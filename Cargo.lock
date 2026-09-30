@@ -9,6 +9,7 @@ dependencies = [
  "bottle-core",
  "bytes",
  "clap",
+ "relay-lib",
  "serde",
  "thiserror",
  "tokio",

@@ -1,12 +1,22 @@
-//! Чистая логика сетевых namespace'ов: имена, слоты адресов, имена veth.
+//! Сетевые namespace'ы бутылок: чистая логика (имена, слоты, veth)
+//! и syscall-слой жизненного цикла (задача 9).
 //!
-//! Здесь нет syscall-обёрток — ими занимается задача 9; этот модуль
-//! только вычисляет имена и адреса.
+//! Syscall-слой управляет системой через `ip` из iproute2 и работает
+//! только под root внутри аплаенса (Linux); на других платформах код
+//! компилируется, но операции завершаются ошибкой.
 
 use std::collections::BTreeSet;
-use std::net::Ipv4Addr;
+use std::fs;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 
 use bottle_core::profile::validate_id;
+use bottle_core::protocol::ForwardPort;
+use relay_lib::forward::{serve_forward, TargetAddr};
+use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 
 use crate::error::AgentError;
 
@@ -87,6 +97,311 @@ impl SlotTable {
 /// (хостовый peer, интерфейс внутри бутылки).
 pub fn veth_names(idx: u8) -> (String, String) {
     (format!("p{idx}"), format!("b{idx}"))
+}
+
+/// Корень per-namespace конфигурации iproute2 (bind-mount поверх `/etc`).
+const NETNS_ETC_ROOT: &str = "/etc/netns";
+/// resolv.conf VM (default namespace) — источник DNS «через VM».
+const VM_RESOLV_CONF: &str = "/etc/resolv.conf";
+/// Переменная окружения, переопределяющая исполняемый файл relay.
+///
+/// Интеграционные тесты подменяют её на собранный `bottle-agent`:
+/// `current_exe()` тестового бинарника — это harness libtest, а не агент.
+const RELAY_EXE_ENV: &str = "BOTTLE_AGENT_RELAY_EXE";
+
+/// Ручка поднятой бутылки: все ресурсы её network namespace.
+#[derive(Debug)]
+pub struct NetnsHandle {
+    /// Идентификатор бутылки.
+    pub id: String,
+    /// Имя network namespace (`bottle-<id>`).
+    pub ns_name: String,
+    /// Слот адресов подсети `/30`.
+    pub slot: Slot,
+    /// Процесс relay внутри namespace (после `execvp` это сам relay,
+    /// а не `ip`: `ip netns exec` выполняет команду без fork).
+    pub relay_child: Child,
+    /// Задачи мостов в default namespace (SOCKS5 + пробросы).
+    pub bridge_tasks: JoinSet<()>,
+}
+
+/// Поднимает network namespace бутылки `id` на слоте `slot`.
+///
+/// Порядок: (1) мосты в default namespace занимают порты до каких-либо
+/// изменений системы — занятый порт отвергается без созданных ресурсов;
+/// (2) `ip netns add` + veth-пара + адреса + маршруты; (3) запуск relay
+/// внутри namespace (`ip netns exec`). При любой неудаче частично
+/// поднятые ресурсы сносятся, а наружу возвращается исходная ошибка.
+///
+/// Мост — тупое копирование байтов: SOCKS5 и пробросы терминируются
+/// relay внутри namespace, поэтому протокол полностью изолирован
+/// в бутылке.
+pub async fn netns_up(
+    slot: &Slot,
+    id: &str,
+    listeners: &[ForwardPort],
+    socks5_port: u16,
+) -> Result<NetnsHandle, AgentError> {
+    let ns_name = netns_name(id)?;
+    let (peer_veth, inner_veth) = veth_names(slot.idx);
+    let mut bridge_tasks = JoinSet::new();
+
+    spawn_bridge(&mut bridge_tasks, socks5_port, slot.inner).await?;
+    for listener in listeners {
+        spawn_bridge(&mut bridge_tasks, listener.port, slot.inner).await?;
+    }
+
+    let mut ns_created = false;
+    let outcome: Result<Child, AgentError> = async {
+        run_cmd("ip", &["netns", "add", &ns_name])?;
+        ns_created = true;
+
+        run_cmd(
+            "ip",
+            &[
+                "link",
+                "add",
+                &peer_veth,
+                "type",
+                "veth",
+                "peer",
+                "name",
+                &inner_veth,
+            ],
+        )?;
+        run_cmd("ip", &["link", "set", &inner_veth, "netns", &ns_name])?;
+        run_cmd(
+            "ip",
+            &[
+                "addr",
+                "add",
+                &format!("{}/30", slot.peer),
+                "dev",
+                &peer_veth,
+            ],
+        )?;
+        run_cmd("ip", &["link", "set", &peer_veth, "up"])?;
+        run_in_ns(
+            &ns_name,
+            &[
+                "ip",
+                "addr",
+                "add",
+                &format!("{}/30", slot.inner),
+                "dev",
+                &inner_veth,
+            ],
+        )?;
+        run_in_ns(&ns_name, &["ip", "link", "set", &inner_veth, "up"])?;
+        run_in_ns(&ns_name, &["ip", "link", "set", "lo", "up"])?;
+        run_in_ns(
+            &ns_name,
+            &[
+                "ip",
+                "route",
+                "add",
+                "default",
+                "via",
+                &slot.peer.to_string(),
+            ],
+        )?;
+
+        // Последний fallible-шаг: после него ручка строится без отказов.
+        spawn_relay(&ns_name, socks5_port, listeners)
+    }
+    .await;
+
+    match outcome {
+        Ok(relay_child) => Ok(NetnsHandle {
+            id: id.to_string(),
+            ns_name,
+            slot: *slot,
+            relay_child,
+            bridge_tasks,
+        }),
+        Err(error) => {
+            // Исходная ошибка важнее отказов очистки.
+            bridge_tasks.abort_all();
+            if ns_created {
+                if let Err(teardown) = run_cmd("ip", &["netns", "del", &ns_name]) {
+                    tracing::warn!(
+                        %teardown,
+                        "не удалось удалить частично поднятый namespace {ns_name}"
+                    );
+                }
+            }
+            remove_netns_etc(&ns_name);
+            Err(error)
+        }
+    }
+}
+
+/// Опускает бутылку: останавливает relay и мосты, удаляет namespace.
+///
+/// `ip netns del` уничтожает veth-пару автоматически. Ошибки отдельных
+/// шагов логируются и не прерывают разбор; ошибкой возвращается только
+/// неудача удаления namespace — она означает утечку имени в `/run/netns`.
+pub fn netns_down(handle: NetnsHandle) -> Result<(), AgentError> {
+    let NetnsHandle {
+        ns_name,
+        mut relay_child,
+        mut bridge_tasks,
+        ..
+    } = handle;
+
+    if let Err(error) = relay_child.kill() {
+        tracing::warn!(%error, "не удалось остановить relay-процесс {ns_name}");
+    }
+    let _ = relay_child.wait();
+
+    bridge_tasks.abort_all();
+
+    run_cmd("ip", &["netns", "del", &ns_name])?;
+    remove_netns_etc(&ns_name);
+    Ok(())
+}
+
+/// Пишет `/etc/netns/bottle-<id>/resolv.conf` — DNS для namespace.
+///
+/// `Some(ip)` фиксирует сервер `ip`; `None` копирует текущий
+/// `/etc/resolv.conf` VM (default namespace), чтобы DNS внутри бутылки
+/// работал наружу через VM, а не в никуда. Каталог создаётся с правами
+/// 0755, файл — 0644.
+///
+/// Файл применяется `ip netns exec` при запуске процесса (bind-mount
+/// поверх `/etc/resolv.conf`), поэтому вызывать нужно до запуска
+/// процессов в namespace.
+pub fn set_dns(id: &str, dns: Option<IpAddr>) -> Result<(), AgentError> {
+    let ns_name = netns_name(id)?;
+    let dir = netns_etc_dir(&ns_name);
+    fs::create_dir_all(&dir)?;
+    set_mode(&dir, 0o755)?;
+
+    let content = match dns {
+        Some(ip) => format!("nameserver {ip}\n"),
+        None => fs::read_to_string(VM_RESOLV_CONF)?,
+    };
+    let resolv_conf = dir.join("resolv.conf");
+    fs::write(&resolv_conf, content)?;
+    set_mode(&resolv_conf, 0o644)?;
+    Ok(())
+}
+
+/// Поднимает мост: слушатель `0.0.0.0:port` в default namespace
+/// переправляет соединения на `inner:port` внутри namespace бутылки.
+async fn spawn_bridge(
+    tasks: &mut JoinSet<()>,
+    port: u16,
+    inner: Ipv4Addr,
+) -> Result<(), AgentError> {
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    let target = TargetAddr::Ip(SocketAddr::V4(SocketAddrV4::new(inner, port)));
+    tasks.spawn(async move {
+        if let Err(error) = serve_forward(listener, target).await {
+            tracing::warn!(port, %error, "мост остановлен");
+        }
+    });
+    Ok(())
+}
+
+/// Запускает relay внутри namespace:
+/// `ip netns exec <ns> <exe> relay --socks5-port <p> [--forward <p:t>]...`.
+///
+/// Путь к своему исполняемому файлу разрешается ДО запуска: магическая
+/// ссылка `/proc/self/exe`, переданная в `ip netns exec` как команда,
+/// разрешится в сам бинарник `ip` (iproute2 выполняет команду обычным
+/// `execvp` без специальной обработки), а не в агента. `ip netns exec`
+/// не порождает промежуточный процесс, поэтому `kill()` ребёнка в
+/// [`netns_down`] завершает именно relay, без осиротевших внуков.
+fn spawn_relay(
+    ns_name: &str,
+    socks5_port: u16,
+    listeners: &[ForwardPort],
+) -> Result<Child, AgentError> {
+    let exe = relay_exe_path()?;
+    let mut args = vec![
+        "relay".to_string(),
+        "--socks5-port".to_string(),
+        socks5_port.to_string(),
+    ];
+    for listener in listeners {
+        args.push("--forward".to_string());
+        args.push(format!("{}:{}", listener.port, listener.target));
+    }
+
+    Command::new("ip")
+        .args(["netns", "exec", ns_name])
+        .arg(&exe)
+        .args(&args)
+        // Лог relay недоступен родителю (tracing не наследуется),
+        // поэтому вывод направляется прямо в терминал/джорнал аплаенса.
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(AgentError::from)
+}
+
+/// Возвращает путь к исполняемому файлу relay: явная переменная
+/// окружения (тесты) или текущий исполняемый файл (на Linux это и есть
+/// чтение `/proc/self/exe` процессом агента).
+fn relay_exe_path() -> Result<PathBuf, AgentError> {
+    match std::env::var_os(RELAY_EXE_ENV) {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => std::env::current_exe().map_err(AgentError::from),
+    }
+}
+
+/// Выполняет команду, захватывая вывод; неудача — [`AgentError::CommandFailed`]
+/// с командой и stderr в сообщении.
+fn run_cmd(program: &str, args: &[&str]) -> Result<String, AgentError> {
+    let output = Command::new(program).args(args).output().map_err(|e| {
+        AgentError::Io(io::Error::new(
+            e.kind(),
+            format!("не удалось запустить {program}: {e}"),
+        ))
+    })?;
+    if !output.status.success() {
+        return Err(AgentError::CommandFailed {
+            command: format!("{program} {}", args.join(" ")),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Выполняет команду внутри namespace через `ip netns exec`.
+fn run_in_ns(ns_name: &str, args: &[&str]) -> Result<String, AgentError> {
+    let mut argv = vec!["netns", "exec", ns_name];
+    argv.extend_from_slice(args);
+    run_cmd("ip", &argv)
+}
+
+/// Возвращает каталог per-namespace конфигурации `/etc/netns/<ns>`.
+fn netns_etc_dir(ns_name: &str) -> PathBuf {
+    Path::new(NETNS_ETC_ROOT).join(ns_name)
+}
+
+/// Удаляет каталог `/etc/netns/<ns>`; отсутствие — не ошибка.
+fn remove_netns_etc(ns_name: &str) {
+    match fs::remove_dir_all(netns_etc_dir(ns_name)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(%e, "не удалось удалить каталог /etc/netns/{ns_name}"),
+    }
+}
+
+/// Выставляет точные права: режим, заданный при создании, маскируется umask.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> Result<(), AgentError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+/// Выставляет точные права — no-op вне unix.
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> Result<(), AgentError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -177,5 +492,13 @@ mod tests {
     #[test]
     fn veth_names_pair_for_idx() {
         assert_eq!(veth_names(7), ("p7".to_string(), "b7".to_string()));
+    }
+
+    #[test]
+    fn netns_etc_dir_layout() {
+        assert_eq!(
+            netns_etc_dir("bottle-office-a"),
+            std::path::PathBuf::from("/etc/netns/bottle-office-a")
+        );
     }
 }
