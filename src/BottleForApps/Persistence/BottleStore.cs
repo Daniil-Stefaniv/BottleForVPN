@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using BottleForApps.Domain;
+using BottleForApps.Infrastructure;
 
 namespace BottleForApps.Persistence;
 
@@ -23,6 +24,7 @@ internal sealed partial class BottleStore
 
     public async Task SaveAsync(BottleDefinition bottle, CancellationToken cancellationToken = default)
     {
+        using var operation = DiagnosticLog.Begin("profile.save", "Сохранение профиля.", new { bottle.Id });
         ValidateId(bottle.Id);
         Directory.CreateDirectory(_directory);
         var json = JsonSerializer.Serialize(bottle, JsonOptions);
@@ -31,6 +33,7 @@ internal sealed partial class BottleStore
 
     public async Task<BottleDefinition> LoadAsync(string id, CancellationToken cancellationToken = default)
     {
+        using var operation = DiagnosticLog.Begin("profile.load", "Загрузка профиля.", new { id });
         ValidateId(id);
         var path = GetPath(id);
         if (!File.Exists(path))
@@ -45,6 +48,7 @@ internal sealed partial class BottleStore
 
     public async Task<IReadOnlyList<BottleDefinition>> ListAsync(CancellationToken cancellationToken = default)
     {
+        using var operation = DiagnosticLog.Begin("profile.list", "Чтение списка профилей.");
         if (!Directory.Exists(_directory))
         {
             return [];
@@ -65,6 +69,7 @@ internal sealed partial class BottleStore
 
     public void Delete(string id)
     {
+        using var operation = DiagnosticLog.Begin("profile.delete", "Удаление профиля.", new { id });
         ValidateId(id);
         var path = GetPath(id);
         if (!File.Exists(path))

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0E7490"/>
+      <stop offset="1" stop-color="#155E75"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.05"/>
+    </linearGradient>
+  </defs>
+
+  <!-- скруглённый квадрат -->
+  <rect x="0" y="0" width="1024" height="1024" rx="228" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" rx="228" fill="none" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="16"/>
+
+  <!-- горлышко и пробка -->
+  <rect x="452" y="150" width="120" height="52" rx="16" fill="#FDE68A"/>
+  <rect x="440" y="196" width="144" height="86" rx="28" fill="#FFFFFF"/>
+
+  <!-- корпус бутылки -->
+  <path d="M440 282
+           C440 358 320 404 320 560
+           L320 804
+           Q320 856 372 856
+           L652 856
+           Q704 856 704 804
+           L704 560
+           C704 404 584 358 584 282
+           Z" fill="url(#glass)" stroke="#FFFFFF" stroke-width="34"/>
+
+  <!-- уровень жидкости -->
+  <path d="M337 600
+           L687 600
+           L687 804
+           Q687 839 652 839
+           L372 839
+           Q337 839 337 804
+           Z" fill="#FFFFFF" fill-opacity="0.85"/>
+
+  <!-- маршруты на жидкости: точка-компьютер → точка-VPN -->
+  <circle cx="412" cy="724" r="30" fill="#155E75"/>
+  <circle cx="612" cy="724" r="30" fill="none" stroke="#155E75" stroke-width="18"/>
+  <path d="M442 724 H 500 M 524 724 H 582" stroke="#155E75" stroke-width="18" stroke-linecap="round"/>
+  <path d="M508 700 L532 724 L508 748" fill="none" stroke="#155E75" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,12 @@
+#!/bin/bash
+# preinstall: аккуратно останавливаем предыдущую версию помощника до замены файлов.
+set -eu
+
+HELPER_ID="local.bottleforapps.route-helper"
+PLIST_PATH="/Library/LaunchDaemons/${HELPER_ID}.plist"
+
+if [ -f "$PLIST_PATH" ]; then
+  launchctl bootout system "$PLIST_PATH" 2>/dev/null || true
+fi
+
+exit 0

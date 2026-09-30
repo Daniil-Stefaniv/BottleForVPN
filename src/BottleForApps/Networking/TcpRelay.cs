@@ -1,13 +1,15 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using BottleForApps.Infrastructure;
 
 namespace BottleForApps.Networking;
 
 internal sealed class TcpRelay : IAsyncDisposable
 {
-    // IP_UNICAST_IF from ws2ipdef.h. The value is intentionally explicit because
-    // older .NET reference assemblies do not expose SocketOptionName.UnicastInterface.
-    private const SocketOptionName IpUnicastInterface = (SocketOptionName)31;
+    // Native values from ws2ipdef.h (Windows) and netinet/in.h (Darwin).
+    private const SocketOptionName WindowsIpUnicastInterface = (SocketOptionName)31;
+    private const SocketOptionName MacOsIpBoundInterface = (SocketOptionName)25;
 
     private readonly IPAddress _destination;
     private readonly int _destinationPort;
@@ -15,7 +17,10 @@ internal sealed class TcpRelay : IAsyncDisposable
     private readonly TcpListener _listener;
     private readonly CancellationTokenSource _shutdown = new();
     private readonly List<Task> _connections = [];
+    private readonly TaskCompletionSource _firstConnection = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Task? _acceptLoop;
+    private int _activeConnections;
+    private long _lastConnectionActivity = Stopwatch.GetTimestamp();
 
     public TcpRelay(IPAddress destination, int destinationPort, int interfaceIndex, int localPort)
     {
@@ -39,7 +44,28 @@ internal sealed class TcpRelay : IAsyncDisposable
     public void Start()
     {
         _listener.Start();
+        DiagnosticLog.Info("relay.start", "Локальный TCP-релей запущен.", new
+        {
+            localPort = LocalPort,
+            destination = _destination.ToString(),
+            destinationPort = _destinationPort,
+            interfaceIndex = _interfaceIndex
+        });
         _acceptLoop = AcceptLoopAsync(_shutdown.Token);
+    }
+
+    public async Task WaitForSessionEndAsync(CancellationToken cancellationToken)
+    {
+        await _firstConnection.Task.WaitAsync(TimeSpan.FromMinutes(2), cancellationToken);
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var idleTime = Stopwatch.GetElapsedTime(Interlocked.Read(ref _lastConnectionActivity));
+            if (Volatile.Read(ref _activeConnections) == 0 && idleTime >= TimeSpan.FromSeconds(5))
+            {
+                return;
+            }
+            await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
+        }
     }
 
     private async Task AcceptLoopAsync(CancellationToken cancellationToken)
@@ -49,6 +75,14 @@ internal sealed class TcpRelay : IAsyncDisposable
             while (!cancellationToken.IsCancellationRequested)
             {
                 var client = await _listener.AcceptTcpClientAsync(cancellationToken);
+                DiagnosticLog.Info("relay.connection.accept", "Принято локальное RDP-соединение.", new
+                {
+                    remoteEndpoint = client.Client.RemoteEndPoint?.ToString(),
+                    localPort = LocalPort
+                });
+                Interlocked.Increment(ref _activeConnections);
+                Interlocked.Exchange(ref _lastConnectionActivity, Stopwatch.GetTimestamp());
+                _firstConnection.TrySetResult();
                 var task = ForwardSafelyAsync(client, cancellationToken);
                 lock (_connections)
                 {
@@ -76,7 +110,18 @@ internal sealed class TcpRelay : IAsyncDisposable
         }
         catch (Exception exception)
         {
+            DiagnosticLog.Error("relay.connection.error", "Ошибка RDP-релея.", exception, new
+            {
+                destination = _destination.ToString(),
+                destinationPort = _destinationPort,
+                interfaceIndex = _interfaceIndex
+            });
             Console.Error.WriteLine($"Ошибка RDP-релея: {exception.Message}");
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeConnections);
+            Interlocked.Exchange(ref _lastConnectionActivity, Stopwatch.GetTimestamp());
         }
     }
 
@@ -86,12 +131,15 @@ internal sealed class TcpRelay : IAsyncDisposable
         using (var outgoing = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
         using (var connectionCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
         {
-            // Winsock expects the IPv4 interface index in network byte order.
-            outgoing.SetSocketOption(
-                SocketOptionLevel.IP,
-                IpUnicastInterface,
-                IPAddress.HostToNetworkOrder(_interfaceIndex));
+            BindToInterface(outgoing);
+            DiagnosticLog.Info("relay.connection.connect", "Соединение привязано к VPN-интерфейсу.", new
+            {
+                destination = _destination.ToString(),
+                destinationPort = _destinationPort,
+                interfaceIndex = _interfaceIndex
+            });
             await outgoing.ConnectAsync(new IPEndPoint(_destination, _destinationPort), cancellationToken);
+            DiagnosticLog.Info("relay.connection.connected", "Соединение с RDP-сервером установлено.");
 
             using var outgoingStream = new NetworkStream(outgoing, ownsSocket: false);
             var incomingStream = incoming.GetStream();
@@ -109,8 +157,28 @@ internal sealed class TcpRelay : IAsyncDisposable
         }
     }
 
+    private void BindToInterface(Socket socket)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Winsock expects IP_UNICAST_IF in network byte order.
+            socket.SetSocketOption(
+                SocketOptionLevel.IP,
+                WindowsIpUnicastInterface,
+                IPAddress.HostToNetworkOrder(_interfaceIndex));
+            return;
+        }
+        if (OperatingSystem.IsMacOS())
+        {
+            socket.SetSocketOption(SocketOptionLevel.IP, MacOsIpBoundInterface, _interfaceIndex);
+            return;
+        }
+        throw new PlatformNotSupportedException("Привязка релея поддерживается только на Windows и macOS.");
+    }
+
     public async ValueTask DisposeAsync()
     {
+        DiagnosticLog.Info("relay.stop", "Остановка TCP-релея.", new { localPort = LocalPort });
         await _shutdown.CancelAsync();
         _listener.Stop();
         if (_acceptLoop is not null)
@@ -137,5 +205,6 @@ internal sealed class TcpRelay : IAsyncDisposable
         {
         }
         _shutdown.Dispose();
+        DiagnosticLog.Info("relay.stopped", "TCP-релей остановлен.");
     }
 }

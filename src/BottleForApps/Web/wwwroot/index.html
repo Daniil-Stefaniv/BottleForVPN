@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08101f">
+  <title>Bottle — рабочие подключения</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#connections" aria-label="Bottle — на главную">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32"><path d="M12 3h8v4l-1.5 2v2.5c4.3 1.2 7.5 5.2 7.5 9.8V27a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-5.7c0-4.6 3.2-8.6 7.5-9.8V9L12 7V3Z"/><path d="M10 21c3-2 9-2 12 0"/></svg>
+        </span>
+        <span><strong>Bottle</strong><small>secure workspace</small></span>
+      </a>
+
+      <nav aria-label="Основная навигация">
+        <button class="nav-item active" data-view="connections">
+          <svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          Подключения
+        </button>
+        <button class="nav-item" data-view="network">
+          <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4M7 9h.01M11 9h6"/></svg>
+          Сеть
+        </button>
+        <button class="nav-item" data-view="help">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.8 9a2.3 2.3 0 1 1 3.5 2c-.8.5-1.3 1-1.3 2M12 17h.01"/></svg>
+          Как это работает
+        </button>
+      </nav>
+
+      <div class="sidebar-status">
+        <span class="status-dot" id="networkDot"></span>
+        <div><strong id="networkLabel">Проверяем сеть…</strong><small id="platformLabel">—</small></div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <button class="mobile-menu icon-button" id="menuButton" aria-label="Открыть меню">
+          <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        </button>
+        <div class="crumb"><span>Bottle</span><svg viewBox="0 0 20 20"><path d="m8 5 5 5-5 5"/></svg><strong id="pageName">Подключения</strong></div>
+        <div class="topbar-actions">
+          <button class="button button-ghost compact" id="quickHelpButton">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.8 9a2.3 2.3 0 1 1 3.5 2c-.8.5-1.3 1-1.3 2M12 17h.01"/></svg>
+            <span>Помощь</span>
+          </button>
+          <button class="button button-primary compact" id="topCreateButton">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            Новый профиль
+          </button>
+        </div>
+      </header>
+
+      <section class="view active" id="connectionsView">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Рабочее пространство</p>
+            <h1>Ваши подключения</h1>
+            <p>Запускайте VPN и удалённый рабочий стол как единое защищённое подключение.</p>
+          </div>
+          <button class="button button-primary" id="createButton">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            Создать профиль
+          </button>
+        </div>
+
+        <div class="summary-grid">
+          <article class="summary-card accent-card">
+            <div class="summary-icon"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+            <div><span>Всего профилей</span><strong id="totalCount">—</strong></div>
+          </article>
+          <article class="summary-card">
+            <div class="summary-icon violet"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10M12 6v6l4 2"/></svg></div>
+            <div><span>Активные сессии</span><strong id="activeCount">—</strong></div>
+          </article>
+          <article class="summary-card health-card">
+            <div class="summary-icon green"><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg></div>
+            <div><span>Состояние системы</span><strong id="healthText">Проверяем…</strong></div>
+          </article>
+        </div>
+
+        <div class="section-title">
+          <div><h2>Профили</h2><span id="profileCount"></span></div>
+          <button class="button button-ghost" id="refreshButton" title="Обновить">
+            <svg viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5M6.1 9a7 7 0 0 1 11.5-2.5L20 9M4 15l2.4 2.5A7 7 0 0 0 17.9 15"/></svg>
+            Обновить
+          </button>
+        </div>
+
+        <div class="profiles-grid" id="profilesGrid" aria-live="polite"></div>
+      </section>
+
+      <section class="view" id="networkView">
+        <div class="page-heading">
+          <div><p class="eyebrow">Диагностика</p><h1>Сетевые интерфейсы</h1><p>Доступные адаптеры и адреса на этом устройстве.</p></div>
+          <button class="button button-secondary" id="refreshNetworkButton"><svg viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5M6.1 9a7 7 0 0 1 11.5-2.5L20 9M4 15l2.4 2.5A7 7 0 0 0 17.9 15"/></svg>Обновить</button>
+        </div>
+        <div class="network-list" id="networkList"></div>
+      </section>
+
+      <section class="view" id="helpView">
+        <div class="guide-hero">
+          <div>
+            <p class="eyebrow">Инструкция от первого запуска до подключения</p>
+            <h1>Разберёмся без сетевого жаргона</h1>
+            <p>Bottle связывает VPN и удалённый рабочий стол в один профиль. Следуйте шагам ниже — сложные сетевые параметры обычно заполнять не нужно.</p>
+            <div class="guide-hero-actions">
+              <button class="button button-primary" id="startTourButton"><svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>Показать интерфейс по шагам</button>
+              <button class="button button-secondary" data-guide-section="quickstart">Быстрый старт</button>
+            </div>
+          </div>
+          <div class="guide-map" aria-label="Схема подключения">
+            <span>Ваш компьютер</span><i>1</i><span>VPN</span><i>2</i><span>Рабочий компьютер</span>
+            <small>Bottle запускает цепочку и следит, чтобы каждое подключение шло своим путём.</small>
+          </div>
+        </div>
+
+        <div class="guide-layout">
+          <nav class="guide-nav" aria-label="Разделы инструкции">
+            <button class="active" data-guide-section="quickstart"><span>01</span>Быстрый старт</button>
+            <button data-guide-section="tabs"><span>02</span>Что на вкладках</button>
+            <button data-guide-section="profile"><span>03</span>Поля профиля</button>
+            <button data-guide-section="connection"><span>04</span>Как подключаться</button>
+            <button data-guide-section="problems"><span>05</span>Если не работает</button>
+            <button data-guide-section="terms"><span>06</span>Словарь</button>
+          </nav>
+
+          <div class="guide-content">
+            <section class="guide-panel active" data-guide-panel="quickstart">
+              <div class="guide-heading"><div><span class="guide-kicker">Начните отсюда</span><h2>Что подготовить до настройки</h2></div><span class="time-chip">≈ 5 минут</span></div>
+              <p class="guide-lead">Попросите у системного администратора четыре вещи. Если у вас их нет — просто отправьте ему список ниже.</p>
+              <div class="prep-list" id="prepChecklist">
+                <label><input type="checkbox" data-check="vpn-app"><span><b>Название VPN-программы</b><small>Например: Cisco Secure Client, FortiClient, OpenVPN Connect или другой корпоративный клиент.</small></span></label>
+                <label><input type="checkbox" data-check="vpn-address"><span><b>Адрес VPN-сервера</b><small>Выглядит как vpn.company.ru или как набор цифр 203.0.113.10. Это не логин и не пароль.</small></span></label>
+                <label><input type="checkbox" data-check="rdp-address"><span><b>Адрес рабочего компьютера</b><small>Обычно внутренний адрес вида 10.20.30.15 или имя компьютера. Он работает только после подключения VPN.</small></span></label>
+                <label><input type="checkbox" data-check="credentials"><span><b>Логин и пароль</b><small>Bottle их не хранит: вы введёте данные в окне VPN и затем в окне удалённого рабочего стола.</small></span></label>
+              </div>
+              <div class="check-progress"><div><span id="checkProgressBar"></span></div><p id="checkProgressText">Отметьте то, что уже есть</p></div>
+              <div class="os-choice">
+                <div><h3>Выберите свою систему</h3><p>Инструкция покажет только подходящие детали.</p></div>
+                <div class="segmented" role="group" aria-label="Операционная система"><button class="active" data-os="windows">Windows</button><button data-os="macos">macOS</button></div>
+              </div>
+              <div class="os-note active" data-os-panel="windows"><b>Для Windows 10/11</b><p>При подключении может появиться запрос прав администратора. Нажмите «Да»: они нужны только для временного сетевого маршрута. RDP уже встроен в Windows.</p></div>
+              <div class="os-note" data-os-panel="macos"><b>Для macOS 12 и новее</b><p>Заранее установите <strong>Windows App</strong> из App Store. macOS отдельно попросит разрешение на изменение маршрута — подтвердите системный запрос.</p></div>
+            </section>
+
+            <section class="guide-panel" data-guide-panel="tabs">
+              <div class="guide-heading"><div><span class="guide-kicker">Карта приложения</span><h2>Что находится на каждой вкладке</h2></div></div>
+              <div class="tab-explainers">
+                <article><span class="tab-icon"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span><div><h3>Подключения</h3><p>Главный экран для ежедневной работы. Здесь лежат карточки ваших профилей — например, «Главный офис» и «Склад».</p><ul><li><b>Всего профилей</b> — сколько связок VPN + RDP сохранено.</li><li><b>Активные сессии</b> — сколько подключений работает сейчас.</li><li><b>Состояние системы</b> — готов ли компьютер к запуску.</li><li>На карточке: адрес рабочего компьютера, VPN-сервер, состояние и кнопки запуска, изменения и удаления.</li></ul><button class="text-button" data-open-view="connections">Открыть вкладку →</button></div></article>
+                <article><span class="tab-icon violet"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4M7 9h.01M11 9h6"/></svg></span><div><h3>Сеть</h3><p>Диагностический экран. В обычной работе сюда заходить не обязательно.</p><ul><li><b>IPv4</b> — адрес компьютера внутри конкретной сети.</li><li><b>Шлюз</b> — устройство, через которое идёт интернет.</li><li><b>Работает</b> — адаптер сейчас включён.</li></ul><p class="mini-note">Полезно, если Bottle не смог автоматически найти VPN-интерфейс: сравните список до и после включения VPN.</p><button class="text-button" data-open-view="network">Открыть вкладку →</button></div></article>
+                <article><span class="tab-icon green"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.8 9a2.3 2.3 0 1 1 3.5 2c-.8.5-1.3 1-1.3 2M12 17h.01"/></svg></span><div><h3>Как это работает</h3><p>Эта инструкция. Здесь есть подготовка, описание полей, порядок подключения, решения типичных проблем и словарь терминов.</p></div></article>
+              </div>
+            </section>
+
+            <section class="guide-panel" data-guide-panel="profile">
+              <div class="guide-heading"><div><span class="guide-kicker">Создание профиля</span><h2>Что вводить в каждое поле</h2></div><button class="button button-secondary compact" data-action="create">Открыть форму</button></div>
+              <p class="guide-lead">Профиль — это сохранённый рецепт одного подключения. Поля со звёздочкой обязательны.</p>
+              <div class="field-guide">
+                <details open><summary><span>Название</span><em>Придумайте сами</em></summary><div><p>Любое понятное вам имя: «Рабочий компьютер», «Офис Москва» или «Бухгалтерия».</p><code>Главный офис</code></div></details>
+                <details><summary><span>VPN-клиент</span><em>Выберите программу</em></summary><div><p>Нажмите <b>«Выбрать…»</b> и укажите приложение, которым вы обычно включаете рабочий VPN. Не выбирайте ярлык или установщик.</p><div class="example-pair"><code>Windows: C:\Program Files\Vendor VPN\vpn.exe</code><code>macOS: /Applications/Vendor VPN.app</code></div></div></details>
+                <details><summary><span>Публичные адреса VPN</span><em>Спросите у администратора</em></summary><div><p>Адрес сервера, к которому подключается VPN-клиент. Один адрес на строку. Не вводите сюда адрес рабочего компьютера, сайт компании, логин или пароль.</p><code>vpn.company.ru</code><p class="mini-note">Если VPN использует несколько серверов, добавьте каждый с новой строки.</p></div></details>
+                <details><summary><span>RDP-адрес</span><em>Спросите у администратора</em></summary><div><p>Внутренний адрес удалённого рабочего компьютера. Часто начинается с 10., 172.16–31. или 192.168.</p><code>10.20.30.15</code></div></details>
+                <details><summary><span>RDP-порт</span><em>Обычно не меняйте</em></summary><div><p>Оставьте <b>3389</b>, если администратор не назвал другой порт.</p><code>3389</code></div></details>
+                <details><summary><span>Дополнительные параметры</span><em>Обычно оставьте пустыми</em></summary><div><dl><dt>Аргументы VPN-клиента</dt><dd>Команды для особого способа запуска. Заполняйте только по готовой строке от администратора.</dd><dt>VPN-интерфейс</dt><dd>Имя сетевого адаптера VPN. Пустое поле означает автоматический поиск.</dd><dt>Основной интерфейс</dt><dd>Wi‑Fi или Ethernet, через который есть интернет. Пустое поле означает автоматический выбор.</dd><dt>Локальный порт релея</dt><dd>Оставьте 0 — Bottle сам найдёт свободный порт.</dd></dl></div></details>
+              </div>
+              <div class="safe-note"><svg viewBox="0 0 24 24"><path d="M12 3 4 6v5c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V6l-8-3Z"/><path d="m9 12 2 2 4-4"/></svg><div><b>Где логин и пароль?</b><p>Их намеренно нет в профиле. Вводите секретные данные только в официальных окнах вашего VPN-клиента и RDP-приложения.</p></div></div>
+            </section>
+
+            <section class="guide-panel" data-guide-panel="connection">
+              <div class="guide-heading"><div><span class="guide-kicker">Ежедневная работа</span><h2>Подключение — шаг за шагом</h2></div></div>
+              <ol class="connection-steps">
+                <li><span>1</span><div><h3>Нажмите «Подключиться»</h3><p>Статус карточки сменится с «Готов» на «Подключение».</p></div></li>
+                <li><span>2</span><div><h3>Подтвердите системный запрос</h3><p>На Windows нажмите «Да» в запросе контроля учётных записей. На macOS подтвердите изменение сетевого маршрута.</p></div></li>
+                <li><span>3</span><div><h3>Подключите VPN</h3><p>В открывшемся VPN-клиенте выберите нужное подключение, введите логин/пароль и дождитесь статуса Connected / Подключено.</p></div></li>
+                <li><span>4</span><div><h3>Дождитесь удалённого рабочего стола</h3><p>Bottle распознает VPN и откроет RDP. Введите учётные данные рабочего компьютера, если приложение их запросит.</p></div></li>
+                <li><span>5</span><div><h3>Завершите работу</h3><p>Закройте окно удалённого рабочего стола и нажмите «Остановить» в Bottle. VPN-клиент при необходимости отключите отдельно.</p></div></li>
+              </ol>
+              <div class="status-legend"><h3>Что означают статусы карточки</h3><div><span><i></i><b>Готов</b> профиль сохранён и не запущен</span><span class="is-active"><i></i><b>Подключение</b> Bottle ждёт VPN или запускает RDP</span><span class="is-active"><i></i><b>Активно</b> удалённый рабочий стол работает</span><span class="is-error"><i></i><b>Ошибка</b> прочитайте строку внизу карточки</span></div></div>
+              <div class="notice"><svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="9"/></svg><div><strong>Можно запустить несколько профилей</strong><p>Сначала полностью подключите первый, затем запускайте второй. Каждый откроется в своём окне удалённого рабочего стола.</p></div></div>
+            </section>
+
+            <section class="guide-panel" data-guide-panel="problems">
+              <div class="guide-heading"><div><span class="guide-kicker">Самопроверка</span><h2>Выберите, что пошло не так</h2></div></div>
+              <div class="problem-picker" role="tablist" aria-label="Тип проблемы">
+                <button class="active" data-problem="vpn">VPN не открылся</button><button data-problem="waiting">Долго ждёт</button><button data-problem="rdp">RDP не подключается</button><button data-problem="second">Не работает второй VPN</button><button data-problem="permission">Запрос прав</button>
+              </div>
+              <div class="problem-answer" id="problemAnswer"></div>
+              <div class="admin-card"><div><span>Нужна помощь?</span><h3>Подготовьте данные для диагностики</h3><p>Архив содержит технические логи и сведения о системе, но не пароли.</p></div><div class="admin-actions"><button class="button button-secondary" id="exportLogsButton">Собрать логи</button><button class="button button-secondary" id="copyAdminRequest">Скопировать запрос</button></div></div>
+            </section>
+
+            <section class="guide-panel" data-guide-panel="terms">
+              <div class="guide-heading"><div><span class="guide-kicker">Простыми словами</span><h2>Словарь терминов</h2></div></div>
+              <div class="glossary">
+                <details><summary>VPN</summary><p>Защищённый «коридор» от вашего компьютера в рабочую сеть компании.</p></details>
+                <details><summary>RDP / удалённый рабочий стол</summary><p>Способ видеть экран рабочего компьютера и управлять им через интернет.</p></details>
+                <details><summary>Профиль</summary><p>Сохранённый набор настроек для одной пары: конкретный VPN + конкретный рабочий компьютер.</p></details>
+                <details><summary>VPN endpoint</summary><p>Публичный адрес входа в VPN. В интерфейсе он называется «Публичные адреса VPN».</p></details>
+                <details><summary>Сетевой интерфейс / адаптер</summary><p>Программный или физический сетевой канал: Wi‑Fi, Ethernet или канал, созданный VPN.</p></details>
+                <details><summary>IPv4-адрес</summary><p>Числовой адрес устройства в сети, например 10.20.30.15.</p></details>
+                <details><summary>Порт</summary><p>Номер конкретной сетевой службы. Для RDP стандартный порт — 3389.</p></details>
+                <details><summary>Маршрут</summary><p>Правило, которое говорит компьютеру, через какое подключение отправлять конкретный сетевой трафик.</p></details>
+                <details><summary>TCP-релей</summary><p>Локальный посредник Bottle, который направляет RDP именно в нужный VPN. Настраивать его вручную обычно не требуется.</p></details>
+              </div>
+              <div class="privacy-card"><svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg><div><h3>Данные остаются на компьютере</h3><p>Панель открывается только локально. Профили не отправляются во внешнюю сеть, а пароли Bottle не запрашивает и не хранит.</p></div></div>
+            </section>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="profileModal" aria-hidden="true">
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-header"><div><p class="eyebrow">Профиль подключения</p><h2 id="modalTitle">Новый профиль</h2></div><button class="icon-button" id="closeModal" aria-label="Закрыть"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+      <form id="profileForm">
+        <input type="hidden" name="id">
+        <div class="form-grid">
+          <label class="field full"><span>Название <b>*</b><span class="field-help" data-field-help="name" role="button" tabindex="0" aria-label="Что вводить в поле Название">?</span></span><input name="name" required placeholder="Например, Главный офис"><small>Придумайте понятное имя — оно будет видно на карточке.</small></label>
+          <label class="field full"><span>VPN-клиент <b>*</b><span class="field-help" data-field-help="vpnExecutable" role="button" tabindex="0" aria-label="Что такое VPN-клиент">?</span></span><span class="input-action"><input name="vpnExecutable" required placeholder="Выберите установленное VPN-приложение"><button type="button" class="button button-secondary" id="browseVpnButton">Выбрать…</button></span><small>Программа, в которой вы обычно включаете рабочий VPN.</small></label>
+          <label class="field full"><span>Публичные адреса VPN <b>*</b><span class="field-help" data-field-help="vpnEndpoints" role="button" tabindex="0" aria-label="Что такое публичный адрес VPN">?</span></span><textarea name="vpnEndpoints" required rows="2" placeholder="vpn.company.ru&#10;backup-vpn.company.ru"></textarea><small>Адрес VPN-сервера, не адрес рабочего компьютера. Один адрес на строку.</small></label>
+          <label class="field"><span>RDP-адрес <b>*</b><span class="field-help" data-field-help="rdpHost" role="button" tabindex="0" aria-label="Что такое RDP-адрес">?</span></span><input name="rdpHost" required placeholder="Например, 10.20.30.15"><small>Внутренний адрес рабочего компьютера.</small></label>
+          <label class="field"><span>RDP-порт <span class="field-help" data-field-help="rdpPort" role="button" tabindex="0" aria-label="Что такое RDP-порт">?</span></span><input name="rdpPort" type="number" min="1" max="65535" value="3389"><small>Обычно оставьте 3389.</small></label>
+        </div>
+        <details class="advanced">
+          <summary>Дополнительные параметры <svg viewBox="0 0 20 20"><path d="m5 7 5 5 5-5"/></svg></summary>
+          <div class="form-grid advanced-fields">
+            <label class="field full"><span>Аргументы VPN-клиента</span><input name="vpnArguments" placeholder="Оставьте пустым, если не нужны"></label>
+            <label class="field"><span>VPN-интерфейс</span><input name="vpnInterface" placeholder="Автоопределение"></label>
+            <label class="field"><span>Основной интерфейс</span><input name="baseInterface" list="baseInterfaceOptions" placeholder="Автоопределение при сохранении"><datalist id="baseInterfaceOptions"></datalist><small>Физический Wi‑Fi/Ethernet; пустое поле — выбор при каждом подключении.</small></label>
+            <label class="field"><span>Локальный порт релея</span><input name="relayPort" type="number" min="0" max="65535" value="0"><small>0 — выбрать автоматически</small></label>
+          </div>
+        </details>
+        <div class="form-error" id="formError"></div>
+        <div class="modal-actions"><button type="button" class="button button-ghost" id="cancelModal">Отмена</button><button type="submit" class="button button-primary" id="saveButton">Сохранить профиль</button></div>
+      </form>
+    </section>
+  </div>
+
+  <div class="tour-layer" id="tourLayer" aria-hidden="true">
+    <div class="tour-shade"></div>
+    <section class="tour-card" role="dialog" aria-modal="true" aria-labelledby="tourTitle">
+      <div class="tour-progress"><span id="tourStepLabel">Шаг 1 из 9</span><button class="tour-close" id="closeTourButton">Закрыть</button></div>
+      <div class="tour-bar"><span id="tourBar"></span></div>
+      <p class="eyebrow" id="tourEyebrow">Знакомство</p>
+      <h2 id="tourTitle">Главная вкладка</h2>
+      <p id="tourText"></p>
+      <div class="tour-actions"><button class="button button-ghost" id="tourPrevButton">Назад</button><button class="button button-primary" id="tourNextButton">Дальше</button></div>
+    </section>
+  </div>
+
+  <div class="field-popover" id="fieldPopover" role="tooltip"></div>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

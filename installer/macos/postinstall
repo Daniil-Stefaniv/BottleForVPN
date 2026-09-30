@@ -1,0 +1,47 @@
+#!/bin/bash
+# postinstall выполняется установщиком macOS от имени root: пароль администратора
+# запрашивается только один раз — здесь, и больше при работе приложения не нужен.
+set -eu
+
+HELPER_ID="local.bottleforapps.route-helper"
+HELPER_PATH="/Library/PrivilegedHelperTools/${HELPER_ID}"
+PLIST_PATH="/Library/LaunchDaemons/${HELPER_ID}.plist"
+RESOURCES_DIR="$(dirname "$0")"
+STAMP="/var/db/bottleforapps-helper.installed"
+
+# 1. Помощник: из ресурсов установщика или из запасной копии внутри .app.
+HELPER_SOURCE="${RESOURCES_DIR}/bottle-route-helper"
+if [ ! -f "$HELPER_SOURCE" ]; then
+  HELPER_SOURCE="/Applications/BottleForApps.app/Contents/MacOS/Extras/bottle-route-helper"
+fi
+
+if [ -f "$HELPER_SOURCE" ]; then
+  mkdir -p /Library/PrivilegedHelperTools
+  cp "$HELPER_SOURCE" "$HELPER_PATH"
+  chown root:wheel "$HELPER_PATH"
+  chmod 755 "$HELPER_PATH"
+  xattr -cr "$HELPER_PATH" 2>/dev/null || true
+else
+  echo "Предупреждение: bottle-route-helper не найден в установщике." >&2
+fi
+
+# 2. LaunchDaemon: launchd запускает помощника от root и перезапускает при падении.
+if [ -f "${RESOURCES_DIR}/${HELPER_ID}.plist" ]; then
+  cp "${RESOURCES_DIR}/${HELPER_ID}.plist" "$PLIST_PATH"
+  chown root:wheel "$PLIST_PATH"
+  chmod 644 "$PLIST_PATH"
+  launchctl bootout system "$PLIST_PATH" 2>/dev/null || true
+  launchctl bootstrap system "$PLIST_PATH" 2>/dev/null || true
+fi
+
+# 3. CLI-ссылка: bottle доступен в терминале без полного пути.
+if [ ! -e /usr/local/bin/bottle ] || [ -L /usr/local/bin/bottle ]; then
+  mkdir -p /usr/local/bin
+  ln -sf "/Applications/BottleForApps.app/Contents/MacOS/bottle" /usr/local/bin/bottle
+fi
+
+# 4. Отметка для pkgbuild: скрипт отработал.
+touch "$STAMP"
+chown root:wheel "$STAMP" 2>/dev/null || true
+
+exit 0

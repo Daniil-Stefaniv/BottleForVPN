@@ -4,6 +4,10 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BottleForApps", "src\BottleForApps\BottleForApps.csproj", "{D39A903F-115A-497A-AEDD-E6DAB9CD0876}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BottleIpc", "src\BottleIpc\BottleIpc.csproj", "{5A9F3D2E-1C4B-4E8A-9B7D-2F6A1E5C8B31}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BottleRouteHelper", "src\BottleRouteHelper\BottleRouteHelper.csproj", "{C7E2A6F4-8D53-4F1B-A0C9-3B7D5E2F6A14}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -14,5 +18,13 @@ Global
 		{D39A903F-115A-497A-AEDD-E6DAB9CD0876}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{D39A903F-115A-497A-AEDD-E6DAB9CD0876}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{D39A903F-115A-497A-AEDD-E6DAB9CD0876}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5A9F3D2E-1C4B-4E8A-9B7D-2F6A1E5C8B31}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5A9F3D2E-1C4B-4E8A-9B7D-2F6A1E5C8B31}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5A9F3D2E-1C4B-4E8A-9B7D-2F6A1E5C8B31}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5A9F3D2E-1C4B-4E8A-9B7D-2F6A1E5C8B31}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C7E2A6F4-8D53-4F1B-A0C9-3B7D5E2F6A14}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C7E2A6F4-8D53-4F1B-A0C9-3B7D5E2F6A14}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C7E2A6F4-8D53-4F1B-A0C9-3B7D5E2F6A14}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C7E2A6F4-8D53-4F1B-A0C9-3B7D5E2F6A14}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
