@@ -5,6 +5,8 @@
 //! появятся в задачах 9 и 11.
 
 pub mod control;
+pub mod error;
+pub mod netns;
 pub mod token;
 
 use std::net::Ipv4Addr;
