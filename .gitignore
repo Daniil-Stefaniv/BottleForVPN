@@ -5,3 +5,8 @@ artifacts/
 .idea/
 *.user
 *.suo
+
+# v2 workflow
+.worktrees/
+.superpowers/
+.DS_Store
