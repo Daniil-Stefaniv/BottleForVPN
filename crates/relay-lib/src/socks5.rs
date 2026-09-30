@@ -39,11 +39,13 @@ const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
 /// Разобранный запрос клиента.
 enum Request {
-    /// CONNECT на указанный адрес цели.
+    /// CONNECT на указанный адрес цели (кадр прочитан целиком).
     Connect(TargetAddr),
-    /// Команда отличается от CONNECT (BIND, UDP ASSOCIATE, неизвестные).
+    /// Команда отличается от CONNECT (BIND, UDP ASSOCIATE, неизвестные):
+    /// ответ `0x07` и закрытие соединения — кадр не дочитан.
     UnsupportedCommand,
-    /// Тип адреса не поддерживается.
+    /// Тип адреса не поддерживается: ответ `0x08` и закрытие соединения —
+    /// длина остатка кадра невычислима.
     UnsupportedAddressType,
 }
 
@@ -69,11 +71,16 @@ pub async fn serve_socks5(listener: TcpListener) -> io::Result<()> {
 
 /// Обслуживает одно соединение: согласование метода, затем цикл запросов.
 ///
-/// После ответа с ошибкой (отказ диала, неподдерживаемая команда или тип
-/// адреса) соединение не закрывается — клиент может послать следующий
-/// запрос. Закрывается соединение только при некорректном протоколе
-/// (чужая версия, обрезанные байты) или после завершения копирования
-/// успешного CONNECT.
+/// Соединение остаётся живым только после ответов об ошибке диала цели
+/// (`0x01`/`0x04`/`0x05`): к этому моменту кадр запроса прочитан целиком,
+/// и клиент может послать следующий запрос. После ответов `0x07`
+/// (неподдерживаемая команда) и `0x08` (неподдерживаемый тип адреса)
+/// сервер закрывает соединение: адрес запроса в этих случаях не
+/// разбирается, остаток кадра остаётся в потоке (для неизвестного типа
+/// адреса его длину вычислить нельзя), и чтение следующего запроса
+/// с оставшихся байтов рассинхронизировало бы поток. Также соединение
+/// закрывается при некорректном протоколе (чужая версия, обрезанные
+/// байты) и после завершения копирования успешного CONNECT.
 async fn handle_connection(mut client: TcpStream, peer: SocketAddr) -> io::Result<()> {
     client.set_nodelay(true)?;
     negotiate_method(&mut client).await?;
@@ -81,12 +88,19 @@ async fn handle_connection(mut client: TcpStream, peer: SocketAddr) -> io::Resul
         let target = match read_request(&mut client).await? {
             Request::Connect(target) => target,
             Request::UnsupportedCommand => {
+                // Кадр не дочитан: байты адреса не читаются, и ответив,
+                // сервер закрывает соединение — иначе остаток кадра будет
+                // ошибочно разобран как следующий запрос.
                 send_reply(&mut client, REP_COMMAND_NOT_SUPPORTED).await?;
-                continue;
+                tracing::debug!(%peer, "socks5 connection closed: unsupported command");
+                return Ok(());
             }
             Request::UnsupportedAddressType => {
+                // Длину непрочитанного адреса вычислить невозможно,
+                // поэтому сервер закрывает соединение сразу после ответа.
                 send_reply(&mut client, REP_ADDRESS_TYPE_NOT_SUPPORTED).await?;
-                continue;
+                tracing::debug!(%peer, "socks5 connection closed: unsupported address type");
+                return Ok(());
             }
         };
 
@@ -265,6 +279,21 @@ mod tests {
             .port()
     }
 
+    /// Утверждает, что сервер закрыл соединение: EOF или RST,
+    /// но никаких байтов ответа больше не приходит.
+    async fn assert_connection_closed(client: &mut TcpStream) {
+        let mut tail = [0u8; 16];
+        let outcome = tokio::time::timeout(TIMEOUT, client.read(&mut tail))
+            .await
+            .expect("connection closed within timeout");
+        match outcome {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            Ok(n) => panic!("expected close, got {n} bytes: {:?}", &tail[..n]),
+            Err(e) => panic!("unexpected read error: {e}"),
+        }
+    }
+
     /// Минимальный клиент: согласование метода `\x05\x01\x00` → `\x05\x00`.
     async fn negotiate(client: &mut TcpStream) -> io::Result<()> {
         client.write_all(&[0x05, 0x01, 0x00]).await?;
@@ -366,21 +395,54 @@ mod tests {
 
     #[tokio::test]
     async fn bind_command_rejected_with_07() -> io::Result<()> {
+        let echo_addr = spawn_echo().await?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let socks_addr = listener.local_addr()?;
         let server = tokio::spawn(serve_socks5(listener));
 
         let mut client = TcpStream::connect(socks_addr).await?;
         negotiate(&mut client).await?;
-        // VER=5, CMD=2 (BIND), RSV=0, ATYP=1, 127.0.0.1:80.
-        client
-            .write_all(&[0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50])
-            .await?;
+        // VER=5, CMD=2 (BIND), RSV=0, ATYP=1; байты адреса не отправляем —
+        // сервер отвечает по заголовку кадра, не дожидаясь адреса.
+        client.write_all(&[0x05, 0x02, 0x00, 0x01]).await?;
         assert_eq!(
             read_reply(&mut client).await?,
             0x07,
             "BIND must map to REP 0x07"
         );
+
+        // После 0x07 кадр не дочитан, поэтому соединение закрывается:
+        // повторный запрос на том же соединении не получает ответа.
+        client.write_all(&connect_ipv4(echo_addr)).await?;
+        assert_connection_closed(&mut client).await;
+
+        assert!(!server.is_finished(), "accept loop must survive");
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_address_type_rejected_with_08() -> io::Result<()> {
+        let echo_addr = spawn_echo().await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let socks_addr = listener.local_addr()?;
+        let server = tokio::spawn(serve_socks5(listener));
+
+        let mut client = TcpStream::connect(socks_addr).await?;
+        negotiate(&mut client).await?;
+        // VER=5, CMD=1, RSV=0, ATYP=2 (в RFC 1928 не определён); формат
+        // адреса при неизвестном ATYP неизвестен, байты адреса не отправляем.
+        client.write_all(&[0x05, 0x01, 0x00, 0x02]).await?;
+        assert_eq!(
+            read_reply(&mut client).await?,
+            0x08,
+            "unknown ATYP must map to REP 0x08"
+        );
+
+        // После 0x08 длина остатка кадра невычислима, соединение закрывается:
+        // повторный запрос на том же соединении не получает ответа.
+        client.write_all(&connect_ipv4(echo_addr)).await?;
+        assert_connection_closed(&mut client).await;
 
         assert!(!server.is_finished(), "accept loop must survive");
         server.abort();
@@ -440,16 +502,7 @@ mod tests {
         );
 
         // После 0xFF сервер закрывает соединение.
-        let mut tail = [0u8; 1];
-        let outcome = tokio::time::timeout(TIMEOUT, client.read(&mut tail))
-            .await
-            .expect("connection closed within timeout");
-        match outcome {
-            Ok(0) => {}
-            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
-            Ok(n) => panic!("unexpected data after 0xFF: {n} bytes"),
-            Err(e) => panic!("unexpected read error after 0xFF: {e}"),
-        }
+        assert_connection_closed(&mut client).await;
 
         assert!(!server.is_finished(), "accept loop must survive");
         server.abort();
@@ -468,17 +521,7 @@ mod tests {
         client
             .write_all(&[0x04, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50])
             .await?;
-
-        let mut tail = [0u8; 1];
-        let outcome = tokio::time::timeout(TIMEOUT, client.read(&mut tail))
-            .await
-            .expect("connection closed within timeout");
-        match outcome {
-            Ok(0) => {}
-            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
-            Ok(n) => panic!("unexpected data after malformed request: {n} bytes"),
-            Err(e) => panic!("unexpected read error after malformed request: {e}"),
-        }
+        assert_connection_closed(&mut client).await;
 
         assert!(!server.is_finished(), "accept loop must survive");
         server.abort();
