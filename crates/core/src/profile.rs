@@ -53,7 +53,7 @@ pub enum VpnConfig {
 
 /// Один TCP-проброс: слушатель на 127.0.0.1 → цель `host:port`
 /// (host — IP или DNS-имя внутри туннеля).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardSpec {
     /// Порт слушателя; 0 = автоподбор из диапазона 49152–65535.
     pub listen: u16,
@@ -62,7 +62,7 @@ pub struct ForwardSpec {
 }
 
 /// Конфигурация входа приложения в бутылку; одинакова для обоих `kind`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExposeConfig {
     /// Порт SOCKS5 на 127.0.0.1; 0 = автоподбор.
     pub socks5: u16,
@@ -75,7 +75,7 @@ pub struct ExposeConfig {
 }
 
 /// Профиль бутылки — валидированное содержимое `bottles/<id>.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BottleProfile {
     /// Идентификатор `[a-z0-9-]`, начинается с буквы или цифры; имя файла = id.
     pub id: String,
