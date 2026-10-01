@@ -10,15 +10,23 @@ path = "src/main.rs"
 
 [dependencies]
 bottle-core = { path = "../core" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 bytes = "1"
+tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
+# Каталог данных по умолчанию (кроссплатформенный local data dir).
+dirs = "5"
+
+# Single-instance демона: CreateMutexW (Win32).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
-# Тесты хранилища работают во временных каталогах.
+# Тесты хранилища и диспетчера работают во временных каталогах.
 tempfile = "3"
