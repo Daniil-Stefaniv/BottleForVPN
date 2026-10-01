@@ -151,7 +151,10 @@ fn copy_config(source: &Path, target: &Path) -> Result<(), DaemonError> {
 /// Атомарная запись: сначала временный файл рядом с целью, затем rename.
 /// Существующий файл не портится при отказе на любом шаге; временный
 /// файл при ошибке удаляется.
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+///
+/// Используется и за пределами хранилища профилей (токен аплаенса,
+/// `crate::appliance`), поэтому видима внутри крейта.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

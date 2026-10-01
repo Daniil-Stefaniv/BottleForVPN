@@ -28,6 +28,11 @@ pub struct Daemon {
 // pipe Windows), поэтому модулям нужно allow; на windows цепочка
 // main -> serve -> dispatch держит всё живым — это проверяется clippy
 // по target x86_64-pc-windows-msvc и windows-джобой CI.
+// Импорт аплаенса, провижининг токена и соединение с агентом
+// подключаются к диспетчеру команд в Task 16 — до этого модуль живёт
+// только своими тестами (на обеих платформах), поэтому allow.
+#[allow(dead_code)]
+mod appliance;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod error;
 mod instance;

@@ -10,6 +10,11 @@ path = "src/main.rs"
 
 [dependencies]
 bottle-core = { path = "../core" }
+# dyn-совместимый трейт WslRunner (async fn в трейте не dyn-совместимны).
+async-trait = "0.1"
+# Токен аплаенса: 32 случайных байта (на unix — getentropy/urandom,
+# на Windows — RtlGenRandom; общий паттерн с agent/token.rs).
+getrandom = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
