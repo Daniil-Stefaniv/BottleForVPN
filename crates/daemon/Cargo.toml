@@ -9,6 +9,7 @@ name = "bottled"
 path = "src/main.rs"
 
 [dependencies]
+bottle-core = { path = "../core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -17,3 +18,7 @@ thiserror = "2"
 tracing = "0.1"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+# Тесты хранилища работают во временных каталогах.
+tempfile = "3"
