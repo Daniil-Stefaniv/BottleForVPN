@@ -146,10 +146,9 @@ pub async fn netns_up(
     let (peer_veth, inner_veth) = veth_names(slot.idx);
     let mut bridge_tasks = JoinSet::new();
 
-    spawn_bridge(&mut bridge_tasks, socks5_port, slot.inner).await?;
-    for listener in listeners {
-        spawn_bridge(&mut bridge_tasks, listener.port, slot.inner).await?;
-    }
+    // Первый fallible-этап: при отказе любого бинда уже поднятые мосты
+    // останавливаются самой bind_bridges — ранний `?` здесь безопасен.
+    bind_bridges(&mut bridge_tasks, socks5_port, listeners, slot.inner).await?;
 
     let mut ns_created = false;
     let outcome: Result<Child, AgentError> = async {
@@ -234,6 +233,39 @@ pub async fn netns_up(
             Err(error)
         }
     }
+}
+
+/// Биндит все мосты бутылки (SOCKS5 + пробросы) в default namespace.
+///
+/// При отказе любого бинда уже поднятые мосты останавливаются:
+/// abort + выкачивание `join_next` гарантируют, что слушатели закрыты
+/// и порты свободны к моменту возврата ошибки. Drop `JoinSet` лишь
+/// отцепляет задачи — без явной остановки уже занятый мост продолжал
+/// бы слушать в default namespace (перенаправляя в несуществующий
+/// namespace), теряя порт до перезапуска агента и ломая повторный Up
+/// ошибкой AddrInUse. Наружу возвращается исходная ошибка бинда.
+async fn bind_bridges(
+    tasks: &mut JoinSet<()>,
+    socks5_port: u16,
+    listeners: &[ForwardPort],
+    inner: Ipv4Addr,
+) -> Result<(), AgentError> {
+    let outcome: Result<(), AgentError> = async {
+        spawn_bridge(tasks, socks5_port, inner).await?;
+        for listener in listeners {
+            spawn_bridge(tasks, listener.port, inner).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    if outcome.is_err() {
+        tasks.abort_all();
+        // Отменённая задача отпускает слушатель только когда рантайм
+        // сбросит её будущее — выкачиваем до последней задачи.
+        while tasks.join_next().await.is_some() {}
+    }
+    outcome
 }
 
 /// Опускает бутылку: останавливает relay и мосты, удаляет namespace.
@@ -499,6 +531,54 @@ mod tests {
         assert_eq!(
             netns_etc_dir("bottle-office-a"),
             std::path::PathBuf::from("/etc/netns/bottle-office-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_bridges_partial_failure_frees_already_bound_port() {
+        // Сквоттер на wildcard-адресе: бинд моста на тот же wildcard
+        // упрётся в активный слушатель и на Linux, и на macOS.
+        let squatter = TcpListener::bind(("0.0.0.0", 0))
+            .await
+            .expect("bind сквоттера");
+        let busy_port = squatter.local_addr().expect("адрес сквоттера").port();
+
+        // Свободный порт для первого (успешного) моста SOCKS5.
+        let probe = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind probe");
+        let socks5_port = probe.local_addr().expect("адрес probe").port();
+        drop(probe);
+
+        let listeners = [ForwardPort {
+            port: busy_port,
+            target: "10.20.30.40:3389".to_string(),
+        }];
+        let mut bridge_tasks = JoinSet::new();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bind_bridges(
+                &mut bridge_tasks,
+                socks5_port,
+                &listeners,
+                Ipv4Addr::new(10, 77, 1, 2),
+            ),
+        )
+        .await
+        .expect("отказ бинда не должен зависать");
+
+        // Наружу — исходная ошибка бинда, а не что-то из очистки.
+        let error = outcome.expect_err("бинд на занятый порт должен провалиться");
+        assert!(
+            matches!(&error, AgentError::Io(e) if e.kind() == io::ErrorKind::AddrInUse),
+            "ожидалась исходная ошибка AddrInUse, получено: {error}"
+        );
+
+        // Суть фикса: успешный мост остановлен и его порт свободен
+        // сразу после возврата — повторный bind проходит.
+        let rebound = TcpListener::bind(("0.0.0.0", socks5_port)).await;
+        assert!(
+            rebound.is_ok(),
+            "порт успешно забинженного моста должен освободиться: {rebound:?}"
         );
     }
 }
