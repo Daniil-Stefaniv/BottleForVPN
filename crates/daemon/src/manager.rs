@@ -10,12 +10,15 @@
 //! Контракт конкурентности: runtime-карта живёт под одним мьютексом,
 //! лок удерживается только на коротких участках без `await`; долгие
 //! операции (соединение с агентом, `Up` с handshake туннеля) выполняются
-//! без лока, а результат докладывается вторым коротким локом. Если за
-//! это время пришёл `stop`, сделанное полностью разбирается.
+//! без лока, а результат докладывается вторым коротким локом. Маркер
+//! `starting` несёт номер поколения: если за время старта пришёл `stop`
+//! (запись вынута) или произошёл перезапуск (запись заменена чужим
+//! поколением), сделанное полностью разбирается.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -135,6 +138,11 @@ impl HostListeners {
 pub struct Runtime {
     /// Текущее состояние.
     pub state: BottleState,
+    /// Поколение маркера `starting`, создавшего запись. `stop` вынимает
+    /// запись целиком, повторный `start` вставляет новую с новым номером —
+    /// фаза 3 старта признаёт результат своим, только если поколение
+    /// записи совпадает (гонка stop → restart, см. [`BottleManager::start`]).
+    pub generation: u64,
     /// Зарезервированные слушатели; `None` после teardown — порты
     /// освобождены (бутылка `failed`, но видна в `status` с причиной).
     pub listeners: Option<HostListeners>,
@@ -156,6 +164,8 @@ pub struct BottleManager {
     connect: Arc<dyn AgentConnect>,
     /// Живые (и упавшие с ошибкой) бутылки по id.
     runtime: Mutex<HashMap<String, Runtime>>,
+    /// Счётчик поколений маркеров `starting` (см. [`Runtime::generation`]).
+    generations: AtomicU64,
 }
 
 impl BottleManager {
@@ -165,16 +175,19 @@ impl BottleManager {
             store,
             connect,
             runtime: Mutex::new(HashMap::new()),
+            generations: AtomicU64::new(0),
         }
     }
 
     /// Поднимает env-бутылку по спеке §7.1.
     ///
-    /// Три фазы: (1) короткий лок — пометка `starting` (активная бутылка —
-    /// no-op по §5.2); (2) без лока — резерв портов, чтение конфига,
-    /// соединение с агентом, `Up` → `Ready` и задачи проброса; (3) короткий
-    /// лок — запись результата (`up`/`failed`), либо полный teardown, если
-    /// за это время пришёл `stop`.
+    /// Три фазы: (1) короткий лок — пометка `starting` со свежим номером
+    /// поколения (активная бутылка — no-op по §5.2); (2) без лока — резерв
+    /// портов, чтение конфига, соединение с агентом, `Up` → `Ready` и
+    /// задачи проброса; (3) короткий лок — запись результата (`up`/`failed`),
+    /// если поколение записи всё ещё наше; иначе (выиграл `stop` или
+    /// перезапуск) — полный teardown СВОИХ ресурсов, вплоть до `Down`
+    /// агенту за уже отправленный `Up`.
     ///
     /// `Err` возможен только при чтении профиля; остальные неудачи —
     /// `Ok(CliReply::Error)` с бутылкой в состоянии `failed`.
@@ -188,6 +201,7 @@ impl BottleManager {
         }
 
         // Фаза 1: пометка starting; активная бутылка — no-op (RF#3).
+        let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         {
             let mut runtime = self.runtime.lock().await;
             if let Some(existing) = runtime.get(id) {
@@ -204,6 +218,7 @@ impl BottleManager {
                 id.to_string(),
                 Runtime {
                     state: BottleState::Starting,
+                    generation,
                     listeners: None,
                     tasks: JoinSet::new(),
                 },
@@ -213,18 +228,18 @@ impl BottleManager {
         // Фаза 2: длинные операции без лока.
         let outcome = self.provision(&profile).await;
 
-        // Фаза 3: короткий лок; метка starting жива, пока никто не вынул
-        // запись (это делает конкурентный stop).
+        // Фаза 3: короткий лок. Маркер жив, только если в карте лежит
+        // запись нашего поколения: stop вынимает запись, перезапуск
+        // кладёт новую с другим номером; чужую запись не трогаем.
         let mut runtime = self.runtime.lock().await;
-        let marker_alive = runtime
-            .get(id)
-            .is_some_and(|r| matches!(r.state, BottleState::Starting));
+        let marker_alive = runtime.get(id).is_some_and(|r| r.generation == generation);
         match outcome {
             Ok(made) if marker_alive => {
                 runtime.insert(
                     id.to_string(),
                     Runtime {
                         state: BottleState::Up,
+                        generation,
                         listeners: Some(made.listeners),
                         tasks: made.tasks,
                     },
@@ -237,12 +252,23 @@ impl BottleManager {
                 Ok(CliReply::Started { id: id.to_string() })
             }
             Ok(mut made) => {
-                // stop выиграл гонку: бутылки в карте нет — разобрать всё
-                // сделанное и опустить бутылку в аплаенсе.
+                // Гонку выиграл stop (записи нет) или перезапуск (в карте
+                // запись чужого, более нового поколения): разобрать всё
+                // сделанное ЭТИМ запуском — задачи, слушатели — и дождаться
+                // освобождения портов. `Down` агенту отправляем, только
+                // когда записи нет: после перезапуска под этим id уже
+                // живёт новая бутылка, и наш `Down` погасил бы её.
+                let superseded_by_restart = runtime.get(id).is_some();
                 drop(runtime);
                 made.tasks.abort_all();
+                while made.tasks.join_next().await.is_some() {
+                    // Результат (в т.ч. cancellation) не важен — ждём
+                    // завершения, чтобы порты освободились до ответа.
+                }
                 drop(made.listeners);
-                if let Err(error) = self.send_down(id).await {
+                if superseded_by_restart {
+                    tracing::warn!(id, "запуск отменён перезапуском: ресурсы освобождены");
+                } else if let Err(error) = self.send_down(id).await {
                     tracing::warn!(
                         id,
                         %error,
@@ -261,6 +287,7 @@ impl BottleManager {
                             state: BottleState::Failed {
                                 reason: reason.clone(),
                             },
+                            generation,
                             listeners: None,
                             tasks: JoinSet::new(),
                         },
@@ -353,7 +380,9 @@ impl BottleManager {
             .map_err(|error| format!("аплаенс недоступен: {error}"))?;
         let vm_ip = handle.vm_ip;
 
-        // Up; PORT_BUSY → перевыбор портов и повтор ровно один раз (RF#5).
+        // Up; PORT_BUSY → перевыбор динамических портов (фиксированные
+        // бинды сохраняются — их порт изменить нельзя) и повтор ровно
+        // один раз (RF#5).
         let selection = match handle
             .send(up_args(profile, protocol, config.clone(), &selection)?)
             .await
@@ -361,12 +390,15 @@ impl BottleManager {
             Ok(AgentReply::Ready { .. }) => selection,
             Ok(AgentReply::Error { code, .. }) if code == err::PORT_BUSY => {
                 tracing::warn!(id = %profile.id, "агент сообщил PORT_BUSY: перевыбор портов");
-                let retry = reserve_ports(profile)?;
+                let retry = retry_ports(profile, selection)?;
                 match handle
                     .send(up_args(profile, protocol, config, &retry)?)
                     .await
                 {
                     Ok(AgentReply::Ready { .. }) => retry,
+                    Ok(AgentReply::Error { code, message }) if code == err::PORT_BUSY => {
+                        return Err(port_busy_after_retry(profile, &message))
+                    }
                     Ok(AgentReply::Error { code, message }) => {
                         return Err(agent_error(code, message))
                     }
@@ -382,15 +414,22 @@ impl BottleManager {
         // Ready: relay агента уже слушает vm_ip:port — перестроить резерв
         // на serve_forward(127.0.0.1:port → vm_ip:port). Задачи получают
         // клоны слушателей; оригиналы остаются в рантайме бутылки.
+        // Если задачи не поднялись, бутылка уже создана в аплаенсе —
+        // опустить её (`Down` за наш `Up`) и вернуть ошибку.
         let mut tasks = JoinSet::new();
-        spawn_forward(
-            &mut tasks,
-            &selection.socks5,
-            vm_ip,
-            selection.socks5_port()?,
-        )?;
-        for (spec, listener) in &selection.forwards {
-            spawn_forward(&mut tasks, listener, vm_ip, spec.port)?;
+        if let Err(reason) = spawn_forwards(&mut tasks, &selection, vm_ip) {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            drop(selection);
+            if let Err(error) = handle
+                .send(AgentRequest::Down {
+                    id: profile.id.clone(),
+                })
+                .await
+            {
+                tracing::warn!(id = %profile.id, %error, "Down после неудачного старта не дошёл");
+            }
+            return Err(reason);
         }
         Ok(Provisioned {
             listeners: selection,
@@ -459,6 +498,65 @@ fn reserve_ports(profile: &BottleProfile) -> Result<HostListeners, String> {
     Ok(HostListeners { socks5, forwards })
 }
 
+/// Пересобирает резерв портов для повтора `Up` после PORT_BUSY:
+/// фиксированные бинды переходят как есть (порт профиля изменить
+/// нельзя — и повторный bind того же порта не нужен), перевыбираются
+/// только динамические порты (новый занимается ДО освобождения
+/// старого, поэтому гарантированно отличается от него).
+fn retry_ports(profile: &BottleProfile, previous: HostListeners) -> Result<HostListeners, String> {
+    let socks5 = if profile.expose.socks5 == 0 {
+        let fresh = reserve_dynamic_port()?;
+        drop(previous.socks5);
+        fresh
+    } else {
+        previous.socks5
+    };
+    let mut forwards = Vec::with_capacity(profile.expose.forwards.len());
+    for (spec, (_, listener)) in profile.expose.forwards.iter().zip(previous.forwards) {
+        let listener = if spec.listen == 0 {
+            let fresh = reserve_dynamic_port()?;
+            drop(listener);
+            fresh
+        } else {
+            listener
+        };
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        forwards.push((
+            ForwardPort {
+                port,
+                target: spec.target.clone(),
+            },
+            listener,
+        ));
+    }
+    Ok(HostListeners { socks5, forwards })
+}
+
+/// Причина неудачи, когда и повторный `Up` получил PORT_BUSY.
+///
+/// Если в профиле есть фиксированные порты, повтор их не меняет —
+/// конфликт на стороне агента снимается только правкой профиля или
+/// освобождением порта в аплаенсе; говорим об этом прямо, а не
+/// маскируем кодом агента.
+fn port_busy_after_retry(profile: &BottleProfile, agent_message: &str) -> String {
+    let fixed: Vec<String> = [profile.expose.socks5]
+        .into_iter()
+        .chain(profile.expose.forwards.iter().map(|f| f.listen))
+        .filter(|port| *port != 0)
+        .map(|port| port.to_string())
+        .collect();
+    if fixed.is_empty() {
+        format!("{}: {agent_message}", err::PORT_BUSY)
+    } else {
+        format!(
+            "{}: {agent_message}; порт(ы) {} занят(ы) на стороне агента и не меняются \
+             повтором — измените socks5/listen в профиле или освободите порт в аплаенсе",
+            err::PORT_BUSY,
+            fixed.join(", ")
+        )
+    }
+}
+
 /// Занимает свободный порт динамического диапазона: bind :0, пока выпавший
 /// порт не окажется в 49152–65535 (порты вне диапазона освобождаются).
 fn reserve_dynamic_port() -> Result<StdTcpListener, String> {
@@ -521,6 +619,21 @@ fn up_args(
         socks5_port: selection.socks5_port()?,
         forwards: selection.forward_specs(),
     }))
+}
+
+/// Поднимает задачи проброса для всего резерва: SOCKS5 + пробросы,
+/// каждый `127.0.0.1:port → vm_ip:port` (relay агента слушает те же
+/// порты на VM).
+fn spawn_forwards(
+    tasks: &mut JoinSet<()>,
+    selection: &HostListeners,
+    vm_ip: Ipv4Addr,
+) -> Result<(), String> {
+    spawn_forward(tasks, &selection.socks5, vm_ip, selection.socks5_port()?)?;
+    for (spec, listener) in &selection.forwards {
+        spawn_forward(tasks, listener, vm_ip, spec.port)?;
+    }
+    Ok(())
 }
 
 /// Ставит слушателя на проброс `127.0.0.1:port → vm_ip:port`
@@ -638,6 +751,16 @@ mod tests {
         (tmp, store)
     }
 
+    /// Свободный порт на `127.0.0.1` (bind `:0` → номер → drop). Крошечное
+    /// окно между drop и использованием допускается — тот же паттерн, что
+    /// в проверках освобождения портов.
+    fn free_host_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
+        let port = probe.local_addr().expect("local_addr").port();
+        drop(probe);
+        port
+    }
+
     /// Поведение фейк-агента на очередной `Up`.
     #[derive(Clone)]
     enum UpBehavior {
@@ -645,8 +768,14 @@ mod tests {
         Ready,
         /// Первый `Up` — `Error{PORT_BUSY}`, дальше `Ready`.
         PortBusyOnce,
+        /// Всегда `Error{PORT_BUSY}` (конфликт не устраняется повтором).
+        PortBusyAlways,
         /// Всегда `Error{TUNNEL_FAILED}` с сообщением.
         TunnelFailed(String),
+        /// Первый `Up` отвечает `Ready` с задержкой (моделирует долгий
+        /// handshake туннеля для гонок stop/restart во время старта),
+        /// остальные — сразу.
+        DelayedFirstUp(Duration),
     }
 
     /// Журнал фейк-агента: полученные `Up`/`Down` и живые relay.
@@ -667,12 +796,16 @@ mod tests {
         }
 
         fn remember_relays(&self, id: &str, handles: Vec<tokio::task::JoinHandle<()>>) {
-            let old = self.relays.lock().unwrap().insert(id.to_string(), handles);
-            if let Some(old) = old {
-                for handle in old {
-                    handle.abort();
-                }
-            }
+            // Релеи накапливаются, а не заменяются: при гонке restart
+            // Up-ы одного id завершаются в произвольном порядке, и поздний
+            // Ready проигравшего не должен гасить релеи живого победителя.
+            // Down гасит все релеи id разом.
+            self.relays
+                .lock()
+                .unwrap()
+                .entry(id.to_string())
+                .or_default()
+                .extend(handles);
         }
 
         fn drop_relays(&self, id: &str) {
@@ -862,10 +995,20 @@ mod tests {
                 message: "порт занят внутри аплаенса".to_string(),
             },
             UpBehavior::PortBusyOnce => ready().await,
+            UpBehavior::PortBusyAlways => AgentReply::Error {
+                code: err::PORT_BUSY.to_string(),
+                message: "порт занят внутри аплаенса".to_string(),
+            },
             UpBehavior::TunnelFailed(message) => AgentReply::Error {
                 code: err::TUNNEL_FAILED.to_string(),
                 message: message.clone(),
             },
+            UpBehavior::DelayedFirstUp(delay) => {
+                if attempt == 1 {
+                    tokio::time::sleep(*delay).await;
+                }
+                ready().await
+            }
         }
     }
 
@@ -1056,6 +1199,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn port_busy_retry_keeps_fixed_ports_and_replaces_dynamic() {
+        let fixed_socks5 = free_host_port();
+        let mut profile = env_profile("fixed-a", "wg.conf");
+        // Фиксированный SOCKS5, проброс остаётся динамическим.
+        profile.expose.socks5 = fixed_socks5;
+
+        let (_tmp, store) = store_with(&profile);
+        let fake = FakeAgent::spawn(UpBehavior::PortBusyOnce).await;
+        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+
+        // Первый Up — PORT_BUSY; повтор сохраняет фиксированный порт
+        // (без повторного bind) и перевыбирает динамический.
+        let reply = manager.start("fixed-a").await.expect("start после ретрая");
+        assert_eq!(
+            reply,
+            CliReply::Started {
+                id: "fixed-a".into()
+            }
+        );
+
+        let ups = fake.journal.ups();
+        assert_eq!(ups.len(), 2, "ровно один повтор Up");
+        assert_eq!(
+            ups[1].socks5_port, ups[0].socks5_port,
+            "фиксированный порт сохранён между попытками"
+        );
+        assert_eq!(ups[1].socks5_port, fixed_socks5);
+        assert_ne!(
+            ups[1].forwards[0].port, ups[0].forwards[0].port,
+            "динамический порт перевыбран"
+        );
+
+        let bottles = manager.status().await;
+        assert!(matches!(bottles[0].state, BottleState::Up));
+        assert_eq!(bottles[0].socks5, Some(fixed_socks5));
+        assert_eq!(bottles[0].forwards[0].port, ups[1].forwards[0].port);
+
+        // Фиксированный SOCKS5 действительно обслуживается через relay агента.
+        let mut sock = TcpStream::connect(("127.0.0.1", fixed_socks5))
+            .await
+            .expect("подключение к фиксированному socks5");
+        sock.write_all(b"\x05\x01\x00").await.expect("greeting");
+        let mut method = [0u8; 2];
+        sock.read_exact(&mut method).await.expect("выбор метода");
+        assert_eq!(&method, b"\x05\x00", "эхо за туннелем ответило no-auth");
+    }
+
+    #[tokio::test]
+    async fn port_busy_on_fixed_port_reports_agent_conflict_after_retry() {
+        let fixed_socks5 = free_host_port();
+        let mut profile = env_profile("fixed-b", "wg.conf");
+        profile.expose.socks5 = fixed_socks5;
+
+        let (_tmp, store) = store_with(&profile);
+        let fake = FakeAgent::spawn(UpBehavior::PortBusyAlways).await;
+        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+
+        let reply = manager.start("fixed-b").await.expect("ответ, не сбой");
+        let CliReply::Error { message } = reply else {
+            panic!("ожидали Error, получили {reply:?}");
+        };
+        // Причиной назван конфликт на стороне агента (и порт профиля),
+        // а не локальный EADDRINUSE от самого ретрая.
+        assert!(message.contains("PORT_BUSY"), "код агента: {message}");
+        assert!(
+            message.contains(&fixed_socks5.to_string()),
+            "назван фиксированный порт: {message}"
+        );
+        assert!(
+            message.contains("на стороне агента"),
+            "конфликт отнесён стороне агента: {message}"
+        );
+        assert!(
+            !message.contains("занят (SOCKS5)"),
+            "не путать с локальной занятостью порта: {message}"
+        );
+
+        // Повтор был; бутылка failed, фиксированный порт освобождён.
+        assert_eq!(fake.journal.ups().len(), 2, "повтор Up выполнялся");
+        let bottles = manager.status().await;
+        assert!(
+            matches!(&bottles[0].state, BottleState::Failed { reason } if reason.contains("PORT_BUSY")),
+            "{:?}",
+            bottles[0].state
+        );
+        drop(
+            std::net::TcpListener::bind(("127.0.0.1", fixed_socks5))
+                .expect("фиксированный порт свободен"),
+        );
+    }
+
+    #[tokio::test]
     async fn tunnel_failure_marks_bottle_failed_and_frees_ports() {
         const REASON: &str = "туннель не поднялся: handshake timeout";
         let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
@@ -1126,6 +1361,122 @@ mod tests {
         assert!(
             TcpStream::connect(("127.0.0.1", socks5)).await.is_err(),
             "порт закрыт после stop"
+        );
+        assert!(manager.status().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_during_start_leaves_single_live_bottle() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        // Первый Up застревает в агенте на 300 мс — окно для stop+restart.
+        let fake = FakeAgent::spawn(UpBehavior::DelayedFirstUp(Duration::from_millis(300))).await;
+        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+
+        let first = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.start("office-a").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await; // start1 уже в фазе Up
+        manager
+            .stop("office-a")
+            .await
+            .expect("stop во время старта");
+        let reply = manager.start("office-a").await.expect("restart");
+        assert_eq!(
+            reply,
+            CliReply::Started {
+                id: "office-a".into()
+            }
+        );
+
+        // Проигравший старт разбирает свои ресурсы и отвечает ошибкой.
+        let reply = first.await.expect("join start1").expect("без паники");
+        assert!(
+            matches!(reply, CliReply::Error { .. }),
+            "проигравший старт отвечает ошибкой: {reply:?}"
+        );
+
+        // Ровно одна живая бутылка; её SOCKS5 реально обслуживается.
+        let bottles = manager.status().await;
+        assert_eq!(bottles.len(), 1, "{bottles:?}");
+        assert!(matches!(bottles[0].state, BottleState::Up));
+        let ups = fake.journal.ups();
+        assert_eq!(ups.len(), 2, "Up дважды: проигравший и победитель");
+        let socks5 = bottles[0].socks5.expect("порт назначен");
+        assert_eq!(socks5, ups[1].socks5_port, "жив порт победителя");
+        let mut sock = TcpStream::connect(("127.0.0.1", socks5))
+            .await
+            .expect("socks5 победителя жив");
+        sock.write_all(b"\x05\x01\x00").await.expect("greeting");
+        let mut method = [0u8; 2];
+        sock.read_exact(&mut method).await.expect("выбор метода");
+        assert_eq!(&method, b"\x05\x00");
+
+        // Порты проигравшего освобождены — ни слушателей, ни задач-сирот.
+        drop(
+            std::net::TcpListener::bind(("127.0.0.1", ups[0].socks5_port))
+                .expect("socks5 проигравшего свободен"),
+        );
+        drop(
+            std::net::TcpListener::bind(("127.0.0.1", ups[0].forwards[0].port))
+                .expect("проброс проигравшего свободен"),
+        );
+
+        // Down отправлял только stop: teardown проигравшего НЕ гасит
+        // бутылку победителя (под тем же id в аплаенсе уже новая).
+        assert_eq!(
+            fake.journal.downs(),
+            vec!["office-a".to_string()],
+            "Down только от stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_during_start_tears_down_and_sends_down() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::DelayedFirstUp(Duration::from_millis(300))).await;
+        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+
+        let first = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.start("office-a").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let reply = manager
+            .stop("office-a")
+            .await
+            .expect("stop во время старта");
+        assert_eq!(
+            reply,
+            CliReply::Stopped {
+                id: "office-a".into()
+            }
+        );
+
+        let reply = first.await.expect("join start1").expect("без паники");
+        let CliReply::Error { message } = reply else {
+            panic!("ожидали Error, получили {reply:?}");
+        };
+        assert_eq!(message, "бутылка остановлена во время запуска");
+
+        // Up успел дойти и создать бутылку в аплаенсе — teardown отправил
+        // Down за него (второй Down после Down самого stop).
+        let ups = fake.journal.ups();
+        assert_eq!(ups.len(), 1);
+        assert_eq!(
+            fake.journal.downs(),
+            vec!["office-a".to_string(), "office-a".to_string()],
+            "Down от stop и Down от teardown"
+        );
+
+        // Порты проигравшего старта освобождены; бутылки в карте нет.
+        drop(
+            std::net::TcpListener::bind(("127.0.0.1", ups[0].socks5_port))
+                .expect("socks5-порт свободен"),
+        );
+        drop(
+            std::net::TcpListener::bind(("127.0.0.1", ups[0].forwards[0].port))
+                .expect("порт проброса свободен"),
         );
         assert!(manager.status().await.is_empty());
     }
