@@ -38,11 +38,19 @@ docker run --rm --platform "$PLATFORM" --entrypoint /bin/sh "$IMAGE" \
         && echo SMOKE-OK'
 
 # --- 4. Экспорт rootfs в tar.gz ----------------------------------------------
+# Пишем во временный файл и mv-им атомарно: на месте артефакта не может
+# оказаться обрезанный tar. Trap снимает контейнер и мусор при любом выходе.
 echo "==> экспорт rootfs"
 cid="$(docker create "$IMAGE" /bin/true)"
 mkdir -p "$ARTIFACT_DIR"
-docker export "$cid" | gzip > "$ARTIFACT"
-docker rm "$cid" > /dev/null
+tmp_artifact="$(mktemp "$ARTIFACT_DIR/bottleforapps-rootfs.tar.gz.XXXXXX")"
+cleanup() {
+    docker rm -f "$cid" > /dev/null 2>&1 || true
+    rm -f "$tmp_artifact"
+}
+trap cleanup EXIT
+docker export "$cid" | gzip > "$tmp_artifact"
+mv "$tmp_artifact" "$ARTIFACT"
 
 # --- 5. Итог -----------------------------------------------------------------
 echo "==> Готово: $ARTIFACT ($(du -h "$ARTIFACT" | cut -f1))"

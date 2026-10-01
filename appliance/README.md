@@ -6,7 +6,7 @@
 
 ## Состав
 
-- **Alpine 3.20** (x86_64/musl) — базовый rootfs.
+- **Alpine 3.22** (x86_64/musl) — базовый rootfs.
 - **Пакеты**: `wireguard-go`, `wireguard-tools`, `openvpn`, `iproute2`, `iptables`.
 - **`/bin/bottle-agent`** — агент (крейт `agent`, target `x86_64-unknown-linux-musl`),
   подкоманды `serve` (с флагом `--boot`) и `relay`.
