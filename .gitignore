@@ -1,11 +1,6 @@
-bin/
-obj/
 target/
 artifacts/
-.vs/
 .idea/
-*.user
-*.suo
 
 # v2 workflow
 .worktrees/
