@@ -22,6 +22,14 @@ pub enum AgentError {
         /// Вывод stderr команды (для диагностики).
         stderr: String,
     },
+    /// Некорректный конфиг туннеля (например, `.conf` WireGuard):
+    /// отсутствуют обязательные ключи или строка не разбирается.
+    #[error("некорректный конфиг туннеля: {0}")]
+    InvalidConfig(String),
+    /// Не удалось поднять туннель (резолв endpoint, handshake и т.п.);
+    /// задача 11 маппирует в `bottle_core::protocol::err::TUNNEL_FAILED`.
+    #[error("не удалось поднять туннель: {0}")]
+    TunnelFailed(String),
     /// Ошибка ввода-вывода.
     #[error("ошибка ввода-вывода: {0}")]
     Io(#[from] io::Error),

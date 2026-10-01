@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 bottle-core = { path = "../core" }
 relay-lib = { path = "../relay-lib" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
 clap = { version = "4", features = ["derive"] }
@@ -19,3 +19,8 @@ serde = "1"
 thiserror = "2"
 tracing = "0.1"
 bytes = "1"
+
+[dev-dependencies]
+# Интеграционный тест wg_handshake входит в network namespace через setns(2):
+# echo-сервер теста слушает в srv-namespace на адресе wg-интерфейса.
+libc = "0.2"

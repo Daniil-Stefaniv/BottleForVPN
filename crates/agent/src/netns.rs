@@ -121,6 +121,10 @@ pub struct NetnsHandle {
     /// Процесс relay внутри namespace (после `execvp` это сам relay,
     /// а не `ip`: `ip netns exec` выполняет команду без fork).
     pub relay_child: Child,
+    /// Процесс wireguard-go туннеля внутри namespace
+    /// (`wg::tunnel_up_wg`/`wg::tunnel_down`, задача 10);
+    /// `None`, пока туннель не поднят.
+    pub tunnel_child: Option<Child>,
     /// Задачи мостов в default namespace (SOCKS5 + пробросы).
     pub bridge_tasks: JoinSet<()>,
 }
@@ -216,6 +220,7 @@ pub async fn netns_up(
             ns_name,
             slot: *slot,
             relay_child,
+            tunnel_child: None,
             bridge_tasks,
         }),
         Err(error) => {
@@ -277,6 +282,7 @@ pub fn netns_down(handle: NetnsHandle) -> Result<(), AgentError> {
     let NetnsHandle {
         ns_name,
         mut relay_child,
+        tunnel_child,
         mut bridge_tasks,
         ..
     } = handle;
@@ -285,6 +291,16 @@ pub fn netns_down(handle: NetnsHandle) -> Result<(), AgentError> {
         tracing::warn!(%error, "не удалось остановить relay-процесс {ns_name}");
     }
     let _ = relay_child.wait();
+
+    // Туннель обязан быть остановлен `wg::tunnel_down` раньше; здесь —
+    // защита от утечки: живой процесс удерживал бы namespace после
+    // удаления имени из /run/netns.
+    if let Some(mut tunnel_child) = tunnel_child {
+        if let Err(error) = tunnel_child.kill() {
+            tracing::warn!(%error, "не удалось остановить wireguard-процесс {ns_name}");
+        }
+        let _ = tunnel_child.wait();
+    }
 
     bridge_tasks.abort_all();
 
@@ -385,7 +401,7 @@ fn relay_exe_path() -> Result<PathBuf, AgentError> {
 
 /// Выполняет команду, захватывая вывод; неудача — [`AgentError::CommandFailed`]
 /// с командой и stderr в сообщении.
-fn run_cmd(program: &str, args: &[&str]) -> Result<String, AgentError> {
+pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<String, AgentError> {
     let output = Command::new(program).args(args).output().map_err(|e| {
         AgentError::Io(io::Error::new(
             e.kind(),
@@ -402,7 +418,7 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<String, AgentError> {
 }
 
 /// Выполняет команду внутри namespace через `ip netns exec`.
-fn run_in_ns(ns_name: &str, args: &[&str]) -> Result<String, AgentError> {
+pub(crate) fn run_in_ns(ns_name: &str, args: &[&str]) -> Result<String, AgentError> {
     let mut argv = vec!["netns", "exec", ns_name];
     argv.extend_from_slice(args);
     run_cmd("ip", &argv)

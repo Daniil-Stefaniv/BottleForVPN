@@ -9,3 +9,4 @@ pub mod error;
 pub mod netns;
 pub mod relay_run;
 pub mod token;
+pub mod wg;
