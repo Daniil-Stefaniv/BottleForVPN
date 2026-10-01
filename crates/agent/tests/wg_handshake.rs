@@ -6,14 +6,14 @@
 //! ```text
 //! [default ns: хост]            [ns t-wg-srv]              [ns bottle-t-wg]
 //!  p<idx> 10.77.idx.1 ←veth→    t-wg-s 10.77.253.1/30  ←veth→ b<idx> 10.77.idx.2
-//!  t-wg-h 10.77.253.2/30 ←──────┘        wg1 10.99.0.1           wg0 10.99.0.2
+//!  t-wg-h 10.77.253.2/30 ←──────┘      wgsrv 10.99.0.1        wg<idx> 10.99.0.2
 //!  SOCKS5-мост 0.0.0.0:49201             echo на 10.99.0.1      relay + туннель
 //! ```
 //!
 //! Хост маршрутизирует бутылку ↔ srv (ip_forward); бутылка поднимает
 //! туннель `tunnel_up_wg` до endpoint `10.77.253.1:51820` (IP — резолв
 //! замыкается на dotted-IPv4), эхо-проверка идёт SOCKS5-CONNECT'ом
-//! через мост → relay → wg0 → wg1 → echo. Запуск:
+//! через мост → relay → wg<idx> → wgsrv → echo. Запуск:
 //!
 //! ```sh
 //! sudo -E cargo test -p agent --test wg_handshake -- --ignored
@@ -64,7 +64,7 @@ const WG_READY_WAIT: Duration = Duration::from_secs(5);
 const WG_READY_POLL: Duration = Duration::from_millis(50);
 
 /// Полный сценарий: подъём туннеля с handshake и сквозной обмен данными
-/// SOCKS5 → relay → wg0 → wg1 → echo внутри srv-namespace.
+/// SOCKS5 → relay → wg<idx> → wgsrv → echo внутри srv-namespace.
 #[tokio::test]
 #[ignore = "нужны root, iproute2 и wireguard (CI-джоба agent-integration)"]
 async fn wg_handshake_and_socks5_over_tunnel() {
@@ -140,14 +140,16 @@ async fn wg_handshake_and_socks5_over_tunnel() {
     let cli_priv = wg_genkey();
     let cli_pub = wg_pubkey(&cli_priv);
 
-    // (3) Сервер WireGuard в srv: wireguard-go wg1 + setconf через stdin.
+    // (3) Сервер WireGuard в srv: wireguard-go wgsrv + setconf через stdin.
+    // Имя wgsrv не пересекается с бутылочными wg<idx> (слот 1 → wg1):
+    // UAPI-сокеты живут в общей файловой системе /var/run/wireguard.
     let mut srv_wg = Command::new("ip")
-        .args(["netns", "exec", NS_SRV, "wireguard-go", "wg1"])
+        .args(["netns", "exec", NS_SRV, "wireguard-go", "wgsrv"])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .expect("запустить wireguard-go в srv");
-    wait_wg_ready(NS_SRV, "wg1", &mut srv_wg);
+    wait_wg_ready(NS_SRV, "wgsrv", &mut srv_wg);
     let srv_conf = format!(
         "[Interface]\n\
          PrivateKey = {srv_priv}\n\
@@ -164,14 +166,14 @@ async fn wg_handshake_and_socks5_over_tunnel() {
             NS_SRV,
             "wg",
             "setconf",
-            "wg1",
+            "wgsrv",
             "/dev/stdin",
         ],
         &srv_conf,
     );
     run_ok(
         "ip",
-        &["netns", "exec", NS_SRV, "ip", "link", "set", "wg1", "up"],
+        &["netns", "exec", NS_SRV, "ip", "link", "set", "wgsrv", "up"],
     );
     run_ok(
         "ip",
@@ -184,10 +186,10 @@ async fn wg_handshake_and_socks5_over_tunnel() {
             "add",
             &format!("{WG_SRV_ADDR}/32"),
             "dev",
-            "wg1",
+            "wgsrv",
         ],
     );
-    // Ответы echo клиенту уходят через wg1 (AllowedIPs не создают маршруты).
+    // Ответы echo клиенту уходят через wgsrv (AllowedIPs не создают маршруты).
     run_ok(
         "ip",
         &[
@@ -199,7 +201,7 @@ async fn wg_handshake_and_socks5_over_tunnel() {
             "add",
             &format!("{WG_CLI_ADDR}/32"),
             "dev",
-            "wg1",
+            "wgsrv",
         ],
     );
 
@@ -233,7 +235,7 @@ async fn wg_handshake_and_socks5_over_tunnel() {
         .await
         .expect("tunnel_up_wg: handshake не состоялся за 30 с");
 
-    // (7) Сквозной путь: SOCKS5 CONNECT через мост → relay → wg0 → wg1 → echo.
+    // (7) Сквозной путь: SOCKS5 CONNECT через мост → relay → wg<idx> → wgsrv → echo.
     socks5_connect_echo_with_retry(SOCKS5_PORT, echo_addr).await;
 
     // (8) Разбор: туннель, бутылка, srv-стенд.

@@ -6,7 +6,8 @@
 //! [`resolve_endpoint_in_ns`]), остальное собирается в тело `wg setconf`.
 //!
 //! [`tunnel_up_wg`] поднимает userspace-реализацию `wireguard-go` внутри
-//! namespace, настраивает wg0, маршруты `0.0.0.0/1` + `128.0.0.0/1`
+//! namespace, настраивает wg-интерфейс (имя `wg<idx>` — уникально per
+//! слот, см. [`wg_iface_name`]), маршруты `0.0.0.0/1` + `128.0.0.0/1`
 //! (перекрывают default-маршрут, не ломая маршрут до самого endpoint)
 //! и ждёт первый handshake; [`tunnel_down`] останавливает процесс.
 
@@ -18,8 +19,17 @@ use std::time::{Duration, Instant};
 use crate::error::AgentError;
 use crate::netns::{run_cmd, run_in_ns, NetnsHandle};
 
-/// Имя интерфейса WireGuard внутри namespace бутылки.
-pub const WG_IFACE: &str = "wg0";
+/// Имя wg-интерфейса бутылки на слоте `idx`: `wg<idx>`.
+///
+/// Имя обязано быть уникальным среди одновременно поднятых бутылок:
+/// UAPI-сокет wireguard-go живёт в `/var/run/wireguard/<iface>.sock`
+/// — файловая система общая для всех network namespaces, и две бутылки
+/// с одинаковым именем интерфейса подрались бы за один сокет
+/// (второй `wireguard-go` не стартует, `wg show` уходил бы в чужой
+/// интерфейс).
+pub fn wg_iface_name(idx: u8) -> String {
+    format!("wg{idx}")
+}
 /// Предел ожидания первого handshake.
 const HANDSHAKE_WAIT: Duration = Duration::from_secs(30);
 /// Пауза между опросами `wg show ... latest-handshakes`.
@@ -78,27 +88,32 @@ pub fn parse_wg_config(text: &str) -> Result<ParsedWg, AgentError> {
                 "Interface]" => Section::Interface,
                 "Peer]" => Section::Peer,
                 _ => {
+                    // Первый токен — имя секции в скобках; значение секции
+                    // не бывает секретом, а остаток строки в ошибку не
+                    // попадает.
+                    let section_token = line.split_whitespace().next().unwrap_or("[]").to_string();
                     return Err(invalid_config(format!(
-                        "строка {}: неизвестная секция {line}",
+                        "строка {}: неизвестная секция {section_token}",
                         num + 1
-                    )))
+                    )));
                 }
             };
             continue;
         }
+        // Строка без «=» не позволяет отделить ключ от значения: сырую
+        // строку в ошибку не подставляем — там может оказаться PrivateKey.
         let (key, value) = line.split_once('=').ok_or_else(|| {
-            invalid_config(format!(
-                "строка {}: ожидается «ключ = значение»: {line}",
-                num + 1
-            ))
+            invalid_config(format!("строка {}: ожидается «ключ = значение»", num + 1))
         })?;
-        let entry = (key.trim().to_string(), value.trim().to_string());
+        let key = key.trim().to_string();
+        let entry = (key.clone(), value.trim().to_string());
         match section {
             Section::None => {
+                // Имя ключа безопасно для диагностики, значение — нет.
                 return Err(invalid_config(format!(
-                    "строка {}: ключ вне секции [Interface]/[Peer]: {line}",
+                    "строка {}: ключ \"{key}\" вне секции [Interface]/[Peer]",
                     num + 1
-                )))
+                )));
             }
             Section::Interface => iface.push(entry),
             Section::Peer => peer.push(entry),
@@ -194,18 +209,21 @@ pub async fn resolve_endpoint_in_ns(ns: &str, host: &str) -> Result<Ipv4Addr, Ag
     })
 }
 
-/// Поднимает WireGuard-туннель wg0 внутри namespace бутылки.
+/// Поднимает WireGuard-туннель `wg<idx>` (слот бутылки) внутри её
+/// namespace.
 ///
 /// Порядок: резолв endpoint (DNS — внутри namespace); запуск
-/// `wireguard-go wg0` (долгоживущий процесс, сохраняется в
+/// `wireguard-go wg<idx>` (долгоживущий процесс, сохраняется в
 /// `h.tunnel_child`); link up + адрес `/32`; `wg setconf` телом
 /// [`ParsedWg::setconf_body`] с дописанным `Endpoint = <ip>:<port>`;
 /// маршрут до endpoint `/32` через peer-gateway слота (упакованный
 /// трафик туннеля не уходит в сам туннель); маршруты `0.0.0.0/1` и
-/// `128.0.0.0/1` через wg0; ожидание первого handshake (≤30 с, иначе
-/// [`AgentError::TunnelFailed`] — код `TUNNEL_FAILED` у задачи 11).
+/// `128.0.0.0/1` через wg-интерфейс; ожидание первого handshake
+/// (≤30 с, иначе [`AgentError::TunnelFailed`] — код `TUNNEL_FAILED`
+/// у задачи 11).
 pub async fn tunnel_up_wg(h: &mut NetnsHandle, cfg: ParsedWg) -> Result<(), AgentError> {
     let ns = h.ns_name.clone();
+    let iface = wg_iface_name(h.slot.idx);
 
     let endpoint_host = cfg.endpoint_host.clone().ok_or_else(|| {
         AgentError::InvalidConfig("конфиг без Endpoint не может быть поднят как туннель".into())
@@ -213,15 +231,15 @@ pub async fn tunnel_up_wg(h: &mut NetnsHandle, cfg: ParsedWg) -> Result<(), Agen
     let endpoint_ip = resolve_endpoint_in_ns(&ns, &endpoint_host).await?;
 
     let child = Command::new("ip")
-        .args(["netns", "exec", &ns, "wireguard-go", WG_IFACE])
+        .args(["netns", "exec", &ns, "wireguard-go", &iface])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
     h.tunnel_child = Some(child);
 
     // wireguard-go создаёт интерфейс и UAPI-сокет асинхронно — ждём оба.
-    wait_wg_ready(&ns, h).await?;
-    run_in_ns(&ns, &["ip", "link", "set", WG_IFACE, "up"])?;
+    wait_wg_ready(&ns, &iface, h).await?;
+    run_in_ns(&ns, &["ip", "link", "set", &iface, "up"])?;
     run_in_ns(
         &ns,
         &[
@@ -230,7 +248,7 @@ pub async fn tunnel_up_wg(h: &mut NetnsHandle, cfg: ParsedWg) -> Result<(), Agen
             "add",
             &format!("{}/32", cfg.interface_addr),
             "dev",
-            WG_IFACE,
+            &iface,
         ],
     )?;
 
@@ -243,7 +261,7 @@ pub async fn tunnel_up_wg(h: &mut NetnsHandle, cfg: ParsedWg) -> Result<(), Agen
     conf.push(':');
     conf.push_str(&cfg.endpoint_port.to_string());
     conf.push('\n');
-    run_in_ns_stdin(&ns, &["wg", "setconf", WG_IFACE, "/dev/stdin"], &conf)?;
+    run_in_ns_stdin(&ns, &["wg", "setconf", &iface, "/dev/stdin"], &conf)?;
 
     run_in_ns(
         &ns,
@@ -256,14 +274,14 @@ pub async fn tunnel_up_wg(h: &mut NetnsHandle, cfg: ParsedWg) -> Result<(), Agen
             &h.slot.peer.to_string(),
         ],
     )?;
-    run_in_ns(&ns, &["ip", "route", "add", "0.0.0.0/1", "dev", WG_IFACE])?;
-    run_in_ns(&ns, &["ip", "route", "add", "128.0.0.0/1", "dev", WG_IFACE])?;
+    run_in_ns(&ns, &["ip", "route", "add", "0.0.0.0/1", "dev", &iface])?;
+    run_in_ns(&ns, &["ip", "route", "add", "128.0.0.0/1", "dev", &iface])?;
 
-    wait_handshake(&ns, h).await
+    wait_handshake(&ns, &iface, h).await
 }
 
 /// Останавливает туннель: завершает процесс wireguard-go из
-/// `h.tunnel_child` (интерфейс wg0 исчезает вместе с процессом).
+/// `h.tunnel_child` (wg-интерфейс исчезает вместе с процессом).
 ///
 /// Ошибки логируются, не паникуют; повторный вызов — no-op.
 /// Маршруты и адрес удалять не нужно: они живут в namespace бутылки
@@ -279,7 +297,7 @@ pub fn tunnel_down(h: &mut NetnsHandle) {
 
 /// Ждёт готовности wireguard-go: `wg show` отвечает, когда существуют
 /// и интерфейс, и UAPI-сокет. Ранний выход — если процесс умер.
-async fn wait_wg_ready(ns: &str, h: &mut NetnsHandle) -> Result<(), AgentError> {
+async fn wait_wg_ready(ns: &str, iface: &str, h: &mut NetnsHandle) -> Result<(), AgentError> {
     let deadline = Instant::now() + WG_READY_WAIT;
     loop {
         if tunnel_child_dead(h) {
@@ -287,12 +305,12 @@ async fn wait_wg_ready(ns: &str, h: &mut NetnsHandle) -> Result<(), AgentError> 
                 "процесс wireguard-go завершился при старте".into(),
             ));
         }
-        if run_in_ns(ns, &["wg", "show", WG_IFACE]).is_ok() {
+        if run_in_ns(ns, &["wg", "show", iface]).is_ok() {
             return Ok(());
         }
         if Instant::now() + WG_READY_POLL > deadline {
             return Err(AgentError::TunnelFailed(format!(
-                "wireguard-go не готов за {} с (интерфейс {WG_IFACE})",
+                "wireguard-go не готов за {} с (интерфейс {iface})",
                 WG_READY_WAIT.as_secs()
             )));
         }
@@ -300,13 +318,13 @@ async fn wait_wg_ready(ns: &str, h: &mut NetnsHandle) -> Result<(), AgentError> 
     }
 }
 
-/// Ждёт первый handshake: `wg show wg0 latest-handshakes` возвращает
+/// Ждёт первый handshake: `wg show <iface> latest-handshakes` возвращает
 /// unix-время последнего handshake (>0). Ранний выход — если процесс
 /// wireguard-go умер.
-async fn wait_handshake(ns: &str, h: &mut NetnsHandle) -> Result<(), AgentError> {
+async fn wait_handshake(ns: &str, iface: &str, h: &mut NetnsHandle) -> Result<(), AgentError> {
     let deadline = Instant::now() + HANDSHAKE_WAIT;
     loop {
-        if let Ok(output) = run_in_ns(ns, &["wg", "show", WG_IFACE, "latest-handshakes"]) {
+        if let Ok(output) = run_in_ns(ns, &["wg", "show", iface, "latest-handshakes"]) {
             let ts = output
                 .split_whitespace()
                 .nth(1)
@@ -322,7 +340,7 @@ async fn wait_handshake(ns: &str, h: &mut NetnsHandle) -> Result<(), AgentError>
         }
         if Instant::now() + HANDSHAKE_POLL > deadline {
             return Err(AgentError::TunnelFailed(format!(
-                "handshake {WG_IFACE} не произошёл за {} с",
+                "handshake {iface} не произошёл за {} с",
                 HANDSHAKE_WAIT.as_secs()
             )));
         }
@@ -475,6 +493,67 @@ mod tests {
         assert!(
             matches!(err, AgentError::InvalidConfig(_)),
             "ожидалась InvalidConfig: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_separator_error_does_not_leak_value() {
+        // Строка без «=»: в ошибке только номер строки — значение
+        // (здесь — секрет) не интерполируется.
+        let err = parse_wg_config("[Interface]\nPrivateKey secret123abc\n")
+            .expect_err("строка без «=» должна быть отклонена");
+        let message = err.to_string();
+        assert!(
+            !message.contains("secret123abc"),
+            "ошибка не должна раскрывать значение: {message}"
+        );
+        assert!(
+            message.contains("строка 2"),
+            "номер строки нужен для диагностики: {message}"
+        );
+    }
+
+    #[test]
+    fn key_outside_section_error_names_key_but_not_value() {
+        // Ключ до любой секции: в ошибке имя ключа, но не значение.
+        let err =
+            parse_wg_config("PrivateKey = secret123abc\n[Interface]\nAddress = 10.8.0.2/32\n")
+                .expect_err("ключ вне секции должен быть отклонён");
+        let message = err.to_string();
+        assert!(
+            !message.contains("secret123abc"),
+            "ошибка не должна раскрывать значение: {message}"
+        );
+        assert!(
+            message.contains("PrivateKey"),
+            "имя ключа безопасно и нужно для диагностики: {message}"
+        );
+    }
+
+    #[test]
+    fn unknown_section_error_shows_only_section_token() {
+        let err =
+            parse_wg_config("[Peers] PrivateKey = secret123abc\n").expect_err("неизвестная секция");
+        let message = err.to_string();
+        assert!(
+            !message.contains("secret123abc"),
+            "ошибка не должна раскрывать остаток строки: {message}"
+        );
+        assert!(
+            message.contains("[Peers]"),
+            "токен секции нужен для диагностики: {message}"
+        );
+    }
+
+    #[test]
+    fn wg_iface_name_is_per_slot() {
+        assert_eq!(wg_iface_name(1), "wg1");
+        assert_eq!(wg_iface_name(42), "wg42");
+        assert_eq!(wg_iface_name(250), "wg250");
+        assert_ne!(
+            wg_iface_name(1),
+            wg_iface_name(2),
+            "слоты не должны делить имя"
         );
     }
 
