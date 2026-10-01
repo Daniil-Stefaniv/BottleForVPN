@@ -186,6 +186,7 @@ dependencies = [
  "bytes",
  "dirs",
  "getrandom 0.3.4",
+ "relay-lib",
  "serde",
  "serde_json",
  "tempfile",

@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 bottle-core = { path = "../core" }
+# Хост-сторона data-plane: serve_forward (127.0.0.1:port → vm_ip:port).
+relay-lib = { path = "../relay-lib" }
 # dyn-совместимый трейт WslRunner (async fn в трейте не dyn-совместимны).
 async-trait = "0.1"
 # Токен аплаенса: 32 случайных байта (на unix — getentropy/urandom,

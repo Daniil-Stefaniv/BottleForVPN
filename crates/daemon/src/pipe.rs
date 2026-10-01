@@ -10,6 +10,7 @@ use bottle_core::ipc::{BottleSummary, CliReply, CliRequest};
 use bottle_core::profile::BottleProfile;
 
 use crate::error::DaemonError;
+use crate::manager::BottleManager;
 use crate::store::Store;
 
 #[cfg(windows)]
@@ -35,34 +36,62 @@ use tokio_util::sync::CancellationToken;
 #[cfg(windows)]
 use crate::Daemon;
 
-/// Переходный ответ на команды управления до Task 16 (менеджер бутылок).
-const COMMAND_NOT_WIRED: &str = "команда ещё не подключена (Task 16)";
+/// Переходный ответ на команды управления, когда менеджер бутылок не
+/// подключён (только тесты и dev-сборки без аплаенса).
+const MANAGER_NOT_WIRED: &str = "менеджер бутылок не подключён";
 
-/// Диспетчер команд CLI: обслуживает запрос из хранилища `store`.
+/// Диспетчер команд CLI: `List`/`Show` читают хранилище `store`,
+/// `Start`/`Stop`/`Status` и рантайм `Show` обслуживает менеджер бутылок
+/// (если подключён).
 ///
-/// Чистая функция (побочные эффекты — только чтение хранилища и warn-логи);
-/// асинхронность — контракт для Task 16, где Start/Stop/Status уйдут
-/// в менеджер бутылок. `List` возвращает только валидные профили: для
-/// битого файла честных полей строки списка нет (тип неизвестен), поэтому
-/// он пропускается с warn-логом. `Show` на отсутствующем/битом профиле
-/// отвечает пустым ответом — `profile: None` (клиент показывает «не найден»).
+/// Побочные эффекты — только чтение хранилища, вызовы менеджера и
+/// warn-логи; битые профили в `List` пропускаются с warn-логом. `Show`
+/// на отсутствующем/битом профиле отвечает `profile: None` (клиент
+/// показывает «не найден»); рантайм берётся из `manager.status`.
 // Вызывается windows-транспортом; на остальных платформах — только тестами.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub async fn dispatch(store: &Store, req: CliRequest) -> CliReply {
+pub async fn dispatch(store: &Store, manager: Option<&BottleManager>, req: CliRequest) -> CliReply {
     match req {
         CliRequest::List => CliReply::List {
             bottles: list_summaries(store),
         },
         CliRequest::Show { id } => CliReply::Show {
             profile: show_profile(store, &id),
-            // Рантайм-состояние появится вместе с менеджером (Task 16).
-            runtime: None,
+            runtime: match manager {
+                Some(manager) => manager.status().await.into_iter().find(|rt| rt.id == id),
+                None => None,
+            },
         },
-        CliRequest::Start { .. } | CliRequest::Stop { .. } | CliRequest::Status => {
-            CliReply::Error {
-                message: COMMAND_NOT_WIRED.to_string(),
-            }
-        }
+        CliRequest::Start { id } => match manager {
+            Some(manager) => manager
+                .start(&id)
+                .await
+                .unwrap_or_else(|error| CliReply::Error {
+                    message: error.to_string(),
+                }),
+            None => CliReply::Error {
+                message: MANAGER_NOT_WIRED.to_string(),
+            },
+        },
+        CliRequest::Stop { id } => match manager {
+            Some(manager) => manager
+                .stop(&id)
+                .await
+                .unwrap_or_else(|error| CliReply::Error {
+                    message: error.to_string(),
+                }),
+            None => CliReply::Error {
+                message: MANAGER_NOT_WIRED.to_string(),
+            },
+        },
+        CliRequest::Status => match manager {
+            Some(manager) => CliReply::Status {
+                bottles: manager.status().await,
+            },
+            None => CliReply::Error {
+                message: MANAGER_NOT_WIRED.to_string(),
+            },
+        },
     }
 }
 
@@ -76,7 +105,7 @@ fn list_summaries(store: &Store) -> Vec<BottleSummary> {
                 id: profile.id,
                 name: profile.name,
                 kind: profile.kind,
-                // До Task 16 демон не поднимает бутылки — состояния нет.
+                // Список не опрашивает менеджер: состояние знает Show/Status.
                 state: None,
             }),
             Err(error) => tracing::warn!(%id, %error, "битый профиль пропущен в списке"),
@@ -154,7 +183,7 @@ async fn handle_connection(pipe: NamedPipeServer, daemon: &Daemon, shutdown: &Ca
             () = shutdown.cancelled() => break,
         };
 
-        let reply = dispatch(&daemon.store, req).await;
+        let reply = dispatch(&daemon.store, daemon.manager.as_deref(), req).await;
         if let Err(e) = send_reply(&mut write_half, &mut reply_codec, reply).await {
             tracing::warn!(error = %e, "не удалось отправить ответ CLI");
             break;
@@ -284,7 +313,7 @@ endpoints = ["e.example"]
     async fn list_returns_summaries_of_valid_profiles_only() {
         let (_tmp, store) = store_with_broken_profile();
 
-        let reply = dispatch(&store, CliRequest::List).await;
+        let reply = dispatch(&store, None, CliRequest::List).await;
 
         let CliReply::List { bottles } = reply else {
             panic!("ожидали List, получили {reply:?}");
@@ -302,7 +331,7 @@ endpoints = ["e.example"]
     async fn list_over_empty_store_is_empty() {
         let (_tmp, store) = empty_store();
 
-        let reply = dispatch(&store, CliRequest::List).await;
+        let reply = dispatch(&store, None, CliRequest::List).await;
 
         assert_eq!(
             reply,
@@ -317,6 +346,7 @@ endpoints = ["e.example"]
 
         let reply = dispatch(
             &store,
+            None,
             CliRequest::Show {
                 id: "corp-vpn".to_string(),
             },
@@ -338,6 +368,7 @@ endpoints = ["e.example"]
 
         let reply = dispatch(
             &store,
+            None,
             CliRequest::Show {
                 id: "ghost".to_string(),
             },
@@ -368,11 +399,11 @@ endpoints = ["e.example"]
 
         for req in commands {
             assert_eq!(
-                dispatch(&store, req).await,
+                dispatch(&store, None, req).await,
                 CliReply::Error {
-                    message: COMMAND_NOT_WIRED.to_string(),
+                    message: MANAGER_NOT_WIRED.to_string(),
                 },
-                "до Task 16 команды управления отвечают переходной ошибкой"
+                "без менеджера команды управления отвечают переходной ошибкой"
             );
         }
     }
@@ -446,7 +477,10 @@ endpoints = ["e.example"]
         let (_tmp, store) = store_with_broken_profile();
         let pipe_name = unique_pipe_name("basic");
         let shutdown = CancellationToken::new();
-        let daemon = Arc::new(crate::Daemon { store });
+        let daemon = Arc::new(crate::Daemon {
+            store,
+            manager: None,
+        });
         let (server_pipe_name, server_shutdown) = (pipe_name.clone(), shutdown.clone());
         let server =
             tokio::spawn(async move { serve(&server_pipe_name, daemon, server_shutdown).await });
@@ -464,7 +498,7 @@ endpoints = ["e.example"]
         );
         assert!(
             bottles.iter().all(|b| b.state.is_none()),
-            "до Task 16 рантайм-состояния нет"
+            "список не опрашивает менеджер"
         );
 
         // Show существующего: профиль с диска, рантайма нет.
@@ -514,7 +548,10 @@ endpoints = ["e.example"]
 
         let pipe_name = unique_pipe_name("seq");
         let shutdown = CancellationToken::new();
-        let daemon = Arc::new(crate::Daemon { store });
+        let daemon = Arc::new(crate::Daemon {
+            store,
+            manager: None,
+        });
         let (server_pipe_name, server_shutdown) = (pipe_name.clone(), shutdown.clone());
         let server =
             tokio::spawn(async move { serve(&server_pipe_name, daemon, server_shutdown).await });

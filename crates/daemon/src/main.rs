@@ -3,39 +3,41 @@
 //! Открывает хранилище профилей в каталоге данных (`--data-dir`, по
 //! умолчанию — локальный каталог данных пользователя) и обслуживает канал
 //! управления CLI (named pipe `\\.\pipe\bottled`): List/Show читают
-//! хранилище, Start/Stop/Status подключаются в Task 16. Повторный запуск
-//! отклоняется single-instance мьютексом; остановка — Ctrl+C.
+//! хранилище, Start/Stop/Status обслуживает менеджер бутылок
+//! (`--rootfs` — тарболл аплаенса, по умолчанию кладётся установщиком
+//! в `<каталог данных>/appliance/`). Повторный запуск отклоняется
+//! single-instance мьютексом; остановка — Ctrl+C.
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(windows)]
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
 /// Целостное состояние демона, обслуживаемое каналом управления.
 ///
-/// Поле менеджера бутылок (реальные Start/Stop/Status) подключается
-/// в Task 16; до него команды управления отвечают переходной ошибкой.
+/// `manager` — менеджер бутылок (реальные Start/Stop/Status); `None`
+/// остаётся тестам и dev-сборкам без аплаенса.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub struct Daemon {
     /// Хранилище профилей бутылок.
     pub store: store::Store,
+    /// Менеджер жизненного цикла бутылок.
+    pub manager: Option<Arc<manager::BottleManager>>,
 }
 
 // На не-windows диспетчер вызывается только тестами (транспорт — named
 // pipe Windows), поэтому модулям нужно allow; на windows цепочка
 // main -> serve -> dispatch держит всё живым — это проверяется clippy
 // по target x86_64-pc-windows-msvc и windows-джобой CI.
-// Импорт аплаенса, провижининг токена и соединение с агентом
-// подключаются к диспетчеру команд в Task 16 — до этого модуль живёт
-// только своими тестами (на обеих платформах), поэтому allow.
 #[allow(dead_code)]
 mod appliance;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod error;
 mod instance;
+#[allow(dead_code)]
+mod manager;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pipe;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -45,11 +47,11 @@ mod store;
 async fn main() -> ExitCode {
     init_tracing();
 
-    let data_dir = match parse_data_dir(std::env::args_os().skip(1)) {
-        Ok(dir) => dir,
+    let args = match parse_cli_args(std::env::args_os().skip(1)) {
+        Ok(args) => args,
         Err(message) => {
             eprintln!("bottled: {message}");
-            eprintln!("использование: bottled [--data-dir <PATH>]");
+            eprintln!("использование: bottled [--data-dir <PATH>] [--rootfs <PATH>]");
             return ExitCode::FAILURE;
         }
     };
@@ -59,7 +61,7 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    if let Err(error) = serve_daemon(data_dir, shutdown_on_ctrl_c()).await {
+    if let Err(error) = serve_daemon(args.data_dir, args.rootfs, shutdown_on_ctrl_c()).await {
         tracing::error!(%error, "bottled завершился с ошибкой");
         eprintln!("bottled: {error}");
         return ExitCode::FAILURE;
@@ -70,17 +72,36 @@ async fn main() -> ExitCode {
 
 /// Открывает хранилище и обслуживает канал управления до отмены `shutdown`.
 ///
-/// Шов для Task 16/17: менеджер бутылок встанет внутрь [`Daemon`], а цикл
-/// [`pipe::serve`] и диспетчер останутся прежними.
-pub async fn serve_daemon(data_dir: PathBuf, shutdown: CancellationToken) -> std::io::Result<()> {
+/// На Windows создаётся менеджер бутылок с реальным подключением
+/// к аплаенсу (импорт/токен/handshake — `appliance::ensure_appliance`).
+pub async fn serve_daemon(
+    data_dir: PathBuf,
+    rootfs_tar: PathBuf,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
     let store = store::Store::open(&data_dir)?;
     println!("Демон BottleForApps запущен");
     println!("Каталог данных: {}", store.data_root().display());
+    println!("Rootfs аплаенса: {}", rootfs_tar.display());
 
     #[cfg(windows)]
     {
         println!("Канал управления: {}", bottle_core::ipc::DAEMON_PIPE);
-        let daemon = Arc::new(Daemon { store });
+        let connect = Arc::new(manager::RealAgentConnect::new(
+            Arc::new(appliance::RealWsl),
+            data_dir,
+            rootfs_tar,
+            manager::AGENT_CONNECT_TIMEOUT,
+        ));
+        // Менеджер владеет своим экземпляром хранилища того же корня.
+        let manager_store = store::Store::open(store.data_root())?;
+        let daemon = Arc::new(Daemon {
+            store,
+            manager: Some(Arc::new(manager::BottleManager::new(
+                manager_store,
+                connect,
+            ))),
+        });
         pipe::serve(bottle_core::ipc::DAEMON_PIPE, daemon, shutdown).await
     }
 
@@ -95,32 +116,56 @@ pub async fn serve_daemon(data_dir: PathBuf, shutdown: CancellationToken) -> std
     }
 }
 
-/// Разбирает аргументы командной строки: `--data-dir <PATH>` или
-/// `--data-dir=<PATH>`. Без флага — каталог данных по умолчанию.
-fn parse_data_dir<I>(args: I) -> Result<PathBuf, String>
+/// Аргументы командной строки демона.
+struct CliArgs {
+    /// Каталог данных (хранилище профилей, токен аплаенса).
+    data_dir: PathBuf,
+    /// Тарболл rootfs аплаенса для `wsl --import`.
+    rootfs: PathBuf,
+}
+
+/// Имя файла rootfs внутри `<data_dir>/appliance/` (кладётся установщиком).
+const ROOTFS_FILE_NAME: &str = "bottleforapps-rootfs.tar.gz";
+
+/// Разбирает аргументы командной строки: `--data-dir <PATH>` / `--rootfs
+/// <PATH>` (также формы через `=`). Без `--data-dir` — каталог данных по
+/// умолчанию; без `--rootfs` — `<data_dir>/appliance/<ROOTFS_FILE_NAME>`
+/// (dev-запуски передают `--rootfs` явно).
+fn parse_cli_args<I>(args: I) -> Result<CliArgs, String>
 where
     I: Iterator<Item = OsString>,
 {
+    let flag_value = |args: &mut I, flag: &str| -> Result<OsString, String> {
+        args.next().ok_or_else(|| format!("для {flag} нужен путь"))
+    };
+    let strip = |arg: &OsString, flag: &str| -> Option<OsString> {
+        arg.to_str()
+            .and_then(|a| a.strip_prefix(flag))
+            .map(OsString::from)
+    };
+
     let mut data_dir = None;
+    let mut rootfs = None;
     let mut args = args;
     while let Some(arg) = args.next() {
         if arg.as_os_str() == OsStr::new("--data-dir") {
-            let value = args
-                .next()
-                .ok_or_else(|| "для --data-dir нужен путь".to_string())?;
+            data_dir = Some(PathBuf::from(flag_value(&mut args, "--data-dir")?));
+        } else if let Some(value) = strip(&arg, "--data-dir=") {
             data_dir = Some(PathBuf::from(value));
-        } else if let Some(value) = arg.to_str().and_then(|a| a.strip_prefix("--data-dir=")) {
-            data_dir = Some(PathBuf::from(value));
+        } else if arg.as_os_str() == OsStr::new("--rootfs") {
+            rootfs = Some(PathBuf::from(flag_value(&mut args, "--rootfs")?));
+        } else if let Some(value) = strip(&arg, "--rootfs=") {
+            rootfs = Some(PathBuf::from(value));
         } else {
             return Err(format!("неизвестный аргумент: {}", arg.to_string_lossy()));
         }
     }
-    match data_dir {
-        Some(dir) => Ok(dir),
-        None => default_data_dir().ok_or_else(|| {
-            "не удалось определить локальный каталог данных; укажите --data-dir <PATH>".to_string()
-        }),
-    }
+
+    let data_dir = data_dir.or_else(default_data_dir).ok_or_else(|| {
+        "не удалось определить локальный каталог данных; укажите --data-dir <PATH>".to_string()
+    })?;
+    let rootfs = rootfs.unwrap_or_else(|| data_dir.join("appliance").join(ROOTFS_FILE_NAME));
+    Ok(CliArgs { data_dir, rootfs })
 }
 
 /// Каталог данных по умолчанию: `<локальный каталог данных>/BottleForApps`.
@@ -162,29 +207,67 @@ mod tests {
     #[test]
     fn data_dir_accepts_space_and_equals_forms() {
         assert_eq!(
-            parse_data_dir(args(&["--data-dir", "/tmp/bfa"])).unwrap(),
+            parse_cli_args(args(&["--data-dir", "/tmp/bfa"]))
+                .unwrap()
+                .data_dir,
             PathBuf::from("/tmp/bfa")
         );
         assert_eq!(
-            parse_data_dir(args(&["--data-dir=/tmp/bfa2"])).unwrap(),
+            parse_cli_args(args(&["--data-dir=/tmp/bfa2"]))
+                .unwrap()
+                .data_dir,
             PathBuf::from("/tmp/bfa2")
         );
     }
 
     #[test]
-    fn data_dir_without_value_is_error() {
-        assert!(parse_data_dir(args(&["--data-dir"])).is_err());
+    fn rootfs_accepts_space_and_equals_forms() {
+        assert_eq!(
+            parse_cli_args(args(&[
+                "--data-dir",
+                "/tmp/bfa",
+                "--rootfs",
+                "/tmp/rootfs.tar.gz"
+            ]))
+            .unwrap()
+            .rootfs,
+            PathBuf::from("/tmp/rootfs.tar.gz")
+        );
+        assert_eq!(
+            parse_cli_args(args(&["--data-dir", "/tmp/bfa", "--rootfs=/tmp/r.tar"]))
+                .unwrap()
+                .rootfs,
+            PathBuf::from("/tmp/r.tar")
+        );
+    }
+
+    #[test]
+    fn rootfs_defaults_into_data_dir_appliance() {
+        let parsed = parse_cli_args(args(&["--data-dir", "/tmp/bfa"])).unwrap();
+        assert_eq!(
+            parsed.rootfs,
+            PathBuf::from("/tmp/bfa/appliance").join(ROOTFS_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn flags_without_value_are_error() {
+        assert!(parse_cli_args(args(&["--data-dir"])).is_err());
+        assert!(
+            parse_cli_args(args(&["--data-dir", "/tmp/bfa", "--rootfs"])).is_err(),
+            "для --rootfs нужен путь"
+        );
     }
 
     #[test]
     fn unknown_argument_is_error() {
-        assert!(parse_data_dir(args(&["--verbose"])).is_err());
+        assert!(parse_cli_args(args(&["--verbose"])).is_err());
     }
 
     #[test]
     fn no_args_fall_back_to_default_data_dir() {
-        let dir = parse_data_dir(args(&[]))
+        let parsed = parse_cli_args(args(&[]))
             .expect("локальный каталог данных определён в тестовом окружении");
-        assert!(dir.ends_with("BottleForApps"));
+        assert!(parsed.data_dir.ends_with("BottleForApps"));
     }
 }

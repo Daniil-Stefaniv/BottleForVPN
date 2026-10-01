@@ -369,6 +369,19 @@ pub struct ApplianceHandle {
 }
 
 impl ApplianceHandle {
+    /// Собирает handle поверх соединения с уже выполненным handshake.
+    ///
+    /// Тестовый шов менеджера (`manager`): фейк-агенты выполняют
+    /// `Hello`/`HelloAck` сами и оборачивают поток этим методом.
+    #[cfg(test)]
+    pub(crate) fn wrap(vm_ip: Ipv4Addr, stream: TcpStream) -> Self {
+        let _ = stream.set_nodelay(true);
+        Self {
+            vm_ip,
+            conn: Framed::new(stream, AgentCodec),
+        }
+    }
+
     /// Отправляет запрос и ждёт ответ на него.
     ///
     /// Таймаут — [`REPLY_TIMEOUT`]: handshake-подобные `Up` длинные.
