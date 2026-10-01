@@ -430,7 +430,7 @@ fn netns_etc_dir(ns_name: &str) -> PathBuf {
 }
 
 /// Удаляет каталог `/etc/netns/<ns>`; отсутствие — не ошибка.
-fn remove_netns_etc(ns_name: &str) {
+pub(crate) fn remove_netns_etc(ns_name: &str) {
     match fs::remove_dir_all(netns_etc_dir(ns_name)) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -440,7 +440,7 @@ fn remove_netns_etc(ns_name: &str) {
 
 /// Выставляет точные права: режим, заданный при создании, маскируется umask.
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> Result<(), AgentError> {
+pub(crate) fn set_mode(path: &Path, mode: u32) -> Result<(), AgentError> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     Ok(())

@@ -18,9 +18,12 @@ clap = { version = "4", features = ["derive"] }
 serde = "1"
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 bytes = "1"
+# boot_cleanup завершает осиротевшие relay/туннели сигналами (kill(2)).
+libc = "0.2"
 
 [dev-dependencies]
-# Интеграционный тест wg_handshake входит в network namespace через setns(2):
-# echo-сервер теста слушает в srv-namespace на адресе wg-интерфейса.
-libc = "0.2"
+# Интеграционные тесты (wg_handshake, bottles_e2e) входят в network
+# namespace через setns(2): echo-сервер теста слушает в srv-namespace
+# на адресе wg-интерфейса.

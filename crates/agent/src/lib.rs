@@ -4,6 +4,7 @@
 //! (`tests/netns_lifecycle.rs`) могли вызывать [`netns::netns_up`] и
 //! [`netns::netns_down`] напрямую.
 
+pub mod bottles;
 pub mod control;
 pub mod error;
 pub mod netns;

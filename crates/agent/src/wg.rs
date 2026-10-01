@@ -349,7 +349,7 @@ async fn wait_handshake(ns: &str, iface: &str, h: &mut NetnsHandle) -> Result<()
 }
 
 /// Завершился ли процесс туннеля (отсутствие процесса тоже «завершился»).
-fn tunnel_child_dead(h: &mut NetnsHandle) -> bool {
+pub(crate) fn tunnel_child_dead(h: &mut NetnsHandle) -> bool {
     h.tunnel_child.as_mut().is_none_or(|child| {
         child
             .try_wait()

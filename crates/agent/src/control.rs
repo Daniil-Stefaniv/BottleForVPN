@@ -4,6 +4,7 @@
 //! после авторизации диспетчеризуются запросы демона. Кадры —
 //! [`bottle_core::frame::LengthJsonCodec`].
 
+use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
@@ -17,6 +18,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, FramedRead};
 use tokio_util::sync::CancellationToken;
+
+use crate::bottles::Bottles;
 
 /// Адрес control-сервера: слушаем все интерфейсы аплаенса.
 pub const CONTROL_BIND_ADDR: &str = "0.0.0.0:7777";
@@ -40,7 +43,6 @@ impl Default for ControlConfig {
 ///
 /// `authed` сбрасывается при каждом новом соединении: каждый клиент
 /// обязан пройти `Hello` заново.
-#[derive(Debug)]
 pub struct AgentState {
     /// Ожидаемый токен авторизации.
     pub token: String,
@@ -48,15 +50,31 @@ pub struct AgentState {
     pub vm_ip: Ipv4Addr,
     /// Прошёл ли текущий клиент handshake `Hello`.
     pub authed: AtomicBool,
+    /// Реестр бутылок: сюда диспетчеризуются `Up`/`Down`/`Status`.
+    pub bottles: Arc<Bottles>,
+}
+
+/// Debug маскирует токен: derive печатал бы секрет целиком, а логи
+/// агента доступны диагностики аплаенса.
+impl fmt::Debug for AgentState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentState")
+            .field("token", &"<скрыт>")
+            .field("vm_ip", &self.vm_ip)
+            .field("authed", &self.authed)
+            .field("bottles", &self.bottles.status(None).len())
+            .finish()
+    }
 }
 
 impl AgentState {
     /// Создаёт состояние с ещё не авторизованным клиентом.
-    pub fn new(token: String, vm_ip: Ipv4Addr) -> Self {
+    pub fn new(token: String, vm_ip: Ipv4Addr, bottles: Arc<Bottles>) -> Self {
         Self {
             token,
             vm_ip,
             authed: AtomicBool::new(false),
+            bottles,
         }
     }
 }
@@ -79,9 +97,9 @@ pub fn detect_vm_ip() -> io::Result<Ipv4Addr> {
 
 /// Диспетчеризация одного запроса поверх состояния агента.
 ///
-/// Единственный побочный эффект — перевод `authed` в `true`
-/// при успешном `Hello`. Версия проверяется раньше токена:
-/// несовпадение версии диагностируется однозначно.
+/// Побочные эффекты: `Hello` авторизует клиента, `Up`/`Down`/`Status`
+/// уходят в [`Bottles`]. Версия проверяется раньше токена: несовпадение
+/// версии диагностируется однозначно.
 pub async fn handle_request(state: &AgentState, req: AgentRequest) -> AgentReply {
     match req {
         AgentRequest::Hello { version, token } => {
@@ -105,11 +123,11 @@ pub async fn handle_request(state: &AgentState, req: AgentRequest) -> AgentReply
         _ if !state.authed.load(Ordering::SeqCst) => {
             error_reply(err::AUTH, "сначала Hello с корректным токеном")
         }
-        // Управление бутылками появится в Task 11.
-        AgentRequest::Up(_) | AgentRequest::Down { .. } => {
-            error_reply(err::BAD_REQUEST, "не подключено (Task 11)")
-        }
-        AgentRequest::Status { .. } => AgentReply::Status { bottles: vec![] },
+        AgentRequest::Up(args) => state.bottles.up(args).await,
+        AgentRequest::Down { id } => state.bottles.down(&id).await,
+        AgentRequest::Status { id } => AgentReply::Status {
+            bottles: state.bottles.status(id.as_deref()),
+        },
         AgentRequest::Shutdown => AgentReply::Ok,
     }
 }
@@ -222,11 +240,16 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+    use crate::bottles::Bottles;
     use bottle_core::profile::TunnelProtocol;
-    use bottle_core::protocol::{err, UpArgs};
+    use bottle_core::protocol::UpArgs;
 
     fn state() -> AgentState {
-        AgentState::new("secret-token".to_string(), Ipv4Addr::new(192, 168, 77, 5))
+        AgentState::new(
+            "secret-token".to_string(),
+            Ipv4Addr::new(192, 168, 77, 5),
+            Arc::new(Bottles::new()),
+        )
     }
 
     fn hello(version: u32, token: &str) -> AgentRequest {
@@ -247,9 +270,9 @@ mod tests {
         }
     }
 
-    fn up_args() -> UpArgs {
+    fn up_args(id: &str) -> UpArgs {
         UpArgs {
-            id: "office-a".to_string(),
+            id: id.to_string(),
             protocol: TunnelProtocol::WireGuard,
             config: String::new(),
             dns: None,
@@ -302,22 +325,43 @@ mod tests {
         assert_eq!(reply, AgentReply::Status { bottles: vec![] });
     }
 
+    #[test]
+    fn agent_state_debug_masks_token() {
+        let debug = format!("{:?}", state());
+        assert!(
+            !debug.contains("secret-token"),
+            "Debug не должен раскрывать токен: {debug}"
+        );
+        assert!(
+            debug.contains("token"),
+            "поле token присутствует замаскированным: {debug}"
+        );
+    }
+
     #[tokio::test]
-    async fn up_and_down_after_auth_are_bad_request_until_task_11() {
+    async fn up_with_invalid_id_after_auth_is_bad_request() {
+        // Барьер id срабатывает до системных вызовов — тест работает
+        // на любой ОС и ничего не создаёт (Review Focus #1).
         let st = state();
         authorized(&st).await;
+        for id in ["../evil", "офис"] {
+            let reply = handle_request(&st, AgentRequest::Up(up_args(id))).await;
+            assert_eq!(error_code(reply), err::BAD_REQUEST, "id {id}");
+        }
+    }
 
-        let up = handle_request(&st, AgentRequest::Up(up_args())).await;
-        assert_eq!(error_code(up), err::BAD_REQUEST);
-
-        let down = handle_request(
+    #[tokio::test]
+    async fn down_unknown_id_after_auth_is_not_found() {
+        let st = state();
+        authorized(&st).await;
+        let reply = handle_request(
             &st,
             AgentRequest::Down {
-                id: "office-a".to_string(),
+                id: "ghost".to_string(),
             },
         )
         .await;
-        assert_eq!(error_code(down), err::BAD_REQUEST);
+        assert_eq!(error_code(reply), err::NOT_FOUND);
     }
 
     #[tokio::test]
