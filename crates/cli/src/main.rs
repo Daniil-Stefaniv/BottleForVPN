@@ -8,6 +8,7 @@
 mod render;
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use bottle_core::ipc::{CliReply, CliRequest};
 use clap::{Parser, Subcommand};
@@ -59,6 +60,28 @@ impl Command {
             Command::Stop { id } => CliRequest::Stop { id: id.clone() },
             Command::Status => CliRequest::Status,
         }
+    }
+}
+
+/// Ожидание ответа демона для быстрых команд (list/show/status/stop).
+#[cfg_attr(not(windows), allow(dead_code))]
+const REPLY_TIMEOUT: Duration = Duration::from_secs(40);
+/// Ожидание ответа демона для `start`: холодный старт складывается из
+/// импорта аплаенса в WSL (десятки секунд), подключения агента (~30 с),
+/// handshake туннеля (~30 с) и возможного ретрая при занятом порте —
+/// худший случай превышает базовые 40 с.
+#[cfg_attr(not(windows), allow(dead_code))]
+const REPLY_TIMEOUT_START: Duration = Duration::from_secs(120);
+
+/// Таймаут ответа демона зависит от команды: `start` — долгая операция,
+/// остальные укладываются в базовое ожидание.
+// Выбирается windows-транспортом; на остальных платформах — только
+// тестами (как `Command::to_request`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn reply_timeout(request: &CliRequest) -> Duration {
+    match request {
+        CliRequest::Start { .. } => REPLY_TIMEOUT_START,
+        _ => REPLY_TIMEOUT,
     }
 }
 
@@ -140,6 +163,7 @@ mod client {
     use std::io;
     use std::time::Duration;
 
+    use super::reply_timeout;
     use bottle_core::frame::{FrameError, LengthJsonCodec};
     use bottle_core::ipc::{CliReply, CliRequest, DAEMON_PIPE};
     use bytes::BytesMut;
@@ -151,10 +175,11 @@ mod client {
 
     /// Окно повторных попыток подключения. Демон обслуживает клиентов по
     /// одному и пересоздаёт экземпляр канала между соединениями — в этот
-    /// момент канал «занят» или «не существует», и это ожидаемо.
-    const CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(2);
-    /// Ожидание ответа: `start` поднимает WSL-аплаенс и туннель — долго.
-    const REPLY_TIMEOUT: Duration = Duration::from_secs(40);
+    /// момент канал «занят» или «не существует», и это ожидаемо. Пока идёт
+    /// чужой длинный `start`, канал занят всю его длительность, поэтому
+    /// окно должно покрывать холодный старт целиком: импорт аплаенса +
+    /// подключение агента + handshake туннеля. 60 с хватает с запасом.
+    const CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(60);
     /// Пауза между попытками подключения.
     const CONNECT_RETRY_PAUSE: Duration = Duration::from_millis(50);
 
@@ -165,8 +190,8 @@ mod client {
         #[error("Не удалось подключиться к демону BottleForApps — запущен ли bottled?")]
         DaemonUnavailable,
         /// Демон не прислал ответ за отведённое время.
-        #[error("Демон не ответил за {} с", REPLY_TIMEOUT.as_secs())]
-        Timeout,
+        #[error("Демон не ответил за {} с", .0.as_secs())]
+        Timeout(Duration),
         /// Демон закрыл соединение, не ответив.
         #[error("Демон закрыл соединение без ответа")]
         Closed,
@@ -185,11 +210,11 @@ mod client {
         let mut reader = FramedRead::new(read_half, LengthJsonCodec::<CliReply>::new());
         send_request(&mut write_half, request).await?;
 
-        match tokio::time::timeout(REPLY_TIMEOUT, reader.next()).await {
+        match tokio::time::timeout(reply_timeout(request), reader.next()).await {
             Ok(Some(Ok(reply))) => Ok(reply),
             Ok(Some(Err(error))) => Err(ClientError::Frame(error)),
             Ok(None) => Err(ClientError::Closed),
-            Err(_) => Err(ClientError::Timeout),
+            Err(_) => Err(ClientError::Timeout(reply_timeout(request))),
         }
     }
 
@@ -269,6 +294,30 @@ mod tests {
                 Cli::try_parse_from(["bottle", command]).is_err(),
                 "«{command}» без id должен отказывать"
             );
+        }
+    }
+
+    #[test]
+    fn reply_timeout_is_per_command() {
+        // `start` — длинная операция: холодный старт (импорт аплаенса,
+        // агент, handshake) не укладывается в базовое ожидание.
+        assert_eq!(
+            reply_timeout(&CliRequest::Start {
+                id: "office-a".to_string()
+            }),
+            Duration::from_secs(120)
+        );
+        for request in [
+            CliRequest::List,
+            CliRequest::Status,
+            CliRequest::Show {
+                id: "office-a".to_string(),
+            },
+            CliRequest::Stop {
+                id: "office-a".to_string(),
+            },
+        ] {
+            assert_eq!(reply_timeout(&request), Duration::from_secs(40));
         }
     }
 

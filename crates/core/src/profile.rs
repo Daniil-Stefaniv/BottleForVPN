@@ -77,7 +77,8 @@ pub struct ExposeConfig {
 /// Профиль бутылки — валидированное содержимое `bottles/<id>.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BottleProfile {
-    /// Идентификатор `[a-z0-9-]`, начинается с буквы или цифры; имя файла = id.
+    /// Идентификатор `[a-z0-9-]`, начинается с буквы или цифры, не
+    /// совпадает с резервированным именем Windows; имя файла = id.
     pub id: String,
     /// Человекочитаемое имя.
     pub name: String,
@@ -89,8 +90,9 @@ pub struct BottleProfile {
 /// Ошибки разбора и валидации профиля.
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileError {
-    /// id не соответствует `[a-z0-9-]` или не начинается с буквы/цифры.
-    #[error("invalid profile id: expected [a-z0-9-] starting with a letter or digit")]
+    /// id не соответствует `[a-z0-9-]`, не начинается с буквы/цифры
+    /// или совпадает с резервированным именем устройства Windows.
+    #[error("invalid profile id: expected [a-z0-9-] starting with a letter or digit, not a Windows reserved name")]
     InvalidId,
     /// Порт вне диапазона 0..=65535 (кроме 0 = автоподбор).
     #[error("invalid port: expected 0..=65535")]
@@ -112,7 +114,21 @@ pub enum ProfileError {
     Toml(#[from] toml::de::Error),
 }
 
-/// Проверяет id бутылки: непустой, только `[a-z0-9-]`, начинается с буквы или цифры.
+/// Резервированные имена устройств Windows. id бутылки становится именем
+/// файла `bottles/<id>.toml`, а Windows считает такие имена устройствами
+/// независимо от расширения (`nul.toml` так же неоткрываем, как `nul`) —
+/// поэтому точное совпадение с ними запрещено. Алфавит id уже ограничен
+/// lowercase (`[a-z0-9-]`), так что регистронезависимость покрыта самим
+/// алфавитом и достаточно прямого сравнения.
+const WINDOWS_RESERVED_NAMES: [&str; 22] = [
+    "con", "prn", "aux", "nul", //
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", //
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Проверяет id бутылки: непустой, только `[a-z0-9-]`, начинается с
+/// буквы или цифры и не совпадает с резервированным именем устройства
+/// Windows (см. [`WINDOWS_RESERVED_NAMES`]).
 pub fn validate_id(id: &str) -> Result<(), ProfileError> {
     let valid = !id.is_empty()
         && id
@@ -121,7 +137,8 @@ pub fn validate_id(id: &str) -> Result<(), ProfileError> {
             .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && id
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !WINDOWS_RESERVED_NAMES.contains(&id);
     if valid {
         Ok(())
     } else {
@@ -399,6 +416,24 @@ config = "c.conf"
                 matches!(validate_id(id), Err(ProfileError::InvalidId)),
                 "expected InvalidId for {id:?}"
             );
+        }
+    }
+
+    #[test]
+    fn windows_reserved_ids_are_rejected() {
+        // id = имя файла bottles/<id>.toml: точное совпадение с
+        // резервированным именем Windows неоткрываемо/опасно.
+        for id in [
+            "con", "prn", "aux", "nul", "com1", "com5", "com9", "lpt1", "lpt9",
+        ] {
+            assert!(
+                matches!(validate_id(id), Err(ProfileError::InvalidId)),
+                "expected InvalidId for reserved id {id:?}"
+            );
+        }
+        // Режется только точное совпадение: похожие id легальны.
+        for id in ["console", "contact", "aux2x", "com1x", "nul0"] {
+            validate_id(id).unwrap_or_else(|e| panic!("expected valid id {id:?}: {e}"));
         }
     }
 
