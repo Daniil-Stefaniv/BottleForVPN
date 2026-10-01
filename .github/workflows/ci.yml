@@ -34,3 +34,14 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y iproute2 iptables wireguard-tools wireguard-go
       # Все root-интеграционные тесты (netns_lifecycle, wg_handshake) — #[ignore].
       - run: sudo -E cargo test -p agent -- --ignored
+
+  appliance-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Сборка rootfs-апплайенса (Alpine + bottle-agent) и smoke внутри docker.
+      - run: bash appliance/build-rootfs.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bottleforapps-rootfs
+          path: artifacts/bottleforapps-rootfs.tar.gz

@@ -1,0 +1,7 @@
+target/
+.git/
+artifacts/
+.superpowers/
+.worktrees/
+docs/
+.github/

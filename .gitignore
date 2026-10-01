@@ -11,3 +11,6 @@ artifacts/
 .worktrees/
 .superpowers/
 .DS_Store
+
+# генерируется appliance/build-rootfs.sh из версии workspace
+appliance/overlay/etc/bottle-appliance-version
