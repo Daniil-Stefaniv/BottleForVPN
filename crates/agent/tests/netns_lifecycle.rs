@@ -34,7 +34,12 @@ const RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Полный цикл: подъём namespace с relay внутри, SOCKS5 через мост,
 /// разбор, повторный подъём на том же слоте.
-#[tokio::test]
+///
+/// multi_thread обязателен: SOCKS5-проверка ниже — блокирующий std-сокет,
+/// а мост — задача того же рантайма; в current-thread рантайме
+/// блокирующий клиент замораживает планировщик и ответ моста не может
+/// быть прочитан (проверено минимальным воспроизведением).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "нужны root и iproute2 (запускается CI-джобой agent-integration)"]
 async fn netns_up_down_lifecycle() {
     assert_root();
