@@ -983,6 +983,7 @@ mod tests {
             dns: None,
             socks5_port: 0,
             forwards: Vec::new(),
+            instance: 0,
         });
         assert_eq!(
             handle.send(up).await.expect("Up отвечает"),

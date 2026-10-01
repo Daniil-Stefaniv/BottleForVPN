@@ -126,6 +126,7 @@ mod tests {
     fn sample_request() -> AgentRequest {
         AgentRequest::Down {
             id: "office-a".to_string(),
+            instance: 7,
         }
     }
 

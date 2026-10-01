@@ -49,14 +49,27 @@ const OPENVPN_WAIT: Duration = Duration::from_secs(60);
 /// Пауза между опросами tun0.
 const OPENVPN_POLL: Duration = Duration::from_secs(1);
 
+/// Живая бутылка в реестре: ручка namespace плюс instance-поколение
+/// демона, поднявшего её ([`UpArgs::instance`]).
+///
+/// Поколение хранится здесь, а не в [`NetnsHandle`]: это метаданные
+/// жизненного цикла демона, netns-слой о них не знает. `Down` чужого
+/// поколения ([`err::STALE_INSTANCE`]) не получает ручку вовсе.
+struct LiveBottle {
+    /// Ресурсы network namespace бутылки.
+    handle: NetnsHandle,
+    /// Поколение демона, которому принадлежит бутылка.
+    instance: u64,
+}
+
 /// Реестр живых бутылок: полный Up/Down/Status поверх слоёв 8–10.
 ///
-/// `inner` хранит ручки поднятых namespace'ов, `slots` — занятость
+/// `inner` хранит живые бутылки по идентификатору, `slots` — занятость
 /// сетевых слотов. std-мьютексы с короткими критическими секциями:
 /// под локом нет ни одного `await`.
 pub struct Bottles {
     /// Живые бутылки по идентификатору.
-    inner: Mutex<HashMap<String, NetnsHandle>>,
+    inner: Mutex<HashMap<String, LiveBottle>>,
     /// Таблица занятости слотов подсетей.
     slots: Mutex<SlotTable>,
 }
@@ -70,15 +83,32 @@ impl Bottles {
         }
     }
 
+    /// Помещает «живую» бутылку в реестр без провижининга — тестовый
+    /// шов для проверки instance-семантики `Down` без root и namespaces
+    /// (unit-тесты `bottles`/`control`; root-стенды поднимают настоящие
+    /// бутылки через `up`).
+    #[cfg(test)]
+    pub fn insert_for_test(&self, id: &str, instance: u64) {
+        lock(&self.inner).insert(
+            id.to_string(),
+            LiveBottle {
+                handle: dummy_handle(id),
+                instance,
+            },
+        );
+    }
+
     /// Поднимает бутылку по аргументам `Up`: namespace + relay + мосты +
     /// туннель. Успех — [`AgentReply::Ready`]; любая неудача — полный
     /// разбор сделанного и [`AgentReply::Error`] с кодом
     /// [`map_agent_error`].
     ///
-    /// Порядок (предписан): барьер id; живой id → `ALREADY_UP`; выделение
-    /// слота; `set_dns` (до туннеля — DNS-endpoint WireGuard резолвится
-    /// в namespace через `/etc/netns/<ns>/resolv.conf`); `netns_up`;
-    /// конфиг в tmpfs; туннель; `Ready`.
+    /// Порядок (предписан): барьер id; живой id → `ALREADY_UP` (поколение
+    /// живой бутылки не перезаписывается — её `Down` останется за
+    /// владельцем); выделение слота; `set_dns` (до туннеля — DNS-endpoint
+    /// WireGuard резолвится в namespace через `/etc/netns/<ns>/resolv.conf`);
+    /// `netns_up`; конфиг в tmpfs; туннель; `Ready`. Поколение
+    /// [`UpArgs::instance`] сохраняется вместе с бутылкой.
     pub async fn up(&self, args: UpArgs) -> AgentReply {
         // Барьер идентификатора: id попадает в пути /run/netns, /etc/netns
         // и /run/bottles — "../evil" отсекается до любых обращений к системе.
@@ -102,19 +132,41 @@ impl Bottles {
         }
     }
 
-    /// Опускает бутылку: туннель, namespace (с relay и мостами), слот,
-    /// tmpfs-каталог. Отсутствующий id — [`err::NOT_FOUND`].
-    pub async fn down(&self, id: &str) -> AgentReply {
+    /// Опускает бутылку СВОЕГО поколения: туннель, namespace (с relay
+    /// и мостами), слот, tmpfs-каталог.
+    ///
+    /// Отсутствующий id — [`err::NOT_FOUND`]. `instance`, не равный
+    /// сохранённому с бутылкой поколению, — [`err::STALE_INSTANCE`]:
+    /// бутылку не трогаем вовсе (защита от TOCTOU «Down проигравшего
+    /// рестарта убивает живую бутылку победителя», протокол v2).
+    pub async fn down(&self, id: &str, instance: u64) -> AgentReply {
         if let Err(error) = netns_name(id) {
             return map_agent_error(error);
         }
-        let mut handle = match lock(&self.inner).remove(id) {
-            Some(handle) => handle,
+        // Проверка и вынимание — под одним локом: чужое поколение
+        // возвращает ручку в реестр атомарно, бутылка остаётся живой.
+        let mut inner = lock(&self.inner);
+        let entry = match inner.remove(id) {
+            Some(entry) => entry,
             None => {
                 return error_reply(err::NOT_FOUND, &format!("бутылка {id} не найдена"));
             }
         };
+        if entry.instance != instance {
+            let stored = entry.instance;
+            inner.insert(id.to_string(), entry);
+            drop(inner);
+            return error_reply(
+                err::STALE_INSTANCE,
+                &format!(
+                    "бутылка {id} принадлежит поколению {stored}, запрос — {instance}; \
+                     бутылка не тронута"
+                ),
+            );
+        }
+        drop(inner);
 
+        let mut handle = entry.handle;
         let slot_idx = handle.slot.idx;
         let run_dir = bottle_run_dir(id);
         tunnel_down(&mut handle);
@@ -163,7 +215,13 @@ impl Bottles {
         let mut handle = netns_up(&slot, &args.id, &args.forwards, args.socks5_port).await?;
         match launch_tunnel(&mut handle, args).await {
             Ok(()) => {
-                lock(&self.inner).insert(args.id.clone(), handle);
+                lock(&self.inner).insert(
+                    args.id.clone(),
+                    LiveBottle {
+                        handle,
+                        instance: args.instance,
+                    },
+                );
                 Ok(())
             }
             Err(error) => {
@@ -495,6 +553,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Ручка namespace без реальных ресурсов для тестового шва
+/// [`Bottles::insert_for_test`]: короткоживущий процесс вместо relay,
+/// без туннеля и мостов.
+#[cfg(test)]
+fn dummy_handle(id: &str) -> NetnsHandle {
+    NetnsHandle {
+        id: id.to_string(),
+        ns_name: format!("bottle-{id}"),
+        slot: Slot::new(1),
+        // «true» мгновенно завершается — down-путь получит уже мёртвый
+        // процесс, kill/wait которого безопасны (ESRCH логируется).
+        relay_child: Command::new("true")
+            .spawn()
+            .expect("запустить процесс-заглушку"),
+        tunnel_child: None,
+        bridge_tasks: tokio::task::JoinSet::new(),
+    }
+}
+
 /// Собирает ответ-ошибку.
 fn error_reply(code: &str, message: &str) -> AgentReply {
     AgentReply::Error {
@@ -576,6 +653,7 @@ mod tests {
             dns: None,
             socks5_port: 0,
             forwards: vec![],
+            instance: 0,
         };
         let reply = bottles.up(args).await;
         assert_eq!(reply.code(), err::BAD_REQUEST, "барьер id на уровне API");
@@ -595,6 +673,7 @@ mod tests {
             dns: None,
             socks5_port: 0,
             forwards: vec![],
+            instance: 0,
         };
         let reply = bottles.up(args).await;
         assert_eq!(reply.code(), err::BAD_REQUEST);
@@ -603,8 +682,53 @@ mod tests {
     #[tokio::test]
     async fn down_unknown_id_is_not_found() {
         let bottles = Bottles::new();
-        let reply = bottles.down("ghost").await;
+        let reply = bottles.down("ghost", 0).await;
         assert_eq!(reply.code(), err::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn down_with_foreign_instance_is_stale_and_bottle_stays_alive() {
+        let bottles = Bottles::new();
+        bottles.insert_for_test("office-a", 7);
+
+        let reply = bottles.down("office-a", 8).await;
+        assert_eq!(
+            reply.code(),
+            err::STALE_INSTANCE,
+            "чужое поколение — код STALE_INSTANCE"
+        );
+
+        // Бутылка жива: реестр не тронут (любое чужое поколение — ниже
+        // или выше сохранённого — одинаково отвергается).
+        for foreign in [0u64, 6, 8, u64::MAX] {
+            let reply = bottles.down("office-a", foreign).await;
+            assert_eq!(reply.code(), err::STALE_INSTANCE, "instance {foreign}");
+        }
+        assert_eq!(
+            bottles.status(Some("office-a")),
+            vec![BottleStatusInfo {
+                id: "office-a".to_string(),
+                state: "up".to_string(),
+                detail: None,
+            }],
+            "бутылка чужого поколения не опускается"
+        );
+    }
+
+    #[tokio::test]
+    async fn down_with_own_instance_removes_bottle_from_registry() {
+        let bottles = Bottles::new();
+        bottles.insert_for_test("office-a", 7);
+
+        // Свой instance — бутылка разбирается. Teardown выполняет
+        // системные команды (ip netns del и др.), которые без root
+        // завершаются ошибкой — значим факт удаления из реестра,
+        // а не код ответа.
+        let _reply = bottles.down("office-a", 7).await;
+        assert!(
+            bottles.status(Some("office-a")).is_empty(),
+            "бутылка своего поколения удалена из реестра"
+        );
     }
 
     #[test]

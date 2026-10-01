@@ -14,9 +14,10 @@
 //! Проверяется контракт `Bottles`: `up` → `Ready`; tmpfs-каталог
 //! `/run/bottles/<id>/` с конфигом и pid-файлами; `Status(Some)` →
 //! state "up"; повторный `up` того же id → `ALREADY_UP`; сквозные
-//! SOCKS5 и TCP-проброс через мосты до echo; `down` → `Ok` и полное
-//! освобождение (namespace, порты, слоты); `up` другого id после
-//! `down` работает. Запуск:
+//! SOCKS5 и TCP-проброс через мосты до echo; `down` чужого
+//! instance-поколения → `STALE_INSTANCE` и бутылка жива (протокол v2);
+//! `down` своего поколения → `Ok` и полное освобождение (namespace,
+//! порты, слоты); `up` другого id после `down` работает. Запуск:
 //!
 //! ```sh
 //! sudo -E cargo test -p agent --test bottles_e2e -- --ignored
@@ -64,6 +65,8 @@ const WG_PORT: u16 = 51820;
 const SOCKS5_PORT: u16 = 49210;
 /// Порт TCP-проброса бутылки в default namespace.
 const FORWARD_PORT: u16 = 49211;
+/// Instance-поколение демона в этом стенде (протокол v2).
+const INSTANCE: u64 = 7;
 /// Общий предел ожидания асинхронных событий (relay, echo).
 const WAIT: Duration = Duration::from_secs(15);
 /// Пауза между попытками.
@@ -231,6 +234,7 @@ async fn bottles_up_down_full_cycle() {
             port: FORWARD_PORT,
             target: format!("{WG_SRV_ADDR}:{}", echo_addr.port()),
         }],
+        instance: INSTANCE,
     };
 
     let reply = bottles.up(args.clone()).await;
@@ -277,8 +281,23 @@ async fn bottles_up_down_full_cycle() {
     // (9) Сквозной TCP-проброс: мост 49211 → relay → туннель → echo.
     forward_connect_echo_with_retry(FORWARD_PORT).await;
 
-    // (10) Down → Ok; namespace и tmpfs-каталог разобраны полностью.
-    let reply = bottles.down(ID).await;
+    // (10) Down чужого поколения → STALE_INSTANCE, бутылка жива
+    // (протокол v2: TOCTOU-защита от Down проигравшего рестарта).
+    let reply = bottles.down(ID, INSTANCE + 1).await;
+    assert_eq!(
+        error_code(reply),
+        err::STALE_INSTANCE,
+        "чужое поколение → STALE_INSTANCE"
+    );
+    assert_eq!(
+        bottles.status(Some(ID)).len(),
+        1,
+        "бутылка жива после чужого Down"
+    );
+
+    // (11) Down своего поколения → Ok; namespace и tmpfs-каталог
+    // разобраны полностью.
+    let reply = bottles.down(ID, INSTANCE).await;
     assert_eq!(reply, AgentReply::Ok, "down → Ok");
     let list = ip_netns_list();
     assert!(
@@ -290,7 +309,7 @@ async fn bottles_up_down_full_cycle() {
         "tmpfs-каталог {run_dir:?} не удалён после down"
     );
 
-    // (11) Слоты и порты свободны: up другого id на тех же портах работает.
+    // (12) Слоты и порты свободны: up другого id на тех же портах работает.
     let args2 = UpArgs {
         id: ID2.to_string(),
         ..args
@@ -305,10 +324,10 @@ async fn bottles_up_down_full_cycle() {
     );
     // Мосты переиспользуют освобождённые порты: сквозной путь жив.
     socks5_connect_echo_with_retry(SOCKS5_PORT, echo_addr).await;
-    let reply = bottles.down(ID2).await;
+    let reply = bottles.down(ID2, INSTANCE).await;
     assert_eq!(reply, AgentReply::Ok, "down второй бутылки → Ok");
 
-    // (12) Разбор стенда.
+    // (13) Разбор стенда.
     kill_wait(&mut srv_wg);
     let _ = Command::new("ip").args(["netns", "del", NS_SRV]).status();
     let _ = Command::new("ip").args(["link", "del", VETH_HOST]).status();

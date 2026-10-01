@@ -7,6 +7,11 @@
 //! резолвит порты сам (диапазон 49152–65535 при автоподборе) — агенту
 //! уходят только конкретные номера, `socks5_port = 0` не отправляется.
 //!
+//! Протокол v2: `Up` и `Down` несут instance-поколение бутылки (номер
+//! поколения маркера `starting`). Агент опускает бутылку только `Down`
+//! с сохранным поколением — `Down` проигравшего рестарта получает
+//! `STALE_INSTANCE` и не гасит живую бутылку победителя.
+//!
 //! Контракт конкурентности: runtime-карта живёт под одним мьютексом,
 //! лок удерживается только на коротких участках без `await`; долгие
 //! операции (соединение с агентом, `Up` с handshake туннеля) выполняются
@@ -225,8 +230,9 @@ impl BottleManager {
             );
         }
 
-        // Фаза 2: длинные операции без лока.
-        let outcome = self.provision(&profile).await;
+        // Фаза 2: длинные операции без лока; instance-поколение этого
+        // старта сопровождает Up (агент сохранит его с бутылкой).
+        let outcome = self.provision(&profile, generation).await;
 
         // Фаза 3: короткий лок. Маркер жив, только если в карте лежит
         // запись нашего поколения: stop вынимает запись, перезапуск
@@ -268,7 +274,7 @@ impl BottleManager {
                 drop(made.listeners);
                 if superseded_by_restart {
                     tracing::warn!(id, "запуск отменён перезапуском: ресурсы освобождены");
-                } else if let Err(error) = self.send_down(id).await {
+                } else if let Err(error) = self.send_down(id, generation).await {
                     tracing::warn!(
                         id,
                         %error,
@@ -321,7 +327,9 @@ impl BottleManager {
         };
         runtime.state = BottleState::Stopping;
 
-        if let Err(error) = self.send_down(id).await {
+        // Down несёт поколение вынутой записи — опускаем именно свою
+        // бутылку (чужую агент отвергнет STALE_INSTANCE).
+        if let Err(error) = self.send_down(id, runtime.generation).await {
             tracing::warn!(id, %error, "агенту не удалось отправить Down; продолжаю остановку");
         }
 
@@ -363,8 +371,14 @@ impl BottleManager {
 
     /// Фаза 2 `start`: резерв портов, чтение конфига, `Up` → `Ready`,
     /// задачи проброса. При ошибке всё сделанное освобождается
-    /// (резерв-слушатели дропаются — порты свободны).
-    async fn provision(&self, profile: &BottleProfile) -> Result<Provisioned, String> {
+    /// (резерв-слушатели дропаются — порты свободны). `instance` —
+    /// поколение этого старта, оно сопровождает `Up` и компенсирующий
+    /// `Down` (агент хранит его с бутылкой).
+    async fn provision(
+        &self,
+        profile: &BottleProfile,
+        instance: u64,
+    ) -> Result<Provisioned, String> {
         let VpnConfig::Env { protocol, .. } = &profile.vpn else {
             return Err(HOST_KIND_MESSAGE.to_string()); // start() уже отфильтровал
         };
@@ -382,9 +396,16 @@ impl BottleManager {
 
         // Up; PORT_BUSY → перевыбор динамических портов (фиксированные
         // бинды сохраняются — их порт изменить нельзя) и повтор ровно
-        // один раз (RF#5).
+        // один раз (RF#5). Повтор — то же поколение: instance у обеих
+        // попыток одинаков.
         let selection = match handle
-            .send(up_args(profile, protocol, config.clone(), &selection)?)
+            .send(up_args(
+                profile,
+                protocol,
+                config.clone(),
+                &selection,
+                instance,
+            )?)
             .await
         {
             Ok(AgentReply::Ready { .. }) => selection,
@@ -392,7 +413,7 @@ impl BottleManager {
                 tracing::warn!(id = %profile.id, "агент сообщил PORT_BUSY: перевыбор портов");
                 let retry = retry_ports(profile, selection)?;
                 match handle
-                    .send(up_args(profile, protocol, config, &retry)?)
+                    .send(up_args(profile, protocol, config, &retry, instance)?)
                     .await
                 {
                     Ok(AgentReply::Ready { .. }) => retry,
@@ -424,6 +445,7 @@ impl BottleManager {
             if let Err(error) = handle
                 .send(AgentRequest::Down {
                     id: profile.id.clone(),
+                    instance,
                 })
                 .await
             {
@@ -437,13 +459,29 @@ impl BottleManager {
         })
     }
 
-    /// Отправляет агенту `Down`; `NOT_FOUND` (бутылки в аплаенсе уже нет)
-    /// считается успехом.
-    async fn send_down(&self, id: &str) -> Result<(), DaemonError> {
+    /// Отправляет агенту `Down` с instance-поколением бутылки.
+    ///
+    /// `NOT_FOUND` (бутылки в аплаенсе уже нет) и `STALE_INSTANCE`
+    /// (под этим id живёт бутылка чужого, более нового поколения —
+    /// выиграл рестарт; своя уже заменена) считаются успехом: в обоих
+    /// случаях опускать нечего, защита живой бутылки сработала.
+    async fn send_down(&self, id: &str, instance: u64) -> Result<(), DaemonError> {
         let mut handle = self.connect.connect().await?;
-        match handle.send(AgentRequest::Down { id: id.to_string() }).await {
+        let request = AgentRequest::Down {
+            id: id.to_string(),
+            instance,
+        };
+        match handle.send(request).await {
             Ok(AgentReply::Ok) => Ok(()),
             Ok(AgentReply::Error { code, .. }) if code == err::NOT_FOUND => Ok(()),
+            Ok(AgentReply::Error { code, .. }) if code == err::STALE_INSTANCE => {
+                tracing::info!(
+                    id,
+                    instance,
+                    "агент сохранил бутылку чужого поколения (STALE_INSTANCE)"
+                );
+                Ok(())
+            }
             Ok(AgentReply::Error { code, message }) => Err(DaemonError::Appliance(format!(
                 "агент отверг Down ({code}): {message}"
             ))),
@@ -604,12 +642,14 @@ fn read_config(data_root: &Path, vpn: &VpnConfig) -> Result<String, String> {
         .map_err(|error| format!("не удалось прочитать конфиг {}: {error}", path.display()))
 }
 
-/// Собирает запрос `Up` из профиля и выбранного резерва портов.
+/// Собирает запрос `Up` из профиля, выбранного резерва портов и
+/// instance-поколения старта (агент сохранит его с бутылкой).
 fn up_args(
     profile: &BottleProfile,
     protocol: TunnelProtocol,
     config: String,
     selection: &HostListeners,
+    instance: u64,
 ) -> Result<AgentRequest, String> {
     Ok(AgentRequest::Up(UpArgs {
         id: profile.id.clone(),
@@ -618,6 +658,7 @@ fn up_args(
         dns: profile.expose.dns,
         socks5_port: selection.socks5_port()?,
         forwards: selection.forward_specs(),
+        instance,
     }))
 }
 
@@ -782,8 +823,13 @@ mod tests {
     #[derive(Clone, Default)]
     struct AgentJournal {
         ups: Arc<Mutex<Vec<UpArgs>>>,
-        downs: Arc<Mutex<Vec<String>>>,
+        downs: Arc<Mutex<Vec<(String, u64)>>>,
         relays: Arc<Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>>,
+        /// Живые бутылки по протоколу v2: id → instance-поколение `Up`,
+        /// создавшего бутылку. Регистрируются при ответе `Ready` (как
+        /// в настоящем агенте — реестр до ответа), `Down` проверяет
+        /// поколение: чужое → `STALE_INSTANCE`, бутылка не трогается.
+        live: Arc<Mutex<HashMap<String, u64>>>,
     }
 
     impl AgentJournal {
@@ -791,7 +837,7 @@ mod tests {
             self.ups.lock().unwrap().clone()
         }
 
-        fn downs(&self) -> Vec<String> {
+        fn downs(&self) -> Vec<(String, u64)> {
             self.downs.lock().unwrap().clone()
         }
 
@@ -820,7 +866,15 @@ mod tests {
     /// In-process фейк-агент: control-сервер на кадрах `bottle_core::frame`
     /// (последовательные соединения демона), после `Ready` поднимает relay
     /// на «vm_ip»: SOCKS5-эхо на socks5-порту, обычное эхо на портах
-    /// пробросов.
+    /// пробросов. Протокол v2: помнит instance-поколение каждого `Up`
+    /// (журнал `live`), `Down` чужого поколения → `STALE_INSTANCE`
+    /// без разбора relay.
+    ///
+    /// От настоящего агента отличается конкурентностью: сессии
+    /// обслуживаются параллельно (настоящий — по одной), поэтому при
+    /// гонке наложившихся `Up` поздний `Ready` проигравшего перезапишет
+    /// поколение в `live` — тестам менеджера это не важно, релеи
+    /// накапливаются и гасятся только `Down` своего поколения.
     ///
     /// «vm_ip» — реальный локальный IPv4 хоста: адреса 127.0.0.2+ (весь
     /// 127/8) доступны для bind только на Linux, macOS/Windows требуют
@@ -947,11 +1001,7 @@ mod tests {
         while let Some(Ok(request)) = reader.next().await {
             let reply = match request {
                 AgentRequest::Up(args) => up_reply(args, &behavior, &journal, vm_ip).await,
-                AgentRequest::Down { id } => {
-                    journal.downs.lock().unwrap().push(id.clone());
-                    journal.drop_relays(&id);
-                    AgentReply::Ok
-                }
+                AgentRequest::Down { id, instance } => down_reply(id, instance, &journal),
                 AgentRequest::Status { .. } => AgentReply::Status {
                     bottles: Vec::new(),
                 },
@@ -962,6 +1012,32 @@ mod tests {
                 },
             };
             send_frame(&mut write_half, &mut codec, reply).await;
+        }
+    }
+
+    /// Ответ на `Down` по семантике протокола v2: бутылки нет —
+    /// `NOT_FOUND`; чужое поколение — `STALE_INSTANCE`, бутылка и relay
+    /// живы; своё поколение — разбор relay и `Ok`.
+    fn down_reply(id: String, instance: u64, journal: &AgentJournal) -> AgentReply {
+        journal.downs.lock().unwrap().push((id.clone(), instance));
+        let owned = journal.live.lock().unwrap().get(&id).copied();
+        match owned {
+            None => AgentReply::Error {
+                code: err::NOT_FOUND.to_string(),
+                message: format!("бутылка {id} не найдена"),
+            },
+            Some(live_instance) if live_instance != instance => AgentReply::Error {
+                code: err::STALE_INSTANCE.to_string(),
+                message: format!(
+                    "бутылка {id} принадлежит поколению {live_instance}, запрос — {instance}; \
+                     бутылка не тронута"
+                ),
+            },
+            Some(_) => {
+                journal.live.lock().unwrap().remove(&id);
+                journal.drop_relays(&id);
+                AgentReply::Ok
+            }
         }
     }
 
@@ -984,6 +1060,13 @@ mod tests {
                 handles.push(spawn_echo_relay(vm_ip, forward.port).await);
             }
             journal.remember_relays(&args.id, handles);
+            // Бутылка регистрируется до ответа Ready — как в настоящем
+            // агенте (реестр Bottles пополняется перед Ready).
+            journal
+                .live
+                .lock()
+                .unwrap()
+                .insert(args.id.clone(), args.instance);
             AgentReply::Ready {
                 id: args.id.clone(),
             }
@@ -1130,8 +1213,9 @@ mod tests {
             .expect("чтение эха");
         assert_eq!(&echoed, b"ping");
 
-        // Агент получил ровно один Up с содержимым конфига и конкретными
-        // портами (socks5_port=0 не отправляется — см. T11).
+        // Агент получил ровно один Up с содержимым конфига, конкретными
+        // портами (socks5_port=0 не отправляется — см. T11) и
+        // instance-поколением старта (первый start — поколение 0).
         let ups = fake.journal.ups();
         assert_eq!(ups.len(), 1);
         assert_eq!(ups[0].id, "office-a");
@@ -1140,6 +1224,7 @@ mod tests {
         assert_eq!(ups[0].dns, Some("10.20.30.1".parse().unwrap()));
         assert_ne!(ups[0].socks5_port, 0, "нулевые порты не отправляются");
         assert_ne!(ups[0].forwards[0].port, 0, "нулевые порты не отправляются");
+        assert_eq!(ups[0].instance, 0, "Up несёт instance-поколение");
     }
 
     #[tokio::test]
@@ -1190,6 +1275,10 @@ mod tests {
             "повтор идёт с другими портами"
         );
         assert_ne!(ups[1].forwards[0].port, ups[0].forwards[0].port);
+        assert_eq!(
+            ups[1].instance, ups[0].instance,
+            "повтор Up — то же поколение старта"
+        );
 
         // Итоговое состояние показывает порты второй попытки.
         let bottles = manager.status().await;
@@ -1356,13 +1445,61 @@ mod tests {
             }
         );
 
-        // Агенту ушёл Down; слушатели закрыты; из status бутылка исчезла.
-        assert_eq!(fake.journal.downs(), vec!["office-a".to_string()]);
+        // Агенту ушёл Down с поколением поднятой бутылки; слушатели
+        // закрыты; из status бутылка исчезла.
+        assert_eq!(
+            fake.journal.downs(),
+            vec![("office-a".to_string(), 0)],
+            "Down несёт instance-поколение"
+        );
         assert!(
             TcpStream::connect(("127.0.0.1", socks5)).await.is_err(),
             "порт закрыт после stop"
         );
         assert!(manager.status().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_instance_down_spares_live_bottle_and_is_tolerated() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+
+        manager.start("office-a").await.expect("start"); // поколение 0
+        let socks5 = manager.status().await[0].socks5.expect("порт назначен");
+
+        // Down чужого поколения: агент отвечает STALE_INSTANCE — для
+        // демона это не ошибка (своя бутылка уже заменена живой чужой).
+        manager
+            .send_down("office-a", 999)
+            .await
+            .expect("STALE_INSTANCE на Down tolerated");
+
+        // Бутылка в аплаенсе жива: relay агента по-прежнему обслуживает
+        // SOCKS5 (фейк-агент не разобрал её по чужому Down).
+        let mut sock = TcpStream::connect(("127.0.0.1", socks5))
+            .await
+            .expect("relay жив после STALE_INSTANCE");
+        sock.write_all(b"\x05\x01\x00").await.expect("greeting");
+        let mut method = [0u8; 2];
+        sock.read_exact(&mut method).await.expect("выбор метода");
+        assert_eq!(&method, b"\x05\x00", "эхо за туннелем ответило");
+
+        // Рантайм демона не тронут; корректный stop со своим поколением
+        // разбирает бутылку как обычно.
+        assert_eq!(manager.status().await.len(), 1);
+        let reply = manager.stop("office-a").await.expect("stop ок");
+        assert_eq!(
+            reply,
+            CliReply::Stopped {
+                id: "office-a".into()
+            }
+        );
+        assert_eq!(
+            fake.journal.downs(),
+            vec![("office-a".to_string(), 999), ("office-a".to_string(), 0)],
+            "чужой Down затем свой Down"
+        );
     }
 
     #[tokio::test]
@@ -1402,6 +1539,10 @@ mod tests {
         assert!(matches!(bottles[0].state, BottleState::Up));
         let ups = fake.journal.ups();
         assert_eq!(ups.len(), 2, "Up дважды: проигравший и победитель");
+        assert_ne!(
+            ups[0].instance, ups[1].instance,
+            "рестарт — новое поколение в Up"
+        );
         let socks5 = bottles[0].socks5.expect("порт назначен");
         assert_eq!(socks5, ups[1].socks5_port, "жив порт победителя");
         let mut sock = TcpStream::connect(("127.0.0.1", socks5))
@@ -1426,8 +1567,8 @@ mod tests {
         // бутылку победителя (под тем же id в аплаенсе уже новая).
         assert_eq!(
             fake.journal.downs(),
-            vec!["office-a".to_string()],
-            "Down только от stop"
+            vec![("office-a".to_string(), 0)],
+            "Down только от stop, с поколением проигравшего старта"
         );
     }
 
@@ -1460,12 +1601,13 @@ mod tests {
         assert_eq!(message, "бутылка остановлена во время запуска");
 
         // Up успел дойти и создать бутылку в аплаенсе — teardown отправил
-        // Down за него (второй Down после Down самого stop).
+        // Down за него (второй Down после Down самого stop); оба несут
+        // поколение проигравшего старта.
         let ups = fake.journal.ups();
         assert_eq!(ups.len(), 1);
         assert_eq!(
             fake.journal.downs(),
-            vec!["office-a".to_string(), "office-a".to_string()],
+            vec![("office-a".to_string(), 0), ("office-a".to_string(), 0)],
             "Down от stop и Down от teardown"
         );
 

@@ -124,7 +124,7 @@ pub async fn handle_request(state: &AgentState, req: AgentRequest) -> AgentReply
             error_reply(err::AUTH, "сначала Hello с корректным токеном")
         }
         AgentRequest::Up(args) => state.bottles.up(args).await,
-        AgentRequest::Down { id } => state.bottles.down(&id).await,
+        AgentRequest::Down { id, instance } => state.bottles.down(&id, instance).await,
         AgentRequest::Status { id } => AgentReply::Status {
             bottles: state.bottles.status(id.as_deref()),
         },
@@ -278,6 +278,7 @@ mod tests {
             dns: None,
             socks5_port: 0,
             forwards: vec![],
+            instance: 0,
         }
     }
 
@@ -358,10 +359,37 @@ mod tests {
             &st,
             AgentRequest::Down {
                 id: "ghost".to_string(),
+                instance: 0,
             },
         )
         .await;
         assert_eq!(error_code(reply), err::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn down_with_foreign_instance_is_stale_and_bottle_stays_alive() {
+        let st = state();
+        authorized(&st).await;
+        st.bottles.insert_for_test("office-a", 7);
+
+        let reply = handle_request(
+            &st,
+            AgentRequest::Down {
+                id: "office-a".to_string(),
+                instance: 8,
+            },
+        )
+        .await;
+        assert_eq!(
+            error_code(reply),
+            err::STALE_INSTANCE,
+            "чужое поколение не опускает бутылку"
+        );
+        assert_eq!(
+            st.bottles.status(Some("office-a")).len(),
+            1,
+            "бутылка жива после чужого Down"
+        );
     }
 
     #[tokio::test]

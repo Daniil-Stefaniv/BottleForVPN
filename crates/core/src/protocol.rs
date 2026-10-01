@@ -2,7 +2,12 @@
 //!
 //! Сообщения передаются кадрами [`crate::frame`] (u32 BE длина + JSON).
 //! Перечисления сериализуются внешней пометкой serde по умолчанию
-//! (например, `{"Down":{"id":"office-a"}}`).
+//! (например, `{"Down":{"id":"office-a","instance":7}}`).
+//!
+//! Версия 2 добавила instance-поколения: демон сопровождает каждый `Up`
+//! и `Down` номером поколения бутылки, агент отвергает `Down` чужого
+//! поколения ([`err::STALE_INSTANCE`]) — защита от TOCTOU «Down проигравшего
+//! рестарта убивает живую бутылку победителя».
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -11,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::profile::TunnelProtocol;
 
 /// Версия RPC-протокола; сверяется в `Hello`/`HelloAck`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Запрос демона к агенту.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,8 +25,9 @@ pub enum AgentRequest {
     Hello { version: u32, token: String },
     /// Поднять бутылку (туннель + SOCKS5 + пробросы).
     Up(UpArgs),
-    /// Опустить бутылку.
-    Down { id: String },
+    /// Опустить бутылку своего поколения; чужое [`UpArgs::instance`]
+    /// отвергается кодом [`err::STALE_INSTANCE`], бутылка не трогается.
+    Down { id: String, instance: u64 },
     /// Статус одной бутылки (`Some`) или всех (`None`).
     Status { id: Option<String> },
     /// Завершить работу агента.
@@ -43,6 +49,11 @@ pub struct UpArgs {
     pub socks5_port: u16,
     /// TCP-пробросы на 127.0.0.1.
     pub forwards: Vec<ForwardPort>,
+    /// Поколение экземпляра демона, поднимающего бутылку. Агент хранит
+    /// его вместе с бутылкой и опускает её только `Down` с тем же
+    /// номером — `Down` перезапущенного/проигравшего демона получает
+    /// [`err::STALE_INSTANCE`] и не убивает живую бутылку.
+    pub instance: u64,
 }
 
 /// Один TCP-проброс: слушатель на 127.0.0.1 → цель `host:port` в туннеле.
@@ -100,6 +111,9 @@ pub mod err {
     pub const AUTH: &str = "AUTH";
     /// Несовместимая версия протокола.
     pub const VERSION: &str = "VERSION";
+    /// `Down` пришёл с чужим instance-поколением: живая бутылка
+    /// принадлежит другому поколению демона и не трогается.
+    pub const STALE_INSTANCE: &str = "STALE_INSTANCE";
 }
 
 #[cfg(test)]
@@ -145,6 +159,7 @@ mod tests {
                     port: 33389,
                     target: "10.20.30.15:3389".to_string(),
                 }],
+                instance: 7,
             }),
             AgentRequest::Up(UpArgs {
                 id: "corp".to_string(),
@@ -153,9 +168,15 @@ mod tests {
                 dns: None,
                 socks5_port: 0,
                 forwards: vec![],
+                instance: 0,
             }),
             AgentRequest::Down {
                 id: "office-a".to_string(),
+                instance: 7,
+            },
+            AgentRequest::Down {
+                id: "office-a".to_string(),
+                instance: 8,
             },
             AgentRequest::Status {
                 id: Some("office-a".to_string()),
@@ -199,6 +220,10 @@ mod tests {
                 code: err::TUNNEL_FAILED.to_string(),
                 message: "wireguard-go exited".to_string(),
             },
+            AgentReply::Error {
+                code: err::STALE_INSTANCE.to_string(),
+                message: "бутылка принадлежит другому поколению демона".to_string(),
+            },
         ];
         for reply in replies {
             assert_eq!(round_trip(reply.clone()), reply);
@@ -214,11 +239,16 @@ mod tests {
             dns: None,
             socks5_port: 1080,
             forwards: vec![],
+            instance: 7,
         };
         let json = serde_json::to_string(&wireguard).expect("serialize UpArgs");
         assert!(
             json.contains(r#""protocol":"wireguard""#),
             "unexpected JSON: {json}"
+        );
+        assert!(
+            json.contains(r#""instance":7"#),
+            "instance-поколение присутствует на проводе: {json}"
         );
 
         let openvpn = UpArgs {
@@ -241,5 +271,13 @@ mod tests {
         assert_eq!(err::PORT_BUSY, "PORT_BUSY");
         assert_eq!(err::AUTH, "AUTH");
         assert_eq!(err::VERSION, "VERSION");
+        assert_eq!(err::STALE_INSTANCE, "STALE_INSTANCE");
+    }
+
+    #[test]
+    fn protocol_version_is_two() {
+        // Версия 2 добавила instance-поколения в Up/Down; аплаенсы v1
+        // отвергаются handshake-ошибкой VERSION (без обратной совместимости).
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 }
