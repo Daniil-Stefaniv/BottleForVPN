@@ -128,7 +128,16 @@ mod tests {
     }
 
     #[tokio::test]
+    // Гард держится через await намеренно: мьютекс сериализует тесты
+    // друг с другом (каждый в своём рантайме/потоке), внутри одного
+    // теста конкурентов на локе нет.
+    #[allow(clippy::await_holding_lock)]
     async fn run_relay_serves_socks5_and_stays_alive() {
+        // Эфемерные порты контестируются с другими тестами крейта —
+        // см. test_support::EPHEMERAL_PORT_LOCK.
+        let _ports = crate::test_support::EPHEMERAL_PORT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Свободные порты: bind и drop слушателей.
         let free_port = || {
             std::net::TcpListener::bind("127.0.0.1:0")
@@ -174,7 +183,16 @@ mod tests {
     }
 
     #[tokio::test]
+    // Гард держится через await намеренно: мьютекс сериализует тесты
+    // друг с другом (каждый в своём рантайме/потоке), внутри одного
+    // теста конкурентов на локе нет.
+    #[allow(clippy::await_holding_lock)]
     async fn run_relay_fails_on_busy_port() {
+        // Эфемерные порты контестируются с другими тестами крейта —
+        // см. test_support::EPHEMERAL_PORT_LOCK.
+        let _ports = crate::test_support::EPHEMERAL_PORT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Занимаем порт слушателем на том же wildcard-адресе, что и relay
         // (конфликт wildcard/specific на BSD с SO_REUSEADDR не возникает).
         let squatter = TcpListener::bind(("0.0.0.0", 0)).await.expect("bind");

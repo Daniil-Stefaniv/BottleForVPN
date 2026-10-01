@@ -551,7 +551,16 @@ mod tests {
     }
 
     #[tokio::test]
+    // Гард держится через await намеренно: мьютекс сериализует тесты
+    // друг с другом (каждый в своём рантайме/потоке), внутри одного
+    // теста конкурентов на локе нет.
+    #[allow(clippy::await_holding_lock)]
     async fn bind_bridges_partial_failure_frees_already_bound_port() {
+        // Эфемерные порты контестируются с другими тестами крейта —
+        // см. test_support::EPHEMERAL_PORT_LOCK.
+        let _ports = crate::test_support::EPHEMERAL_PORT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Сквоттер на wildcard-адресе: бинд моста на тот же wildcard
         // упрётся в активный слушатель и на Linux, и на macOS.
         let squatter = TcpListener::bind(("0.0.0.0", 0))
@@ -590,11 +599,22 @@ mod tests {
         );
 
         // Суть фикса: успешный мост остановлен и его порт свободен
-        // сразу после возврата — повторный bind проходит.
-        let rebound = TcpListener::bind(("0.0.0.0", socks5_port)).await;
-        assert!(
-            rebound.is_ok(),
-            "порт успешно забинженного моста должен освободиться: {rebound:?}"
-        );
+        // после возврата — повторный bind проходит. Бинд повторяется
+        // ограниченное время: macOS на ~150 мс резервирует только что
+        // закрытый эфемерный порт при параллельных (даже неудачных)
+        // запусках процессов в системе — это transient-состояние ядра,
+        // а не утечка слушателя (утёкший слушатель не освободится никогда).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if TcpListener::bind(("0.0.0.0", socks5_port)).await.is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "порт {socks5_port} успешно забинженного моста \
+                 не освободился за 2 с после возврата"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 }
