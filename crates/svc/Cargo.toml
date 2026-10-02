@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "svc"
+
 [[bin]]
 name = "bottle-svc"
 path = "src/main.rs"
@@ -15,6 +18,8 @@ bottle-core = { path = "../core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# RouteOpError в routes.rs.
+thiserror = "2"
 
 # Обвязка Windows-службы: SCM dispatcher, install/uninstall, статусы.
 [target.'cfg(windows)'.dependencies]

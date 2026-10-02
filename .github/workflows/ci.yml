@@ -24,6 +24,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
       - run: cargo test --workspace
+      # Поведенческий тест маршрутов bottle-svc: реальный ActiveStore,
+      # add/del точечного маршрута через шлюз по умолчанию (раннер
+      # под администратором).
+      - run: cargo test -p svc --test routes_win -- --ignored
 
   agent-integration:
     runs-on: ubuntu-latest
