@@ -350,4 +350,21 @@ mod tests {
             }
         );
     }
+
+    /// До M2 `Degraded` был юнит-вариантом и лежал на проводе кадром
+    /// `"Degraded"`; теперь несёт причину (см. тест
+    /// `degraded_state_round_trips_with_reason`). Старый кадр НЕ
+    /// десериализуется — осознанный разрыв M2: CLI и демон ставятся
+    /// вместе, смешанных версий на канале не бывает. Разрыв закреплён
+    /// тестом (обратный прецедент — добавление опционального поля в
+    /// `stopped_without_warning_field_deserializes_as_none`).
+    #[test]
+    fn degraded_old_unit_variant_frame_is_deliberate_m2_break() {
+        let result = serde_json::from_str::<BottleState>("\"Degraded\"");
+        assert!(
+            result.is_err(),
+            "старая без-field форма кадра Degraded обязана отвергаться: {:?}",
+            result
+        );
+    }
 }
