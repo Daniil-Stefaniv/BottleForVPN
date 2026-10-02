@@ -334,7 +334,10 @@ fn teardown(mut handle: NetnsHandle) {
 /// Приводит систему в чистое состояние при старте агента (`--boot`):
 ///
 /// 1. убивает осиротевшие relay/туннели по pid-файлам `/run/bottles/*/`
-///    (после падения агента их некому `kill()`);
+///    (после падения агента их некому `kill()`); pid-файлы переживают
+///    рестарт агента без перезагрузки VM, поэтому перед сигналом
+///    проверяется cmdline процесса — реюзнутый чужой pid не трогается
+///    ([`should_kill_pid`]);
 /// 2. удаляет все namespaces `bottle-*` (с добиванием выживших процессов
 ///    — живой процесс удержал бы namespace после `ip netns del`);
 /// 3. удаляет `/etc/netns/bottle-*` и `/run/bottles/*`;
@@ -352,7 +355,10 @@ pub fn boot_cleanup() {
     ensure_masquerade();
 }
 
-/// Убивает процессы из pid-файлов `/run/bottles/*/pid-{relay,tunnel}`.
+/// Убивает процессы из pid-файлов `/run/bottles/*/pid-{relay,tunnel}` —
+/// только те, чья cmdline опознана как процесс бутылки
+/// ([`should_kill_pid`]): /run — tmpfs, pid-файлы переживают рестарт
+/// агента без перезагрузки VM, и pid мог быть реюзнут чужим процессом.
 fn kill_pidfile_orphans() {
     let Ok(entries) = fs::read_dir(RUN_BOTTLES_ROOT) else {
         return; // пустое состояние — норма
@@ -367,16 +373,51 @@ fn kill_pidfile_orphans() {
                 tracing::warn!(file = %path.display(), "повреждённый pid-файл, пропущен");
                 continue;
             };
-            kill_orphan(pid);
+            match read_cmdline(pid) {
+                Some(cmdline) if should_kill_pid(&cmdline) => kill_orphan(pid),
+                Some(cmdline) => tracing::warn!(
+                    pid,
+                    ?cmdline,
+                    "pid из pid-файла не похож на процесс бутылки (реюз pid?) — не тронут"
+                ),
+                // Нет /proc или процесса — сигнал по слепому pid из файла
+                // не отправляем: это чужая территория.
+                None => tracing::warn!(pid, "cmdline процесса недоступна — pid не тронут"),
+            }
         }
     }
+}
+
+/// Опознаёт cmdline как процесс бутылки: relay — это сам бинарник
+/// агента (`bottle-agent relay --socks5-port …`: `ip netns exec`
+/// выполняет команду через execvp без промежуточного процесса, см.
+/// [`crate::netns`]), туннели — `wireguard-go wg<idx>`
+/// ([`crate::wg::tunnel_up_wg`]) и `openvpn --config …`
+/// ([`openvpn_up`]).
+///
+/// Прагматика (по брифингу T12): матчинг по подстроке всей cmdline,
+/// без разбора argv — маркеры достаточно специфичны для аплаенса.
+fn should_kill_pid(cmdline: &str) -> bool {
+    cmdline.contains("bottle-agent")
+        || cmdline.contains("wireguard-go")
+        || cmdline.contains("openvpn")
+}
+
+/// Читает `/proc/<pid>/cmdline` (argv через NUL; NUL допустим в UTF-8,
+/// поэтому lossy-конвертация меняет только экзотические байты).
+/// Отсутствие `/proc` или процесса — `None`.
+fn read_cmdline(pid: i32) -> Option<String> {
+    let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// SIGTERM → короткое ожидание → SIGKILL для осиротевшего процесса.
 ///
 /// Это не дочерний процесс текущего агента: waitpid невозможен,
-/// завершение отслеживается сигналом 0. /run — tmpfs, pid-файлы
-/// не переживают перезагрузку, реюз pid им не грозит.
+/// завершение отслеживается сигналом 0. Вызывающий из pid-файла
+/// обязан сначала отсечь реюз pid проверкой cmdline
+/// ([`should_kill_pid`]); `delete_bottle_netns` зовёт без проверки —
+/// её pid'ы принадлежность namespace'у уже доказали (`ip netns pids`).
 #[cfg(unix)]
 fn kill_orphan(pid: i32) {
     if !pid_alive(pid) {
@@ -752,6 +793,83 @@ mod tests {
         // недоступны ip/iptables) очистка завершается без паники —
         // все шаги идемпотентны, ошибки отдельных команд логируются.
         boot_cleanup();
+    }
+
+    /// Собирает cmdline как в `/proc/<pid>/cmdline`: argv через NUL.
+    fn cmdline(parts: &[&str]) -> String {
+        parts.join("\0")
+    }
+
+    #[test]
+    fn should_kill_pid_matches_relay_cmdline() {
+        // ip netns exec execvp'ит команду без fork: ребёнок — сам бинарник
+        // агента с аргументами relay (netns::spawn_relay).
+        let relay = cmdline(&[
+            "/usr/local/bin/bottle-agent",
+            "relay",
+            "--socks5-port",
+            "10800",
+            "--forward",
+            "33389:10.20.30.15:3389",
+        ]);
+        assert!(
+            should_kill_pid(&relay),
+            "наш relay должен признаваться своим"
+        );
+    }
+
+    #[test]
+    fn should_kill_pid_matches_tunnel_cmdlines() {
+        // Туннельные дети (wg::tunnel_up_wg, openvpn_up) — argv запуска
+        // внутри namespace после execvp.
+        let wg = cmdline(&["/usr/bin/wireguard-go", "wg3"]);
+        assert!(
+            should_kill_pid(&wg),
+            "wireguard-go должен признаваться своим"
+        );
+        let ovpn = cmdline(&[
+            "openvpn",
+            "--config",
+            "/run/bottles/office-a/openvpn.conf",
+            "--dev",
+            "tun0",
+            "--dev-type",
+            "tun",
+        ]);
+        assert!(should_kill_pid(&ovpn), "openvpn должен признаваться своим");
+    }
+
+    #[test]
+    fn should_kill_pid_rejects_unrelated_processes() {
+        // Ядро сценария: после рестарта агента без перезагрузки VM pid
+        // из старого pid-файла мог достаться чужому процессу.
+        for parts in [
+            &["nginx", "-g", "daemon off;"][..],
+            &["python3", "server.py"][..],
+            &["systemd", "--switched-root", "--system"][..],
+            &["sshd", "-D", "-e"][..],
+            &["kubelet", "--config=/etc/kubernetes/kubelet.yaml"][..],
+        ] {
+            let foreign = cmdline(parts);
+            assert!(
+                !should_kill_pid(&foreign),
+                "чужой процесс не должен убиваться: {foreign:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_kill_pid_rejects_empty_cmdline() {
+        // cmdline потоков ядра пуста — их нельзя трогать ни при каких
+        // pid-файлах.
+        assert!(!should_kill_pid(""));
+    }
+
+    #[test]
+    fn read_cmdline_of_dead_pid_is_none() {
+        // Несуществующий pid: на Linux нет /proc/<pid>/cmdline, вне Linux
+        // нет /proc вовсе — оба случая дают None (pid не тронут).
+        assert_eq!(read_cmdline(i32::MAX), None);
     }
 
     /// Тренажёр ответа-ошибки для ассертов на код/сообщение.
