@@ -517,6 +517,12 @@ pub struct HostManager {
     /// одновременные io-отказы (старт + DNS-цикл) не должны
     /// переустанавливать маршруты дважды (finding 2 ревью T9/T10).
     restore_lock: Mutex<()>,
+    /// Тест-обсервер сериализации восстановления: сколько раз
+    /// конкурент дожидался чужого восстановления и пропускал своё
+    /// (ветка ожидания [`Self::restore_live_routes`]). Только в
+    /// тест-сборке.
+    #[cfg(test)]
+    restore_waits: std::sync::atomic::AtomicUsize,
     /// Живые (и упавшие) host-сессии по id: живое множество endpoint'ов
     /// всех активных бутылок агрегируется отсюда (спека §7.2 шаг 2).
     endpoints_state: Mutex<HashMap<String, HostRoutes>>,
@@ -532,6 +538,8 @@ impl HostManager {
             timing,
             svc: Mutex::new(None),
             restore_lock: Mutex::new(()),
+            #[cfg(test)]
+            restore_waits: std::sync::atomic::AtomicUsize::new(0),
             endpoints_state: Mutex::new(HashMap::new()),
             generations: AtomicU64::new(0),
         }
@@ -1200,9 +1208,12 @@ impl HostManager {
     /// пропускает своё (дубликаты `New-NetRoute` не нужны).
     async fn restore_live_routes(&self) {
         // Держатель гварда восстанавливает; ожидавшие — нет.
+        // Держатель гварда восстанавливает; ожидавшие — нет.
         let Ok(_guard) = self.restore_lock.try_lock() else {
-            // Ждём завешения чужого восстановления; гвард отпускаем
+            // Ждём завершения чужого восстановления; гвард отпускаем
             // сразу — своё пропускаем (дублей New-NetRoute не нужно).
+            #[cfg(test)]
+            self.restore_waits.fetch_add(1, Ordering::SeqCst);
             drop(self.restore_lock.lock().await);
             return;
         };
@@ -1444,13 +1455,49 @@ mod tests {
         }
     }
 
+    /// Рандеву на первом Add транспорта: первый Add паркуется, следующий
+    /// Add на том же транспорте его будит и проходит сам. Загоняет
+    /// восстановление живого множества (держатель гварда) внутрь чужого
+    /// Add — конкурентный poison застаёт гвард занятым и уходит в ветку
+    /// ожидания. Детерминированно на current_thread-runtime (`join!`
+    /// опрашивает ветки по порядку, парковка — единственная точка
+    /// передачи управления).
+    #[derive(Default)]
+    struct AddGate {
+        /// 0 — взведён, прибытий нет; 1 — первый Add паркуется;
+        /// 2 — гейт отработал.
+        state: StdMutex<u32>,
+        /// Будит парковку первого Add.
+        notify: tokio::sync::Notify,
+    }
+
+    impl AddGate {
+        /// Первый Add на транспорте ждёт следующего; следующий будит
+        /// его и идёт дальше сразу.
+        async fn arrive(&self) {
+            let first = {
+                let mut state = self.state.lock().unwrap();
+                *state += 1;
+                *state == 1
+            };
+            if first {
+                self.notify.notified().await;
+            } else {
+                self.notify.notify_one();
+            }
+        }
+    }
+
     /// Фейк-транспорт службы: всё `Ok`, журнал запросов; очередные
     /// `Add` могут упасть io-ошибкой (poison-политика — клиент
     /// пересоздаётся). Счётчик отказов общий с фабрикой: тест
-    /// «взводит» его на живом кэшированном транспорте.
+    /// «взводит» его на живом кэшированном транспорте. Необязательный
+    /// [`AddGate`] паркует первый Add транспорта (хореография
+    /// двойного poison).
     struct FakeSvc {
         ops: Ops,
         fail_adds_left: Arc<StdMutex<u32>>,
+        add_gate: Option<Arc<AddGate>>,
     }
 
     #[async_trait]
@@ -1459,6 +1506,9 @@ mod tests {
             match req {
                 SvcRequest::Hello { .. } => self.ops.push("svc:Hello"),
                 SvcRequest::Add { dest, .. } => {
+                    if let Some(gate) = &self.add_gate {
+                        gate.arrive().await;
+                    }
                     let mut fail = self.fail_adds_left.lock().unwrap();
                     if *fail > 0 {
                         *fail -= 1;
@@ -1481,6 +1531,9 @@ mod tests {
     struct FakeSvcFactory {
         ops: Ops,
         fail_adds_left: Arc<StdMutex<u32>>,
+        /// Одноразовый гейт для СЛЕДУЮЩЕГО созданного транспорта
+        /// (хореография двойного poison; см. [`AddGate`]).
+        gate_next: StdMutex<Option<Arc<AddGate>>>,
     }
 
     impl FakeSvcFactory {
@@ -1496,14 +1549,24 @@ mod tests {
         fn fail_next_adds(&self, n: u32) {
             *self.fail_adds_left.lock().unwrap() = n;
         }
+
+        /// Первый Add СЛЕДУЮЩЕГО созданного транспорта паркуется до
+        /// второго Add на нём (заставляет конкурентные poison-события
+        /// перекрыться: держатель гварда восстановления ждёт внутри
+        /// своего Add).
+        fn gate_next_add(&self) {
+            *self.gate_next.lock().unwrap() = Some(Arc::new(AddGate::default()));
+        }
     }
 
     #[async_trait]
     impl SvcFactory for FakeSvcFactory {
         async fn create(&self) -> Result<Arc<SvcClient>, DaemonError> {
+            let add_gate = self.gate_next.lock().unwrap().take();
             SvcClient::connect(Arc::new(FakeSvc {
                 ops: self.ops.clone(),
                 fail_adds_left: Arc::clone(&self.fail_adds_left),
+                add_gate,
             }))
             .await
             .map(Arc::new)
@@ -1695,6 +1758,7 @@ mod tests {
         let svc_factory = Arc::new(FakeSvcFactory {
             ops: ops.clone(),
             fail_adds_left: Arc::new(StdMutex::new(u32::from(fail_first_add))),
+            gate_next: StdMutex::new(None),
         });
         let parts = HostParts {
             svc_present: svc_present.unwrap_or(|| true),
@@ -2180,10 +2244,22 @@ mod tests {
         );
     }
 
-    /// Сериализация восстановления (finding 2 ревью): два одновременных
-    /// poison-события (параллельные проходы DNS-цикла, оба Add нового
-    /// адреса падают io) переустанавливают живое множество АКТИВНОЙ
-    /// сессии ровно один раз — без дубликатов svc:Add на адрес.
+    /// Сериализация восстановления (finding 2 ревью): ДВА ОДНОВРЕМЕННЫХ
+    /// poison-события (параллельные проходы DNS-цикла) переустанавливают
+    /// живое множество АКТИВНОЙ сессии ровно один раз — конкурент
+    /// застаёт гвард восстановления занятым, дожидается чужого
+    /// восстановления и пропускает своё.
+    ///
+    /// Хореография (детерминирована на current_thread-runtime: `join!`
+    /// опрашивает ветки по порядку, парковка в гейте — единственная
+    /// точка передачи управления): проход-1 своим Add(B) сажает
+    /// транспорт, берёт гвард восстановления и паркуется в его Add(A) —
+    /// гейт держит первый Add транспорта до следующего Add на нём.
+    /// Проход-2 вычисляет fresh=[B] (проход-1 ещё не зафиксировал B),
+    /// своим Add(B) — на ТОМ ЖЕ восстановительном транспорте — получает
+    /// второй io-отказ, будит гейт и застаёт гвард занятым → ветка
+    /// ожидания (`restore_waits`). Дальше держатель завершает
+    /// восстановление, каждый проход доводит только СВОЙ Add(B).
     #[tokio::test]
     async fn simultaneous_poisons_restore_live_routes_once() {
         let setup = test_host(true, vec![adapter("CorpVPN", 42, true)]);
@@ -2192,41 +2268,68 @@ mod tests {
         // t=0: A маршрутизирован (один успешный Add(A)).
         assert_eq!(exact_count(&setup, "svc:Add(203.0.113.10)"), 1);
 
-        // Оба прохода увидят новый адрес B; оба его Add сажают транспорт.
+        // Оба прохода увидят новый адрес B (фиксации ещё нет — проход-1
+        // стоит в гейте восстановления). Оба СВОИХ Add(B) сажают
+        // транспорт; Add(A) восстановления проходит успешно уже после
+        // гейта (счётчик к тому моменту исчерпан).
         setup
             .resolver
             .set(vec![ip("203.0.113.10"), ip("198.51.100.77")]);
         setup.svc_factory.fail_next_adds(2);
-        let (first, second) = tokio::join!(async { setup.host.recheck_dns().await }, async {
-            setup.host.recheck_dns().await
-        },);
-        let _ = (first, second);
+        setup.svc_factory.gate_next_add();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(async { setup.host.recheck_dns().await }, async {
+                setup.host.recheck_dns().await
+            },)
+        })
+        .await
+        .expect("хореография двойного poison не сошлась за 5 с");
 
-        // Живое множество восстановлено ровно один раз: успешных Add(A)
-        // ровно два (исходный + восстановление), дублей нет. Add(B) —
-        // по одному на попытку каждой из операций (свой адрес, не
-        // восстановление).
+        // Оба io-отказа — по одному Add(B) на попытку каждого прохода.
         let ops = setup.ops.snapshot();
+        assert_eq!(
+            setup.ops.count("svc:Add(198.51.100.77)~io"),
+            2,
+            "по одному io-отказу Add(B) на проход: {ops:?}"
+        );
+        // Восстановление A ровно ОДНО: исходный Add(A) + Add(A) держателя
+        // гварда; дублей нет — конкурент своё восстановление пропустил.
         assert_eq!(
             exact_count(&setup, "svc:Add(203.0.113.10)"),
             2,
             "восстановление A ровно одно: {ops:?}"
         );
-        let restored = ops
-            .iter()
-            .filter(|e| **e == "svc:Add(203.0.113.10)")
-            .count();
-        assert_eq!(restored, 2, "пин: исходный + одно восстановление");
-        assert!(
-            ops.iter().any(|e| e == "svc:Add(198.51.100.77)"),
-            "ретраи своих операций успешны: {ops:?}"
+        // Ретраи своих операций: Add(B) успешен дважды (по разу на
+        // проход), на свежем транспорте после второго poison.
+        assert_eq!(
+            exact_count(&setup, "svc:Add(198.51.100.77)"),
+            2,
+            "по одному успешному Add(B) на проход: {ops:?}"
         );
+        // Транспорт пересоздан дважды: восстановление держателя и ретрай
+        // прохода-1 (кэш ссажен poison'ом прохода-2); плюс исходный.
+        assert_eq!(
+            setup.ops.count("svc:Hello"),
+            3,
+            "исходный транспорт + два пересоздания: {ops:?}"
+        );
+        // ПИН ветки ожидания: ровно один конкурент (проход-2) дождался
+        // чужого восстановления и пропустил своё.
+        assert_eq!(
+            setup
+                .host
+                .restore_waits
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "ветка «дождаться и пропустить» исполнена ровно раз"
+        );
+
         // Бутылка жива, B зафиксирован в живом множестве (следующий
         // проход ничего не добавляет).
         setup.host.recheck_dns().await;
         assert_eq!(
             exact_count(&setup, "svc:Add(198.51.100.77)"),
-            1,
+            2,
             "адрес зафиксирован после успешной установки"
         );
         assert!(matches!(
