@@ -39,8 +39,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y iproute2 iptables wireguard-tools wireguard-go
-      # Все root-интеграционные тесты (netns_lifecycle, wg_handshake) — #[ignore].
+      - run: sudo apt-get update && sudo apt-get install -y iproute2 iptables wireguard-tools wireguard-go openvpn
+      # Все root-интеграционные тесты (netns_lifecycle, wg_handshake,
+      # bottles_e2e, openvpn_e2e) — #[ignore].
       - run: sudo -E cargo test -p agent -- --ignored
 
   appliance-build:

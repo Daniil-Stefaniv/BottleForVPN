@@ -23,6 +23,6 @@ bytes = "1"
 libc = "0.2"
 
 [dev-dependencies]
-# Интеграционные тесты (wg_handshake, bottles_e2e) входят в network
-# namespace через setns(2): echo-сервер теста слушает в srv-namespace
-# на адресе wg-интерфейса.
+# Интеграционные тесты (wg_handshake, bottles_e2e, openvpn_e2e) входят в
+# network namespace через setns(2) из libc (dependencies): echo-сервер
+# теста слушает в srv-namespace на адресе туннельного интерфейса.
