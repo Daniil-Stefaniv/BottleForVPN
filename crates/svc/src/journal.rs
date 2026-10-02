@@ -407,6 +407,12 @@ impl RouteStore {
         self.live.contains_key(&dest)
     }
 
+    /// Запись live-маршрута по назначению — для идемпотентного `add`
+    /// (сверка параметров и сессии дубля с живой записью).
+    pub fn get(&self, dest: IpAddr) -> Option<RouteEntry> {
+        self.live.get(&dest).cloned()
+    }
+
     /// Дописывает запись в JSONL-файл (создаёт файл и каталог).
     fn append(&self, record: &JournalRecord) -> Result<(), JournalError> {
         let line = serde_json::to_string(record).map_err(|error| JournalError::Append {

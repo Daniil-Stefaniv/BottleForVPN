@@ -675,10 +675,13 @@ impl BottleManager {
                 // Гонку выиграл stop (записи нет) или перезапуск (в карте
                 // запись чужого, более нового поколения): разобрать всё
                 // сделанное ЭТИМ запуском — задачи, слушатели — и дождаться
-                // освобождения портов. `Down` агенту отправляем, только
-                // когда записи нет: после перезапуска под этим id уже
-                // живёт новая бутылка, и наш `Down` погасил бы её.
-                let superseded_by_restart = runtime.get(id).is_some();
+                // освобождения портов. `Down` отправляем ВСЕГДА с
+                // поколением этого старта: агент опускает только совпавшее
+                // поколение, чужое отвергается STALE_INSTANCE (трактуется
+                // как успех) — бутылке победителя он не вредит. Пропуск
+                // Down после перезапуска оставлял бы в аплаенсе
+                // бутылку-призрак проигравшего старта, навсегда
+                // блокирующую id (`ALREADY_UP`) — Finding 2 ревью.
                 drop(runtime);
                 made.tasks.abort_all();
                 while made.tasks.join_next().await.is_some() {
@@ -686,9 +689,7 @@ impl BottleManager {
                     // завершения, чтобы порты освободились до ответа.
                 }
                 drop(made.listeners);
-                if superseded_by_restart {
-                    tracing::warn!(id, "запуск отменён перезапуском: ресурсы освобождены");
-                } else if let Err(error) = self.send_down(id, generation).await {
+                if let Err(error) = self.send_down(id, generation).await {
                     tracing::warn!(
                         id,
                         %error,
@@ -1310,19 +1311,39 @@ mod tests {
         /// handshake туннеля для гонок stop/restart во время старта),
         /// остальные — сразу.
         DelayedFirstUp(Duration),
+        /// Гонка «бутылка-призрак» (Finding 2 ревью): `Up`-ы
+        /// обслуживаются строго по очереди (как сессии настоящего
+        /// агента) через общий гейт, первый — `Ready` с задержкой
+        /// (долгий handshake), а `Up` для id, уже зарегистрированного
+        /// в live-реестре, — `Error{ALREADY_UP}` (барьер настоящего
+        /// агента: поколение живой бутылки не перезаписывается).
+        /// Поздний `Ready` проигравшего регистрирует его бутылку
+        /// раньше, чем `Up` победителя дойдёт до барьера.
+        DelayedFirstUpBarrier(Duration),
     }
+
+    /// Релеи фейк-агента по (id, instance-поколению) `Up`.
+    type FakeRelays = HashMap<(String, u64), Vec<tokio::task::JoinHandle<()>>>;
 
     /// Журнал фейк-агента: полученные `Up`/`Down` и живые relay.
     #[derive(Clone, Default)]
     struct AgentJournal {
         ups: Arc<Mutex<Vec<UpArgs>>>,
         downs: Arc<Mutex<Vec<(String, u64)>>>,
-        relays: Arc<Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>>,
+        /// Релеи по (id, instance-поколению) — как handle живой бутылки
+        /// настоящего агента: `Down` совпавшего поколения разбирает
+        /// релеи только этой бутылки (накапливаются, а не заменяются:
+        /// при гонке рестарта поздний `Ready` проигравшего не должен
+        /// гасить релеи живого победителя).
+        relays: Arc<Mutex<FakeRelays>>,
         /// Живые бутылки по протоколу v2: id → instance-поколение `Up`,
         /// создавшего бутылку. Регистрируются при ответе `Ready` (как
         /// в настоящем агенте — реестр до ответа), `Down` проверяет
         /// поколение: чужое → `STALE_INSTANCE`, бутылка не трогается.
         live: Arc<Mutex<HashMap<String, u64>>>,
+        /// Гейт сериализации `Up`-ов (модель последовательного агента
+        /// для [`UpBehavior::DelayedFirstUpBarrier`]).
+        up_gate: Arc<tokio::sync::Mutex<()>>,
     }
 
     impl AgentJournal {
@@ -1334,21 +1355,27 @@ mod tests {
             self.downs.lock().unwrap().clone()
         }
 
-        fn remember_relays(&self, id: &str, handles: Vec<tokio::task::JoinHandle<()>>) {
-            // Релеи накапливаются, а не заменяются: при гонке restart
-            // Up-ы одного id завершаются в произвольном порядке, и поздний
-            // Ready проигравшего не должен гасить релеи живого победителя.
-            // Down гасит все релеи id разом.
+        fn remember_relays(
+            &self,
+            id: &str,
+            instance: u64,
+            handles: Vec<tokio::task::JoinHandle<()>>,
+        ) {
             self.relays
                 .lock()
                 .unwrap()
-                .entry(id.to_string())
+                .entry((id.to_string(), instance))
                 .or_default()
                 .extend(handles);
         }
 
-        fn drop_relays(&self, id: &str) {
-            if let Some(handles) = self.relays.lock().unwrap().remove(id) {
+        fn drop_relays(&self, id: &str, instance: u64) {
+            if let Some(handles) = self
+                .relays
+                .lock()
+                .unwrap()
+                .remove(&(id.to_string(), instance))
+            {
                 for handle in handles {
                     handle.abort();
                 }
@@ -1380,7 +1407,10 @@ mod tests {
     /// обслуживаются параллельно (настоящий — по одной), поэтому при
     /// гонке наложившихся `Up` поздний `Ready` проигравшего перезапишет
     /// поколение в `live` — тестам менеджера это не важно, релеи
-    /// накапливаются и гасятся только `Down` своего поколения.
+    /// накапливаются по поколениям и гасятся только `Down` своего
+    /// поколения. Последовательность `Up`-ов и барьер живого id
+    /// (как в настоящем агенте) моделирует
+    /// [`UpBehavior::DelayedFirstUpBarrier`].
     ///
     /// «vm_ip» — реальный локальный IPv4 хоста: адреса 127.0.0.2+ (весь
     /// 127/8) доступны для bind только на Linux, macOS/Windows требуют
@@ -1602,7 +1632,7 @@ mod tests {
             },
             Some(_) => {
                 journal.live.lock().unwrap().remove(&id);
-                journal.drop_relays(&id);
+                journal.drop_relays(&id, instance);
                 AgentReply::Ok
             }
         }
@@ -1626,7 +1656,7 @@ mod tests {
             for forward in &args.forwards {
                 handles.push(spawn_echo_relay(vm_ip, forward.port).await);
             }
-            journal.remember_relays(&args.id, handles);
+            journal.remember_relays(&args.id, args.instance, handles);
             // Бутылка регистрируется до ответа Ready — как в настоящем
             // агенте (реестр Bottles пополняется перед Ready).
             journal
@@ -1654,6 +1684,22 @@ mod tests {
                 message: message.clone(),
             },
             UpBehavior::DelayedFirstUp(delay) => {
+                if attempt == 1 {
+                    tokio::time::sleep(*delay).await;
+                }
+                ready().await
+            }
+            UpBehavior::DelayedFirstUpBarrier(delay) => {
+                // Строгая очередь `Up`-ов: первый занимает гейт на время
+                // «handshake туннеля», следующий ждёт и приходит к
+                // барьеру уже после регистрации предыдущего.
+                let _gate = journal.up_gate.lock().await;
+                if journal.live.lock().unwrap().contains_key(&args.id) {
+                    return AgentReply::Error {
+                        code: err::ALREADY_UP.to_string(),
+                        message: format!("бутылка {} уже поднята", args.id),
+                    };
+                }
                 if attempt == 1 {
                     tokio::time::sleep(*delay).await;
                 }
@@ -2215,14 +2261,100 @@ mod tests {
                 .expect("проброс проигравшего свободен"),
         );
 
-        // Down отправлял только stop: teardown проигравшего НЕ гасит
-        // бутылку победителя (под тем же id в аплаенсе уже новая).
+        // Down дважды, оба с поколением проигравшего старта: от stop
+        // (бутылки в аплаенсе ещё не было — NOT_FOUND) и от teardown
+        // проигравшего (Finding 2: teardown ВСЕГДА посылает Down своего
+        // поколения). Бутылке-победителю они не вредит: агент опускает
+        // только совпавшее поколение, релеи победителя не тронуты.
         let loser_instance = fake.journal.ups()[0].instance;
         assert_eq!(
             fake.journal.downs(),
-            vec![("office-a".to_string(), loser_instance)],
-            "Down только от stop, с поколением проигравшего старта"
+            vec![
+                ("office-a".to_string(), loser_instance),
+                ("office-a".to_string(), loser_instance),
+            ],
+            "Down от stop и Down от teardown проигравшего, оба его поколения"
         );
+    }
+
+    /// Finding 2 (ревью): гонка stop→restart оставляет «бутылку-призрак»
+    /// проигравшего старта в аплаенсе. Последовательный агент с барьером
+    /// id: первый `Up` «поднимает туннель» дольше, чем идут stop+restart,
+    /// и регистрирует свою бутылку к моменту, когда `Up` победителя
+    /// дойдёт до барьера → победитель получает `ALREADY_UP` и падает.
+    /// Teardown проигравшего обязан отправить `Down` СВОЕГО поколения и
+    /// убрать призрака — иначе id заблокирован навсегда (каждый следующий
+    /// старт — снова `ALREADY_UP`).
+    #[tokio::test]
+    async fn restart_race_loser_down_clears_ghost_bottle() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        // Первый Up держит гейт 300 мс («долгий handshake туннеля»):
+        // Up победителя встаёт в очередь и приходит к барьеру ПОСЛЕ
+        // регистрации проигравшего → ALREADY_UP.
+        let fake = FakeAgent::spawn(UpBehavior::DelayedFirstUpBarrier(Duration::from_millis(
+            300,
+        )))
+        .await;
+        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+
+        let first = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.start("office-a").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await; // start1 в фазе Up
+        manager
+            .stop("office-a")
+            .await
+            .expect("stop во время старта (Down ещё NOT_FOUND)");
+        let reply = manager.start("office-a").await.expect("restart отвечает");
+        let CliReply::Error { message } = reply else {
+            panic!("ожидали Error (ALREADY_UP), получили {reply:?}")
+        };
+        assert!(
+            message.contains("ALREADY_UP"),
+            "победитель упёрся в призрака: {message}"
+        );
+
+        // Проигравший старт получил свой Ready, но запись в карте уже
+        // чужая: teardown разбирает ресурсы и отправляет Down СВОЕГО
+        // поколения — призрак снят с аплаенса.
+        let reply = first.await.expect("join start1").expect("без паники");
+        assert!(
+            matches!(reply, CliReply::Error { .. }),
+            "проигравший старт отвечает ошибкой: {reply:?}"
+        );
+        let loser_instance = fake.journal.ups()[0].instance;
+        assert!(
+            fake.journal
+                .downs()
+                .contains(&("office-a".to_string(), loser_instance)),
+            "Down поколения проигравшего убрал призрака: {:?}",
+            fake.journal.downs()
+        );
+
+        // Призрака нет — следующий старт проходит (никакого вечного
+        // цикла ALREADY_UP) и бутылка реально работает.
+        let reply = manager
+            .start("office-a")
+            .await
+            .expect("start после уборки призрака");
+        assert_eq!(
+            reply,
+            CliReply::Started {
+                id: "office-a".into()
+            }
+        );
+        let bottles = manager.status().await;
+        assert_eq!(bottles.len(), 1, "{bottles:?}");
+        assert!(matches!(bottles[0].state, BottleState::Up));
+        let socks5 = bottles[0].socks5.expect("порт назначен");
+        let mut sock = TcpStream::connect(("127.0.0.1", socks5))
+            .await
+            .expect("socks5 жив после уборки призрака");
+        sock.write_all(b"\x05\x01\x00").await.expect("greeting");
+        let mut method = [0u8; 2];
+        sock.read_exact(&mut method).await.expect("выбор метода");
+        assert_eq!(&method, b"\x05\x00");
     }
 
     #[tokio::test]

@@ -96,7 +96,8 @@ impl SvcClient {
     }
 
     /// Добавляет точечный маршрут `dest → gateway` через интерфейс
-    /// `iface_alias` (адаптер host-бутылки).
+    /// `iface_alias` (адаптер host-бутылки). Идемпотентен на стороне
+    /// службы: повторный `add` живого dest — `Ok` без OS-вызова.
     pub async fn add(
         &self,
         dest: IpAddr,
@@ -340,10 +341,7 @@ mod real {
     }
 }
 
-// До T9 (host-менеджер) RealSvcPipe никем не используется — экспорт
-// из bin-крейта считает неиспользуемым импортом; T9 снимет allow.
 #[cfg(windows)]
-#[allow(unused_imports)]
 pub use real::RealSvcPipe;
 
 /// Debug без соединения: транспорт не выводится ( dyn-объект).

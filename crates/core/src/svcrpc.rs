@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 /// Имя канала службы маршрутов (Windows named pipe).
 pub const SVC_PIPE: &str = r"\\.\pipe\bottleforapps-routes";
 
-/// Запрос агента к службе маршрутов.
+/// Запрос демона к службе маршрутов.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SvcRequest {
-    /// Рукопожатие: агент сообщает PID демона для привязки сессий.
+    /// Рукопожатие: демон сообщает свой PID (служба привязывает
+    /// маршруты к сессии соединения, а не к самому PID).
     Hello { daemon_pid: u32 },
     /// Добавить маршрут (dest → gateway через iface_alias) в сессию.
     Add {
@@ -32,7 +33,7 @@ pub enum SvcRequest {
     List,
 }
 
-/// Ответ службы маршрутов агенту.
+/// Ответ службы маршрутов демону.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SvcReply {
     /// Успех без данных.
@@ -52,7 +53,8 @@ pub struct RouteEntry {
     pub gateway: IpAddr,
     /// Псевдоним интерфейса (индекс адаптера бутылки).
     pub iface_alias: String,
-    /// Идентификатор сессии (PID демона-владельца).
+    /// Идентификатор сессии соединения демона: монотонный счётчик
+    /// сессий службы (выделяется в `Hello`), а не PID демона.
     pub session: u64,
 }
 
@@ -95,6 +97,69 @@ pub fn validate_route(dest: IpAddr) -> Result<(), SvcError> {
                 Err(SvcError::LinkLocal)
             } else if v6.is_multicast() {
                 Err(SvcError::Multicast)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Ошибки валидации адреса шлюза маршрута.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GatewayError {
+    /// Шлюз unspecified: 0.0.0.0 / ::.
+    #[error("шлюз unspecified (0.0.0.0, ::) — адрес не назначен ни одному интерфейсу")]
+    Unspecified,
+    /// Шлюз из loopback-диапазонов: 127.0.0.0/8, ::1.
+    #[error("шлюз loopback (127.0.0.0/8, ::1) — не является достижимым next-hop")]
+    Loopback,
+    /// Шлюз — v4-broadcast: 255.255.255.255.
+    #[error("широковещательный адрес 255.255.255.255 не может быть шлюзом")]
+    Broadcast,
+    /// Шлюз из link-local-диапазонов: 169.254.0.0/16, fe80::/10.
+    #[error("шлюз link-local (169.254.0.0/16, fe80::/10) — без явного scope недостижим")]
+    LinkLocal,
+    /// Шлюз из multicast-диапазонов: 224.0.0.0/4, ff00::/8.
+    #[error("шлюз multicast (224.0.0.0/4, ff00::/8) — next-hop обязан быть unicast")]
+    Multicast,
+}
+
+/// Проверяет адрес шлюза маршрута (спека §4.2: привилегированная
+/// поверхность службы обязана отвергать мусор до командлетов).
+///
+/// Шлюз — достижимый unicast-адрес: отвергаются unspecified
+/// (0.0.0.0/::), loopback (127.0.0.0/8, ::1), v4-broadcast
+/// (255.255.255.255) и link-local (169.254.0.0/16, fe80::/10 — без
+/// zone id недостижимы); on-link ULA/приватные адреса допустимы
+/// (`fd00::1`, `192.168.1.1`). Полная проверка «next-hop достижим
+/// через конкретный интерфейс хоста» — M3 (нужен перечень адаптеров).
+pub fn validate_gateway(gateway: IpAddr) -> Result<(), GatewayError> {
+    match gateway {
+        IpAddr::V4(v4) => {
+            if v4.is_unspecified() {
+                Err(GatewayError::Unspecified)
+            } else if v4.is_loopback() {
+                Err(GatewayError::Loopback)
+            } else if v4.is_broadcast() {
+                Err(GatewayError::Broadcast)
+            } else if v4.is_link_local() {
+                Err(GatewayError::LinkLocal)
+            } else if v4.is_multicast() {
+                Err(GatewayError::Multicast)
+            } else {
+                Ok(())
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_unspecified() {
+                Err(GatewayError::Unspecified)
+            } else if v6.is_loopback() {
+                Err(GatewayError::Loopback)
+            } else if v6.segments()[0] & 0xffc0 == 0xfe80 {
+                // fe80::/10 — link-local без zone id.
+                Err(GatewayError::LinkLocal)
+            } else if v6.is_multicast() {
+                Err(GatewayError::Multicast)
             } else {
                 Ok(())
             }
@@ -255,5 +320,49 @@ mod tests {
             SvcError::Multicast.to_string(),
             "адрес назначения multicast (224.0.0.0/4, ff00::/8)"
         );
+    }
+
+    /// Finding 3 (ревью): шлюз — достижимый unicast; приватные и
+    /// ULA-адреса допустимы.
+    #[test]
+    fn validate_gateway_accepts_reachable_unicast() {
+        let ok_gateways = [
+            "192.168.1.1",
+            "10.0.0.1",
+            "8.8.8.8",
+            "fd00::1",
+            "2001:db8::1",
+        ];
+        for addr in ok_gateways {
+            let ip: IpAddr = addr.parse().expect("test gateway must parse");
+            assert_eq!(validate_gateway(ip), Ok(()), "expected ok for {addr}");
+        }
+    }
+
+    /// Finding 3 (ревью): мусорные классы адресов отвергаются до
+    /// командлетов (спека §4.2 — привилегированная поверхность).
+    #[test]
+    fn validate_gateway_rejects_unreachable_classes() {
+        let cases = [
+            ("0.0.0.0", GatewayError::Unspecified),
+            ("::", GatewayError::Unspecified),
+            ("127.0.0.1", GatewayError::Loopback),
+            ("127.8.8.8", GatewayError::Loopback),
+            ("::1", GatewayError::Loopback),
+            ("255.255.255.255", GatewayError::Broadcast),
+            ("169.254.0.1", GatewayError::LinkLocal),
+            ("fe80::1", GatewayError::LinkLocal),
+            ("224.0.0.1", GatewayError::Multicast),
+            ("239.255.255.1", GatewayError::Multicast),
+            ("ff02::1", GatewayError::Multicast),
+        ];
+        for (addr, expected) in cases {
+            let ip: IpAddr = addr.parse().expect("test gateway must parse");
+            assert_eq!(
+                validate_gateway(ip),
+                Err(expected),
+                "expected reject for {addr}"
+            );
+        }
     }
 }

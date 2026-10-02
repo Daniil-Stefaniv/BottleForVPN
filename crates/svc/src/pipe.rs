@@ -14,14 +14,18 @@
 //! сверка при следующем старте службы (спека §9: маршруты не
 //! переживают смерть демона).
 
-use bottle_core::svcrpc::{svc_err, validate_route, RouteEntry, SvcReply, SvcRequest};
+use bottle_core::svcrpc::{
+    svc_err, validate_gateway, validate_route, RouteEntry, SvcReply, SvcRequest,
+};
 use tokio::sync::Mutex;
 
 use crate::journal::{RouteStore, SessionId};
 use crate::routes::{route_ps_args, run_ps, RouteCmd};
 
 /// Предельная длина псевдонима интерфейса (защита в глубину).
-pub const MAX_IFACE_ALIAS_LEN: usize = 64;
+/// Windows InterfaceAlias бывает длиннее 64 символов (составные имена
+/// вроде «vEthernet (WSL (Hyper-V firewall))»), поэтому лимит — 128.
+pub const MAX_IFACE_ALIAS_LEN: usize = 128;
 
 /// SDDL-дескриптор безопасности именованного канала службы (спека
 /// §4.2). Дефолтный DACL named pipe даёт запись только создателю
@@ -85,8 +89,54 @@ pub async fn dispatch(
             if let Err(error) = validate_route(dest) {
                 return validation_error(&error.to_string());
             }
+            // Finding 3 (ревью, спека §4.2): шлюз проверяется до
+            // командлета — привилегированная поверхность службы не
+            // принимает мусорные next-hop (полная проверка «достижим
+            // через конкретный интерфейс» — M3).
+            if let Err(error) = validate_gateway(gateway) {
+                return validation_error(&error.to_string());
+            }
             if let Err(message) = validate_iface_alias(&iface_alias) {
                 return validation_error(&message);
+            }
+            // Finding 1 (ревью): идемпотентность add — зеркало Del.
+            // Повторный add живого dest НЕ выходит в ОС: New-NetRoute
+            // на существующем маршруте падает «объект уже существует»,
+            // а host-менеджер при старте второй бутылки намеренно
+            // пере-добавляет объединение чужих endpoint'ов. Идентичный
+            // дубль — чистый Ok (журнал не растёт); дубль другой
+            // сессии/параметров — пере-атрибуция записи текущей
+            // сессией по модели журнала «последний wins» (закрытие
+            // НОВОЙ сессии снимет маршрут; в ОС остаётся исходный
+            // вариант маршрута — снятие идёт по dest).
+            {
+                let mut guard = store.lock().await;
+                if let Some(existing) = guard.get(dest) {
+                    if existing.session == session_id
+                        && existing.gateway == gateway
+                        && existing.iface_alias == iface_alias
+                    {
+                        tracing::info!(
+                            %dest,
+                            session = session_id,
+                            "повторный add живого маршрута: Ok без OS-вызова"
+                        );
+                        return SvcReply::Ok;
+                    }
+                    return match guard.add(session_id, dest, gateway, iface_alias) {
+                        Ok(()) => {
+                            tracing::info!(
+                                %dest,
+                                session = session_id,
+                                previous_session = existing.session,
+                                "add живого маршрута пере-атрибутирован текущей сессией \
+                                 (Ok без OS-вызова)"
+                            );
+                            SvcReply::Ok
+                        }
+                        Err(error) => io_error(&error.to_string()),
+                    };
+                }
             }
             // Только route_ps_args: ручное построение аргументов
             // запрещено (дисциплина инъекционной безопасности).
@@ -490,7 +540,7 @@ mod tests {
         let too_long = "x".repeat(MAX_IFACE_ALIAS_LEN + 1);
         assert!(
             validate_iface_alias(&too_long).is_err(),
-            "длиннее 64 символов"
+            "длиннее {MAX_IFACE_ALIAS_LEN} символов"
         );
         assert!(
             validate_iface_alias("Ethernet\n2").is_err(),
@@ -546,7 +596,7 @@ mod tests {
         let (_tmp, store) = test_store().await;
         let mut session = Some(1);
 
-        for alias in ["", &"y".repeat(65), "Bad\nAlias"] {
+        for alias in ["", &"y".repeat(MAX_IFACE_ALIAS_LEN + 1), "Bad\nAlias"] {
             let reply = dispatch(
                 &store,
                 &mut session,
@@ -580,6 +630,109 @@ mod tests {
         assert!(
             store.lock().await.routes().is_empty(),
             "провал ОС-операции не меняет live-set"
+        );
+    }
+
+    /// Finding 3 (ревью): шлюз из мусорного класса адресов отвергается
+    /// ДО любого OS-вызова — Error VALIDATION с русским текстом
+    /// (спека §4.2: привилегированная поверхность службы).
+    #[tokio::test]
+    async fn add_rejects_bad_gateway_before_any_os_call() {
+        let (_tmp, store) = test_store().await;
+        let mut session = Some(1);
+
+        let reply = dispatch(
+            &store,
+            &mut session,
+            SvcRequest::Add {
+                dest: ip("203.0.113.10"),
+                gateway: ip("0.0.0.0"),
+                iface_alias: "Ethernet".to_string(),
+            },
+        )
+        .await;
+        let SvcReply::Error { code, message } = reply else {
+            panic!("ожидали Error, получили {reply:?}");
+        };
+        assert_eq!(code, svc_err::VALIDATION);
+        assert!(
+            message.contains("шлюз"),
+            "текст ошибки валидации шлюза: {message}"
+        );
+        assert!(
+            store.lock().await.routes().is_empty(),
+            "отказ валидации не трогает live-set"
+        );
+    }
+
+    /// Finding 1 (ревью): повторный add того же dest той же сессией —
+    /// Ok БЕЗ обращения к ОС (на не-Windows любой OS-вызов — Error IO,
+    /// значит Ok доказывает короткое замыкание) и без новой записи в
+    /// журнале — идентичный дубль ничего не меняет.
+    #[tokio::test]
+    async fn add_duplicate_same_session_is_ok_without_os_call() {
+        let (tmp, store) = test_store().await;
+        {
+            let mut guard = store.lock().await;
+            guard
+                .add(1, ip("203.0.113.10"), ip("192.168.1.1"), "Ethernet")
+                .unwrap();
+        }
+        let mut session = Some(1);
+
+        let reply = dispatch(&store, &mut session, add_req("203.0.113.10")).await;
+        assert_eq!(reply, SvcReply::Ok, "дубль add — Ok без OS-вызова");
+
+        let journal = std::fs::read_to_string(tmp.path().join(JOURNAL_FILE_NAME)).unwrap();
+        assert_eq!(
+            journal.matches("\"add\"").count(),
+            1,
+            "идентичный дубль не пишет запись: {journal}"
+        );
+        assert_eq!(
+            store.lock().await.routes().len(),
+            1,
+            "дубль не меняет live-set"
+        );
+    }
+
+    /// Finding 1 (ревью): дубль add из ДРУГОЙ сессии — Ok без OS-вызова,
+    /// запись пере-атрибуруется новой сессии (модель журнала «последний
+    /// wins»): закрытие НОВОЙ сессии снимет маршрут, старой — нет.
+    #[tokio::test]
+    async fn add_duplicate_other_session_reattributes_entry() {
+        let (_tmp, store) = test_store().await;
+        {
+            let mut guard = store.lock().await;
+            guard
+                .add(1, ip("203.0.113.10"), ip("192.168.1.1"), "Ethernet")
+                .unwrap();
+        }
+        let mut session = Some(2);
+
+        let reply = dispatch(&store, &mut session, add_req("203.0.113.10")).await;
+        assert_eq!(reply, SvcReply::Ok, "дубль чужой сессии — Ok без OS-вызова");
+
+        {
+            let guard = store.lock().await;
+            let routes = guard.routes();
+            assert_eq!(routes.len(), 1, "dest один — запись одна");
+            assert_eq!(routes[0].dest, ip("203.0.113.10"));
+            assert_eq!(routes[0].session, 2, "владелец — новая сессия (last wins)");
+            assert_eq!(
+                guard.session_routes(2).len(),
+                1,
+                "маршрут виден закрытию НОВОЙ сессии"
+            );
+            assert!(
+                guard.session_routes(1).is_empty(),
+                "закрытие СТАРОЙ сессии маршрут не снимет"
+            );
+        }
+        // Подтверждение снятия приходит от новой сессии, не от старой.
+        assert!(
+            store.lock().await.del(1, ip("203.0.113.10")).unwrap(),
+            "del по живому dest снимает маршрут (сессия в записи — новая)"
         );
     }
 
