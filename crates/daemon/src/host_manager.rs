@@ -63,8 +63,10 @@ pub const DNS_RECHECK_STEP: Duration = Duration::from_secs(30);
 const HOST_STOP_CLIENT_WARNING: &str =
     "VPN-клиент оставлен запущенным (API завершения у вендорских клиентов нет); \
      остановите его вручную, если он больше не нужен";
-/// Сообщение `stop` на не запущенной бутылке.
-const BOTTLE_NOT_RUNNING: &str = "бутылка не запущена";
+/// Сообщение `stop` на не запущенной бутылке. Общее для env- и
+/// host-менеджеров (finding 3 ревью T9/T10: одно определение здесь,
+/// [`crate::manager`] переиспользует).
+pub(crate) const BOTTLE_NOT_RUNNING: &str = "бутылка не запущена";
 
 // ----------------------------------------------------------------------
 // Инъекционные зависимости (тестируемость на фейках, macOS).
@@ -511,6 +513,10 @@ pub struct HostManager {
     /// Кэш клиента службы маршрутов; io-ошибка транспорта сбрасывает
     /// его (poison-политика: пересоздание через фабрику).
     svc: Mutex<Option<Arc<SvcClient>>>,
+    /// Сериализация восстановления живого множества после poison:
+    /// одновременные io-отказы (старт + DNS-цикл) не должны
+    /// переустанавливать маршруты дважды (finding 2 ревью T9/T10).
+    restore_lock: Mutex<()>,
     /// Живые (и упавшие) host-сессии по id: живое множество endpoint'ов
     /// всех активных бутылок агрегируется отсюда (спека §7.2 шаг 2).
     endpoints_state: Mutex<HashMap<String, HostRoutes>>,
@@ -525,6 +531,7 @@ impl HostManager {
             parts,
             timing,
             svc: Mutex::new(None),
+            restore_lock: Mutex::new(()),
             endpoints_state: Mutex::new(HashMap::new()),
             generations: AtomicU64::new(0),
         }
@@ -1186,7 +1193,19 @@ impl HostManager {
     /// без восстановления активные бутылки молча теряли бы pin-маршруты.
     /// Ошибки отдельных адресов — warn (следующая операция/проход
     /// DNS-цикла повторит); рекурсии нет ([`Self::svc_add_no_restore`]).
+    ///
+    /// Сериализация (finding 2 ревью): одновременные poison-события
+    /// (старт бутылки + DNS-цикл) восстанавливают множество один раз —
+    /// конкурент, заставший чужое восстановление, дожидается его и
+    /// пропускает своё (дубликаты `New-NetRoute` не нужны).
     async fn restore_live_routes(&self) {
+        // Держатель гварда восстанавливает; ожидавшие — нет.
+        let Ok(_guard) = self.restore_lock.try_lock() else {
+            // Ждём завешения чужого восстановления; гвард отпускаем
+            // сразу — своё пропускаем (дублей New-NetRoute не нужно).
+            drop(self.restore_lock.lock().await);
+            return;
+        };
         let union: Vec<IpAddr> = {
             let state = self.endpoints_state.lock().await;
             let mut union: Vec<IpAddr> = Vec::new();
@@ -1425,13 +1444,13 @@ mod tests {
         }
     }
 
-    /// Фейк-транспорт службы: всё `Ok`, журнал запросов; очередной
-    /// `Add` может упасть io-ошибкой (poison-политика — клиент
-    /// пересоздаётся). Флаг отказа общий с фабрикой: тест «взводит»
-    /// его на живом кэшированном транспорте.
+    /// Фейк-транспорт службы: всё `Ok`, журнал запросов; очередные
+    /// `Add` могут упасть io-ошибкой (poison-политика — клиент
+    /// пересоздаётся). Счётчик отказов общий с фабрикой: тест
+    /// «взводит» его на живом кэшированном транспорте.
     struct FakeSvc {
         ops: Ops,
-        fail_next_add: Arc<StdMutex<bool>>,
+        fail_adds_left: Arc<StdMutex<u32>>,
     }
 
     #[async_trait]
@@ -1440,9 +1459,9 @@ mod tests {
             match req {
                 SvcRequest::Hello { .. } => self.ops.push("svc:Hello"),
                 SvcRequest::Add { dest, .. } => {
-                    let mut fail = self.fail_next_add.lock().unwrap();
-                    if *fail {
-                        *fail = false;
+                    let mut fail = self.fail_adds_left.lock().unwrap();
+                    if *fail > 0 {
+                        *fail -= 1;
                         self.ops.push(format!("svc:Add({dest})~io"));
                         return Err(io::Error::other("фейк: транспорт службы отказал"));
                     }
@@ -1456,11 +1475,12 @@ mod tests {
         }
     }
 
-    /// Фабрика фейк-клиентов (новое соединение = новый `Hello`); флаг
-    /// «следующий Add падает io» общий со всеми созданными транспортами.
+    /// Фабрика фейк-клиентов (новое соединение = новый `Hello`);
+    /// счётчик «следующие N Add падают io» общий со всеми созданными
+    /// транспортами.
     struct FakeSvcFactory {
         ops: Ops,
-        fail_next_add: Arc<StdMutex<bool>>,
+        fail_adds_left: Arc<StdMutex<u32>>,
     }
 
     impl FakeSvcFactory {
@@ -1468,7 +1488,13 @@ mod tests {
         /// (arm poison-карусели посреди теста — в т.ч. на кэшированном
         /// клиенте).
         fn fail_next_add(&self) {
-            *self.fail_next_add.lock().unwrap() = true;
+            self.fail_next_adds(1);
+        }
+
+        /// Следующие `n` Add на любых живых транспортах уронят io
+        /// (параллельные poison-события).
+        fn fail_next_adds(&self, n: u32) {
+            *self.fail_adds_left.lock().unwrap() = n;
         }
     }
 
@@ -1477,7 +1503,7 @@ mod tests {
         async fn create(&self) -> Result<Arc<SvcClient>, DaemonError> {
             SvcClient::connect(Arc::new(FakeSvc {
                 ops: self.ops.clone(),
-                fail_next_add: Arc::clone(&self.fail_next_add),
+                fail_adds_left: Arc::clone(&self.fail_adds_left),
             }))
             .await
             .map(Arc::new)
@@ -1668,7 +1694,7 @@ mod tests {
         };
         let svc_factory = Arc::new(FakeSvcFactory {
             ops: ops.clone(),
-            fail_next_add: Arc::new(StdMutex::new(fail_first_add)),
+            fail_adds_left: Arc::new(StdMutex::new(u32::from(fail_first_add))),
         });
         let parts = HostParts {
             svc_present: svc_present.unwrap_or(|| true),
@@ -1786,6 +1812,21 @@ mod tests {
         let mut reply = [0u8; 10];
         sock.read_exact(&mut reply).await.expect("ответ CONNECT");
         assert_eq!(reply[1], 0x00, "CONNECT успешен");
+
+        // «accepted» пишется эхо-сервером асинхронно ПОСЛЕ kernel-
+        // handshake (userspace accept): ждём появления записи в
+        // журнале до order-ассерта, иначе он гонится с логом (~9%
+        // флейков). Продуктовая логика детерминирована: bind
+        // выполняется до connect.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while setup.ops.count("accepted") == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "эхо не отметило соединение за 5 с: {:?}",
+                setup.ops.snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         // Review Focus #5: привязка сокета к адаптеру — до соединения.
         assert!(
@@ -2137,6 +2178,71 @@ mod tests {
             matches!(&reply, CliReply::Error { ref message } if message == "бутылка не запущена"),
             "{reply:?}"
         );
+    }
+
+    /// Сериализация восстановления (finding 2 ревью): два одновременных
+    /// poison-события (параллельные проходы DNS-цикла, оба Add нового
+    /// адреса падают io) переустанавливают живое множество АКТИВНОЙ
+    /// сессии ровно один раз — без дубликатов svc:Add на адрес.
+    #[tokio::test]
+    async fn simultaneous_poisons_restore_live_routes_once() {
+        let setup = test_host(true, vec![adapter("CorpVPN", 42, true)]);
+        let profile = host_profile("corp", "vpn.example.com");
+        setup.host.start(&profile).await.expect("start");
+        // t=0: A маршрутизирован (один успешный Add(A)).
+        assert_eq!(exact_count(&setup, "svc:Add(203.0.113.10)"), 1);
+
+        // Оба прохода увидят новый адрес B; оба его Add сажают транспорт.
+        setup
+            .resolver
+            .set(vec![ip("203.0.113.10"), ip("198.51.100.77")]);
+        setup.svc_factory.fail_next_adds(2);
+        let (first, second) = tokio::join!(async { setup.host.recheck_dns().await }, async {
+            setup.host.recheck_dns().await
+        },);
+        let _ = (first, second);
+
+        // Живое множество восстановлено ровно один раз: успешных Add(A)
+        // ровно два (исходный + восстановление), дублей нет. Add(B) —
+        // по одному на попытку каждой из операций (свой адрес, не
+        // восстановление).
+        let ops = setup.ops.snapshot();
+        assert_eq!(
+            exact_count(&setup, "svc:Add(203.0.113.10)"),
+            2,
+            "восстановление A ровно одно: {ops:?}"
+        );
+        let restored = ops
+            .iter()
+            .filter(|e| **e == "svc:Add(203.0.113.10)")
+            .count();
+        assert_eq!(restored, 2, "пин: исходный + одно восстановление");
+        assert!(
+            ops.iter().any(|e| e == "svc:Add(198.51.100.77)"),
+            "ретраи своих операций успешны: {ops:?}"
+        );
+        // Бутылка жива, B зафиксирован в живом множестве (следующий
+        // проход ничего не добавляет).
+        setup.host.recheck_dns().await;
+        assert_eq!(
+            exact_count(&setup, "svc:Add(198.51.100.77)"),
+            1,
+            "адрес зафиксирован после успешной установки"
+        );
+        assert!(matches!(
+            setup.host.status().await[0].state,
+            BottleState::Up
+        ));
+    }
+
+    /// Число записей журнала, ТОЧНО равных `entry` (без ~io-хвостов).
+    fn exact_count(setup: &TestSetup, entry: &str) -> usize {
+        setup
+            .ops
+            .snapshot()
+            .iter()
+            .filter(|e| e.as_str() == entry)
+            .count()
     }
 
     /// Маршрутизация менеджера: kind=Host уходит в host-менеджер,

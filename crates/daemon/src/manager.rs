@@ -38,7 +38,7 @@ use tokio::task::JoinSet;
 
 use crate::appliance::{ensure_appliance, ApplianceHandle, WslRunner};
 use crate::error::DaemonError;
-use crate::host_manager::{HostManager, HostParts, HostTiming};
+use crate::host_manager::{HostManager, HostParts, HostTiming, BOTTLE_NOT_RUNNING};
 use crate::store::Store;
 
 /// Нижняя граница диапазона автоподбора портов (dynamic, RFC 6335).
@@ -51,8 +51,6 @@ const PORT_DYNAMIC_ATTEMPTS: usize = 1000;
 /// Сколько [`RealAgentConnect`] ждёт соединения с агентом после wake
 /// (агент стартует при первом обращении к VM; спека §4.3 — ≤30 с).
 pub const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Сообщение `stop` на не запущенной бутылке.
-const BOTTLE_NOT_RUNNING: &str = "бутылка не запущена";
 
 /// Точка подключения к агенту аплаенса; инъекция для тестов.
 ///
