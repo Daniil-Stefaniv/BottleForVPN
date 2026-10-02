@@ -318,7 +318,7 @@ async fn service_sessions_and_reconcile_end_to_end() {
     // Правило сессии (спека §9): маршруты исчезают ≤10 с.
     wait_route_absent(SESSION_DEST, Duration::from_secs(10)).await;
 
-    // --- Фаза C: новая сессия, cleanup. -----------------------------
+    // --- Фаза C: новая сессия, cleanup с непустым live-set. ---------
     let mut client = wait_pipe().await;
     assert_eq!(
         exchange(
@@ -338,10 +338,33 @@ async fn service_sessions_and_reconcile_end_to_end() {
         routes.is_empty(),
         "после смерти сессии live-set пуст: {routes:?}"
     );
+
+    // Наполняем live-set заново: Cleanup обязан пройти РЕАЛЬНУЮ ветку
+    // удаления (Remove-NetRoute по каждому маршруту), а не пустой цикл.
     assert_eq!(
-        exchange(&mut client, SvcRequest::Cleanup).await,
+        exchange(
+            &mut client,
+            SvcRequest::Add {
+                dest: SESSION_DEST.parse().unwrap(),
+                gateway,
+                iface_alias: alias.clone(),
+            }
+        )
+        .await,
         SvcReply::Ok
     );
+    assert!(route_exists(SESSION_DEST), "маршрут снова в таблице ОС");
+    assert_eq!(
+        exchange(&mut client, SvcRequest::Cleanup).await,
+        SvcReply::Ok,
+        "cleanup снимает live-маршруты через Remove-NetRoute"
+    );
+    wait_route_absent(SESSION_DEST, Duration::from_secs(10)).await;
+    let reply = exchange(&mut client, SvcRequest::List).await;
+    let SvcReply::RouteList { routes } = reply else {
+        panic!("ожидали RouteList, получили {reply:?}");
+    };
+    assert!(routes.is_empty(), "после cleanup live-set пуст: {routes:?}");
     drop(client);
 
     // --- Фаза D: сверка журнала при повторном старте службы. -------

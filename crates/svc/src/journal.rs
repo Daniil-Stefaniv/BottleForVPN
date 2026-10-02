@@ -6,11 +6,18 @@
 //! тот же live-set в памяти и дописывает каждую операцию в
 //! `routes.jsonl` (append-only, строка JSON `{op, dest, gateway,
 //! iface_alias, session, ts}`). Сессия демона — монотонный счётчик
-//! службы ([`SessionId`]); при закрытии соединения демона все его
-//! маршруты удаляются из live-set с записью `del` (спека §9: маршруты
-//! не переживают смерть демона), фактическое удаление из ОС выполняет
-//! вызывающий (pipe-сервер) по списку, который возвращают
-//! [`RouteStore::close_session`] / [`RouteStore::cleanup`].
+//! службы ([`SessionId`]).
+//!
+//! Удаления — строго OS-first: сначала фактический `Remove-NetRoute`,
+//! и только после успеха — запись `del` и снятие из live-set
+//! ([`RouteStore::del`]). Провал OS-удаления оставляет маршрут в
+//! live-set и ОС — сверка при следующем старте службы ([`reconcile`])
+//! удаляет его как сироту; она сканирует live-set журнала, а не всю
+//! таблицу ОС, поэтому опережать ОС журналом нельзя (иначе маршрут
+//! потерялся бы из-под контроля навсегда). Закрытие соединения демона
+//! (спека §9: маршруты не переживают смерть демона) получает снимок
+//! [`RouteStore::session_routes`] и подтверждает каждый маршрут после
+//! его фактического удаления из ОС.
 //!
 //! [`reconcile`] при старте службы сверяет live-set из журнала с
 //! фактическими маршрутами ОС: маршрут есть в ОС, а его сессии уже
@@ -352,53 +359,22 @@ impl RouteStore {
         Ok(true)
     }
 
-    /// Закрывает сессию: снимает все её маршруты из live-set с записью
-    /// `del` по каждому и возвращает их — вызывающий удаляет их из ОС
-    /// (демон упал — маршруты не переживают; спека §9).
+    /// Снимок маршрутов сессии для закрытия соединения демона
+    /// (спека §9: маршруты не переживают смерть демона).
     ///
-    /// Ошибка дописи журнала не прерывает закрытие: live-set важнее
-    /// истории, расхождение подберёт сверка при следующем старте.
-    pub fn close_session(&mut self, session: SessionId) -> Vec<RouteEntry> {
-        let removed: Vec<RouteEntry> = self
-            .live
+    /// Чистая выборка БЕЗ изменения состояния: удаление OS-first —
+    /// вызывающий сначала снимает каждый маршрут из ОС, затем
+    /// подтверждает успех через [`RouteStore::del`] (запись `del` +
+    /// снятие из live-set). Провал OS-удаления оставляет маршрут в
+    /// live-set — сверка при следующем старте службы удалит его как
+    /// сироту (reconcile сканирует live-set журнала, а не всю таблицу
+    /// ОС, поэтому опережать ОС журналом нельзя).
+    pub fn session_routes(&self, session: SessionId) -> Vec<RouteEntry> {
+        self.live
             .values()
             .filter(|entry| entry.session == session)
             .cloned()
-            .collect();
-        for entry in &removed {
-            if let Err(error) = self.append(&JournalRecord {
-                op: "del".to_string(),
-                dest: entry.dest,
-                gateway: None,
-                iface_alias: None,
-                session,
-                ts: now_ms(),
-            }) {
-                tracing::warn!(%error, dest = %entry.dest, "не удалось записать del закрываемой сессии");
-            }
-        }
-        apply_op(&mut self.live, &JournalOp::CloseSession { session });
-        removed
-    }
-
-    /// Снимает ВСЕ live-маршруты (maintenance-режим `Cleanup`):
-    /// возвращает их для удаления из ОС, по каждому пишется `del`.
-    pub fn cleanup(&mut self) -> Vec<RouteEntry> {
-        let removed: Vec<RouteEntry> = self.live.values().cloned().collect();
-        for entry in &removed {
-            if let Err(error) = self.append(&JournalRecord {
-                op: "del".to_string(),
-                dest: entry.dest,
-                gateway: None,
-                iface_alias: None,
-                session: entry.session,
-                ts: now_ms(),
-            }) {
-                tracing::warn!(%error, dest = %entry.dest, "не удалось записать del при cleanup");
-            }
-        }
-        self.live.clear();
-        removed
+            .collect()
     }
 
     /// Вычищает маршрут из live-set как отсутствующий в ОС (фаза
@@ -815,8 +791,8 @@ mod tests {
     }
 
     #[test]
-    fn store_close_session_returns_its_routes_and_journals_dels() {
-        let (tmp, mut store) = store_in_tempdir();
+    fn store_session_routes_is_pure_snapshot() {
+        let (_tmp, mut store) = store_in_tempdir();
         store
             .add(1, ip("203.0.113.10"), ip("192.168.1.1"), "Ethernet")
             .unwrap();
@@ -827,41 +803,44 @@ mod tests {
             .add(2, ip("203.0.113.12"), ip("192.168.1.1"), "Wi-Fi")
             .unwrap();
 
-        let removed = store.close_session(1);
+        // Снимок НЕ меняет состояние: OS-first — сначала Remove-NetRoute,
+        // потом подтверждение через del (иначе провал OS-удаления
+        // вычистил бы маршрут из журнала навсегда).
+        let snapshot = store.session_routes(1);
 
         assert_eq!(
-            removed.iter().map(|e| e.dest).collect::<Vec<_>>(),
+            snapshot.iter().map(|e| e.dest).collect::<Vec<_>>(),
             vec![ip("203.0.113.10"), ip("203.0.113.11")],
-            "возвращены маршруты закрываемой сессии (для del_route)"
+            "снимок содержит маршруты закрываемой сессии"
         );
+        assert_eq!(store.routes().len(), 3, "live-set нетронут снимком");
+
+        // Подтверждение OS-удаления: del по каждому — запись + снятие.
+        for entry in &snapshot {
+            assert!(store.del(entry.session, entry.dest).unwrap());
+        }
         let mut expected = entry("203.0.113.12", 2);
         expected.iface_alias = "Wi-Fi".to_string();
         assert_eq!(store.routes(), vec![expected]);
-        let records = read_records(&tmp.path().join(JOURNAL_FILE_NAME));
-        let ops: Vec<&str> = records.iter().map(|r| r["op"].as_str().unwrap()).collect();
-        assert_eq!(ops, vec!["add", "add", "add", "del", "del"]);
 
-        // Повторное закрытие той же сессии — пусто и без записей.
-        assert!(store.close_session(1).is_empty());
-        assert_eq!(read_records(&tmp.path().join(JOURNAL_FILE_NAME)).len(), 5);
+        // Повторный снимок закрытой сессии — пуст.
+        assert!(store.session_routes(1).is_empty());
     }
 
+    /// Закрытие сессии с провалом OS-удаления: маршрут не удаляется из
+    /// ОС, live-set и журнал не тронуты (подберёт сверка при старте).
+    /// Проверяется на уровне pipe::close_session_routes — здесь же
+    /// фиксируем, что без `del`-подтверждения записей не прибавляется.
     #[test]
-    fn store_cleanup_returns_all_live_routes() {
+    fn store_del_confirmation_only_after_os_success() {
         let (tmp, mut store) = store_in_tempdir();
         store
-            .add(1, ip("203.0.113.10"), ip("192.168.1.1"), "Ethernet")
-            .unwrap();
-        store
-            .add(2, ip("203.0.113.12"), ip("192.168.1.1"), "Wi-Fi")
+            .add(7, ip("203.0.113.10"), ip("192.168.1.1"), "Ethernet")
             .unwrap();
 
-        let removed = store.cleanup();
-
-        assert_eq!(removed.len(), 2, "cleanup снимает все сессии");
-        assert!(store.routes().is_empty());
-        let records = read_records(&tmp.path().join(JOURNAL_FILE_NAME));
-        assert_eq!(records.len(), 4, "add, add, del, del");
+        // OS-удаление НЕ выполнено → подтверждения нет: одна add-запись.
+        assert_eq!(read_records(&tmp.path().join(JOURNAL_FILE_NAME)).len(), 1);
+        assert_eq!(store.routes().len(), 1);
     }
 
     // ------------------------------------------------------------------

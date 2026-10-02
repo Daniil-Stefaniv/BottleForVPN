@@ -32,11 +32,9 @@ serde_json = "1"
 # Тесты журнала работают во временном каталоге.
 tempfile = "3"
 
-# Обвязка Windows-службы: SCM dispatcher, install/uninstall, статусы.
+# Обвязка Windows-службы: SCM dispatcher, install/uninstall, статусы;
+# DACL именованного канала (SDDL → SECURITY_ATTRIBUTES) и коды ошибок
+# канала в тестах.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
-
-# Поведенческий тест службы (tests/svc_win.rs): кодек клиента и коды
-# ошибок named pipe при ожидании экземпляра канала.
-[target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }

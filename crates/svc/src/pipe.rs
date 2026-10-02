@@ -9,10 +9,12 @@
 //! повторный `Hello` на живом соединении закрывает прежнюю сессию
 //! (демон перезапустился) и открывает новую. Когда соединение
 //! закрывается — демон умер или отключился — маршруты сессии
-//! снимаются из live-set с записью в журнал и удаляются из ОС
-//! (спека §9: маршруты не переживают смерть демона).
+//! удаляются по принципу OS-first: сначала из ОС, после успеха — из
+//! журнала и live-set; провал остаётся в live-set и ОС, и его подберёт
+//! сверка при следующем старте службы (спека §9: маршруты не
+//! переживают смерть демона).
 
-use bottle_core::svcrpc::{svc_err, validate_route, SvcReply, SvcRequest};
+use bottle_core::svcrpc::{svc_err, validate_route, RouteEntry, SvcReply, SvcRequest};
 use tokio::sync::Mutex;
 
 use crate::journal::{RouteStore, SessionId};
@@ -20,6 +22,14 @@ use crate::routes::{route_ps_args, run_ps, RouteCmd};
 
 /// Предельная длина псевдонима интерфейса (защита в глубину).
 pub const MAX_IFACE_ALIAS_LEN: usize = 64;
+
+/// SDDL-дескриптор безопасности именованного канала службы (спека
+/// §4.2). Дефолтный DACL named pipe даёт запись только создателю
+/// (службе, SYSTEM) — не-возвышенный демон получил бы ACCESS_DENIED.
+/// ACE: `GRGW` (generic read/write) для `IU` (интерактивные
+/// пользователи), `FA` (полный доступ) для `SY` (SYSTEM) и `BA`
+/// (администраторы).
+pub const PIPE_SDDL: &str = "D:P(A;;GRGW;;;IU)(A;;FA;;;SY)(A;;FA;;;BA)";
 
 /// Лёгкая валидация псевдонима интерфейса: непустой, не длиннее
 /// [`MAX_IFACE_ALIAS_LEN`], без управляющих символов. Само имя
@@ -129,20 +139,10 @@ pub async fn dispatch(
             let Some(session_id) = *session else {
                 return no_session_error();
             };
-            // Снимаем ВСЕ live-маршруты: последовательный Remove по
-            // каждому; проваленные остаются в live-set и попадают в ответ.
+            // Снимаем ВСЕ live-маршруты службы (рулинг контроллера,
+            // спека §9): OS-first через общий исполнитель.
             let entries = store.lock().await.routes();
-            let mut failures = Vec::new();
-            for entry in entries {
-                match run_ps(&route_ps_args(RouteCmd::Del, entry.dest, None, None)).await {
-                    Ok(_) => {
-                        if let Err(error) = store.lock().await.del(session_id, entry.dest) {
-                            failures.push(format!("{}: {error}", entry.dest));
-                        }
-                    }
-                    Err(error) => failures.push(format!("{}: {error}", entry.dest)),
-                }
-            }
+            let failures = remove_routes(store, entries).await;
             if failures.is_empty() {
                 tracing::info!(session = session_id, "cleanup: live-маршруты сняты");
                 SvcReply::Ok
@@ -185,29 +185,67 @@ fn io_error(message: &str) -> SvcReply {
     }
 }
 
-/// Закрывает сессию: снимает её маршруты из live-set с записью `del`
-/// в журнал и best-effort удаляет их из ОС (ошибка удаления — warn:
-/// остаток подберёт сверка при следующем старте службы).
+/// Закрывает сессию демона (соединение оборвалось, служба
+/// останавливается либо пришёл повторный `Hello`): OS-first снятие
+/// всех её маршрутов; проваленные остаются в live-set и ОС — сверка
+/// при следующем старте службы удалит их как сироты (спека §9:
+/// маршруты не переживают смерть демона; сверка сканирует live-set
+/// журнала, а не всю таблицу ОС — опережать ОС журналом нельзя).
 async fn close_session_routes(store: &Mutex<RouteStore>, session: SessionId) {
-    let removed = store.lock().await.close_session(session);
-    if removed.is_empty() {
+    let entries = store.lock().await.session_routes(session);
+    if entries.is_empty() {
         return;
     }
     tracing::info!(
         session,
-        routes = removed.len(),
-        "сессия закрыта: снимаю её маршруты"
+        routes = entries.len(),
+        "сессия закрыта: снимаю её маршруты из ОС"
     );
-    for entry in removed {
+    let failures = remove_routes(store, entries).await;
+    if !failures.is_empty() {
+        tracing::warn!(
+            session,
+            "часть маршрутов закрытой сессии не удалена из ОС ({}); \
+             они остаются в live-set — сверка при следующем старте \
+             службы удалит их как сироты",
+            failures.join("; ")
+        );
+    }
+}
+
+/// Исполнитель удаления маршрутов по принципу OS-first: успешный
+/// `Remove-NetRoute` → подтверждение [`RouteStore::del`] (запись `del`
+/// в журнал + снятие из live-set); провал OS-удаления — маршрут
+/// ОСТАЁТСЯ в live-set и ОС (следующая сверка удалит его как сироту).
+/// Возвращает список провалов «dest: ошибка» для ответа/лога.
+async fn remove_routes(store: &Mutex<RouteStore>, entries: Vec<RouteEntry>) -> Vec<String> {
+    let mut failures = Vec::new();
+    for entry in entries {
         match run_ps(&route_ps_args(RouteCmd::Del, entry.dest, None, None)).await {
-            Ok(_) => tracing::info!(dest = %entry.dest, "маршрут умершей сессии удалён"),
-            Err(error) => tracing::warn!(
-                dest = %entry.dest,
-                %error,
-                "не удалось удалить маршрут умершей сессии (подберёт сверка при старте)"
-            ),
+            Ok(_) => match store.lock().await.del(entry.session, entry.dest) {
+                Ok(_) => tracing::info!(dest = %entry.dest, "маршрут удалён из ОС и журнала"),
+                Err(error) => {
+                    tracing::warn!(
+                        dest = %entry.dest,
+                        %error,
+                        "маршрут удалён из ОС, но не записан в журнал — \
+                         остаётся в live-set, сверка при старте вычистит"
+                    );
+                    failures.push(format!("{}: {error}", entry.dest));
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    dest = %entry.dest,
+                    %error,
+                    "не удалось удалить маршрут из ОС — остаётся в live-set; \
+                     сверка при следующем старте службы удалит его как сироту"
+                );
+                failures.push(format!("{}: {error}", entry.dest));
+            }
         }
     }
+    failures
 }
 
 // ----------------------------------------------------------------------
@@ -228,6 +266,11 @@ mod transport {
     use tokio_stream::StreamExt;
     use tokio_util::codec::{Encoder, FramedRead};
     use tokio_util::sync::CancellationToken;
+    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
     use super::{close_session_routes, dispatch};
     use crate::journal::{RouteStore, SessionId};
@@ -235,14 +278,22 @@ mod transport {
     /// Обслуживает named pipe: по одному клиенту на соединение, свежий
     /// экземпляр канала на каждый цикл, до отмены `shutdown`.
     ///
-    /// Ошибки отдельных соединений логируются и не останавливают
-    /// сервер; наружу уходит только отказ создать экземпляр канала.
+    /// Канал создаётся с DACL [`super::PIPE_SDDL`] (интерактивные
+    /// пользователи — чтение/запись; дефолтный DACL дал бы
+    /// не-возвышенному демону ACCESS_DENIED, спека §4.2). Ошибки
+    /// отдельных соединений логируются и не останавливают сервер;
+    /// наружу уходит только отказ создать дескриптор безопасности
+    /// или экземпляр канала.
     pub async fn serve(
         pipe_name: &str,
         store: Arc<Mutex<RouteStore>>,
         shutdown: CancellationToken,
     ) -> io::Result<()> {
-        let mut server = ServerOptions::new().create(pipe_name)?;
+        let mut security = PipeSecurityAttributes::create()?;
+        // SAFETY: `security` живёт до конца `serve` (включая все
+        // вызовы create в цикле), указатель — на валидную структуру
+        // SECURITY_ATTRIBUTES; CreateNamedPipe копирует дескриптор.
+        let mut server = unsafe { create_pipe_instance(pipe_name, &mut security)? };
         tracing::info!(pipe = pipe_name, "pipe-сервер службы маршрутов запущен");
         loop {
             tokio::select! {
@@ -253,7 +304,69 @@ mod transport {
                 }
             }
             handle_connection(server, &store, &shutdown).await;
-            server = ServerOptions::new().create(pipe_name)?;
+            // SAFETY: как и выше — security ещё жив.
+            server = unsafe { create_pipe_instance(pipe_name, &mut security)? };
+        }
+    }
+
+    /// Создаёт экземпляр канала с дескриптором безопасности для
+    /// интерактивных пользователей. Небезопасен: `security` обязан
+    /// быть живым на момент вызова.
+    unsafe fn create_pipe_instance(
+        pipe_name: &str,
+        security: &mut PipeSecurityAttributes,
+    ) -> io::Result<NamedPipeServer> {
+        ServerOptions::new().create_with_security_attributes_raw(pipe_name, security.as_raw())
+    }
+
+    /// Владелец SECURITY_ATTRIBUTES с дескриптором из SDDL
+    /// [`super::PIPE_SDDL`]; освобождает дескриптор в Drop.
+    pub(super) struct PipeSecurityAttributes {
+        attributes: SECURITY_ATTRIBUTES,
+    }
+
+    impl PipeSecurityAttributes {
+        /// Конвертирует SDDL-строку в дескриптор безопасности.
+        pub(super) fn create() -> io::Result<Self> {
+            let sddl: Vec<u16> = super::PIPE_SDDL
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            // PCWSTR в windows-sys — сырой указатель на UTF-16 строку.
+            let converted = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            };
+            if converted == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                attributes: SECURITY_ATTRIBUTES {
+                    nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                    lpSecurityDescriptor: descriptor,
+                    bInheritHandle: 0,
+                },
+            })
+        }
+
+        /// Сырой указатель для `create_with_security_attributes_raw`.
+        fn as_raw(&mut self) -> *mut std::ffi::c_void {
+            &mut self.attributes as *mut SECURITY_ATTRIBUTES as *mut std::ffi::c_void
+        }
+    }
+
+    impl Drop for PipeSecurityAttributes {
+        fn drop(&mut self) {
+            if !self.attributes.lpSecurityDescriptor.is_null() {
+                unsafe {
+                    LocalFree(self.attributes.lpSecurityDescriptor as HLOCAL);
+                }
+            }
         }
     }
 
@@ -520,13 +633,6 @@ mod tests {
     #[tokio::test]
     async fn hello_opens_session_and_rehello_closes_previous() {
         let (_tmp, store) = test_store().await;
-        // Маршруты «прошлой» сессии уже в журнале (как после сбоя).
-        {
-            let mut guard = store.lock().await;
-            guard
-                .add(1, ip("203.0.113.10"), ip("192.168.1.1"), "Ethernet")
-                .unwrap();
-        }
         let mut session = None;
 
         // Первый Hello: прежних живых сессий нет, открывается новая.
@@ -535,7 +641,8 @@ mod tests {
         let first = session.expect("сессия открыта");
 
         // Повторный Hello на живом соединении — перезапуск сессии:
-        // маршруты прежней снимаются (журнал + live-set).
+        // прежняя закрывается по принципу OS-first (см. тест ниже),
+        // открывается новая с монотонно большим номером.
         store
             .lock()
             .await
@@ -545,12 +652,55 @@ mod tests {
         assert_eq!(reply, SvcReply::Ok);
         let second = session.expect("новая сессия открыта");
         assert_ne!(first, second, "сессии монотонно нумеруются");
+        assert_eq!(session, Some(second), "соединение привязано к новой сессии");
+    }
 
-        let routes = store.lock().await.routes();
-        assert!(
-            routes.iter().all(|entry| entry.session == second),
-            "после перезапуска сессии live-set содержит только её маршруты: {routes:?}"
+    /// Finding 1 (ревью): провал OS-удаления при закрытии сессии НЕ
+    /// должен вычищать маршрут из live-set и журнала — иначе маршрут
+    /// теряется из-под контроля навсегда (сверка сканирует live-set
+    /// журнала, а не всю таблицу ОС).
+    ///
+    /// ОС-удаление здесь детерминированно проваливается: вне Windows
+    /// run_ps всегда NotWindows; на Windows тестовых маршрутов в
+    /// ActiveStore нет — Remove-NetRoute с -ErrorAction Stop падает.
+    #[tokio::test]
+    async fn session_close_keeps_routes_when_os_del_fails() {
+        let (tmp, store) = test_store().await;
+        {
+            let mut guard = store.lock().await;
+            guard
+                .add(1, ip("203.0.113.10"), ip("192.168.1.1"), "Ethernet")
+                .unwrap();
+            guard
+                .add(1, ip("203.0.113.11"), ip("192.168.1.1"), "Ethernet")
+                .unwrap();
+            guard
+                .add(2, ip("203.0.113.12"), ip("192.168.1.1"), "Wi-Fi")
+                .unwrap();
+        }
+
+        close_session_routes(&store, 1).await;
+
+        {
+            let guard = store.lock().await;
+            assert_eq!(
+                guard.routes().len(),
+                3,
+                "провал OS-удаления: маршруты остаются в live-set"
+            );
+            assert_eq!(
+                guard.session_routes(1).len(),
+                2,
+                "маршруты мёртвой сессии остаются под контролем сверки"
+            );
+        }
+        let journal = std::fs::read_to_string(tmp.path().join(JOURNAL_FILE_NAME)).unwrap();
+        assert_eq!(
+            journal.matches("\"del\"").count(),
+            0,
+            "провал OS-удаления не пишет del в журнал: {journal}"
         );
+        assert_eq!(journal.matches("\"add\"").count(), 3);
     }
 
     #[tokio::test]
@@ -579,5 +729,35 @@ mod tests {
 
         let reply = dispatch(&store, &mut session, SvcRequest::Cleanup).await;
         assert_eq!(reply, SvcReply::Ok, "чистый live-set — немедленный успех");
+    }
+
+    /// Пин DACL именованного канала: интерактивные пользователи —
+    /// чтение/запись (демон без повышения прав, спека §4.2), SYSTEM и
+    /// администраторы — полный доступ. Изменение состава ACE —
+    /// осознанное решение безопасности, а не случайный рефакторинг.
+    #[test]
+    fn pipe_sddl_pins_interactive_rw_and_admins_full() {
+        assert!(
+            PIPE_SDDL.starts_with("D:P("),
+            "DACL без наследования: {PIPE_SDDL}"
+        );
+        assert!(
+            PIPE_SDDL.contains("(A;;GRGW;;;IU)"),
+            "интерактивным пользователям — generic read/write: {PIPE_SDDL}"
+        );
+        assert!(
+            PIPE_SDDL.contains("(A;;FA;;;SY)") && PIPE_SDDL.contains("(A;;FA;;;BA)"),
+            "SYSTEM и администраторы — полный доступ: {PIPE_SDDL}"
+        );
+    }
+
+    /// SDDL-строка обязана конвертироваться в реальный дескриптор
+    /// безопасности (запускается на Windows-CI в обычном прогоне
+    /// тестов; прав администратора не требует).
+    #[cfg(windows)]
+    #[test]
+    fn pipe_sddl_converts_to_security_descriptor() {
+        transport::PipeSecurityAttributes::create()
+            .expect("SDDL канала конвертируется в SECURITY_ATTRIBUTES");
     }
 }
