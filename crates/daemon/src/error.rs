@@ -62,4 +62,8 @@ pub enum DaemonError {
     /// службы (VALIDATION/IO/INTERNAL), уже готовое для пользователя.
     #[error("{0}")]
     Svc(String),
+    /// Ошибка host-сети демона (резолв endpoint'ов, поиск физического
+    /// шлюза); текст уже сформулирован для пользователя (CLI → IPC).
+    #[error("{0}")]
+    HostNet(String),
 }

@@ -35,11 +35,15 @@ pub struct Daemon {
 mod appliance;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod error;
+#[allow(dead_code)]
+mod host_net;
 mod instance;
 #[allow(dead_code)]
 mod manager;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pipe;
+#[allow(dead_code)]
+mod ps_query;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod store;
 #[allow(dead_code)]
