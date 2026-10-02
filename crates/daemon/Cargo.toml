@@ -29,10 +29,14 @@ tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
 # Каталог данных по умолчанию (кроссплатформенный local data dir).
 dirs = "5"
+# Исходящие сокеты релеев host-бутылок: создание сокета и неблокирующий
+# connect с привязкой к адаптеру VPN ДО соединения (M2 T9, Review Focus #5).
+socket2 = "0.6"
 
-# Single-instance демона: CreateMutexW (Win32).
+# Single-instance демона: CreateMutexW (Win32); WinSock — сырой setsockopt
+# IP_UNICAST_IF/IPV6_UNICAST_IF привязки исходящих сокетов (T9).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 # Тесты хранилища и диспетчера работают во временных каталогах.

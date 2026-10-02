@@ -45,8 +45,11 @@ pub enum CliReply {
     },
     /// Бутылка поднята (ответ на `Start`).
     Started { id: String },
-    /// Бутылка опущена (ответ на `Stop`).
-    Stopped { id: String },
+    /// Бутылка опущена (ответ на `Stop`); `warning` — предупреждение
+    /// о неочищенных эффектах (host-бутылка: VPN-клиент остаётся
+    /// работать — спека §7.2, шаг 6). Отсутствующее поле в старом
+    /// кадре десериализуется как `None`.
+    Stopped { id: String, warning: Option<String> },
     /// Ответ на `Status`.
     Status { bottles: Vec<RuntimeState> },
     /// Ошибка выполнения команды.
@@ -244,6 +247,11 @@ mod tests {
             },
             CliReply::Stopped {
                 id: "office-a".to_string(),
+                warning: None,
+            },
+            CliReply::Stopped {
+                id: "corp-vpn".to_string(),
+                warning: Some("VPN-клиент оставлен запущенным".to_string()),
             },
             CliReply::Status {
                 bottles: vec![
@@ -296,5 +304,21 @@ mod tests {
         let json = serde_json::to_string(&state).expect("serialize BottleState");
         assert_eq!(json, r#"{"Failed":{"reason":"туннель не поднялся"}}"#);
         assert_eq!(round_trip(state.clone()), state);
+    }
+
+    /// Поле `warning` в `Stopped` опционально на проводе: кадр старой
+    /// формы (до появления поля) читается как `warning: None` —
+    /// смешанные версии CLI/демона не ломают канал.
+    #[test]
+    fn stopped_without_warning_field_deserializes_as_none() {
+        let reply: CliReply =
+            serde_json::from_str(r#"{"Stopped":{"id":"office-a"}}"#).expect("старая форма кадра");
+        assert_eq!(
+            reply,
+            CliReply::Stopped {
+                id: "office-a".to_string(),
+                warning: None
+            }
+        );
     }
 }

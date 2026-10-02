@@ -3,6 +3,7 @@
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
 
@@ -104,6 +105,21 @@ pub async fn resolve_target(target: &TargetAddr) -> io::Result<SocketAddr> {
     }
 }
 
+/// Future одного установки исходящего соединения (см. [`Dial`]).
+pub type DialFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<TcpStream>> + Send>>;
+
+/// Функция установки исходящего соединения с целью — инъекция способа
+/// диала (M2 T9): host-релеи демона привязывают сокет к VPN-адаптеру
+/// (`IP_UNICAST_IF`/`IPV6_UNICAST_IF`) ДО connect; обычные релеи
+/// используют [`default_dial`] (просто `TcpStream::connect`).
+pub type Dial = Arc<dyn Fn(SocketAddr) -> DialFuture + Send + Sync>;
+
+/// Стандартный диал: `TcpStream::connect` без дополнительной настройки.
+pub fn default_dial() -> Dial {
+    Arc::new(|addr: SocketAddr| Box::pin(async move { TcpStream::connect(addr).await }))
+}
+
 /// Сервер TCP-проброса: принимает соединения на `listener` и копирует
 /// байты в обе стороны с целью `target`.
 ///
@@ -114,26 +130,40 @@ pub async fn resolve_target(target: &TargetAddr) -> io::Result<SocketAddr> {
 /// через `tracing`, не останавливая сервер. Ошибка возвращается только при
 /// отказе самого слушателя (`accept`) — дальше сервер работать не может.
 pub async fn serve_forward(listener: TcpListener, target: TargetAddr) -> io::Result<()> {
+    serve_forward_with_dial(listener, target, default_dial()).await
+}
+
+/// [`serve_forward`] с инъекцией способа установки исходящего соединения
+/// ([`Dial`]): host-релеи демона передают диал с привязкой сокета
+/// к интерфейсу VPN (спека §7.2, шаг 4).
+pub async fn serve_forward_with_dial(
+    listener: TcpListener,
+    target: TargetAddr,
+    dial: Dial,
+) -> io::Result<()> {
     loop {
         let (client, peer) = listener.accept().await?;
         let connection_target = target.clone();
+        let dial = Arc::clone(&dial);
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(client, peer, &connection_target).await {
+            if let Err(error) = handle_connection(client, peer, &connection_target, &dial).await {
                 tracing::warn!(%peer, %error, "forward connection failed");
             }
         });
     }
 }
 
-/// Обслуживает одно соединение: разрешает цель, подключается, копирует байты.
+/// Обслуживает одно соединение: разрешает цель, подключается (через
+/// переданный [`Dial`]), копирует байты.
 async fn handle_connection(
     client: TcpStream,
     peer: SocketAddr,
     target: &TargetAddr,
+    dial: &Dial,
 ) -> io::Result<()> {
     client.set_nodelay(true)?;
     let addr = resolve_target(target).await?;
-    let upstream = TcpStream::connect(addr).await?;
+    let upstream = dial(addr).await?;
     upstream.set_nodelay(true)?;
     tracing::debug!(%peer, target = %addr, "forward connection established");
 

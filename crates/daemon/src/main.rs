@@ -35,8 +35,11 @@ pub struct Daemon {
 mod appliance;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod error;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod host_manager;
 #[allow(dead_code)]
 mod host_net;
+#[allow(dead_code)]
 mod instance;
 #[allow(dead_code)]
 mod manager;
@@ -101,12 +104,13 @@ pub async fn serve_daemon(
         ));
         // Менеджер владеет своим экземпляром хранилища того же корня.
         let manager_store = store::Store::open(store.data_root())?;
+        let manager = Arc::new(manager::BottleManager::new(manager_store, connect));
+        // Фоновый цикл DNS-перепроверки host-бутылок (спека §7.2, шаг 5)
+        // живёт до остановки демона.
+        manager.spawn_host_dns_recheck(shutdown.clone());
         let daemon = Arc::new(Daemon {
             store,
-            manager: Some(Arc::new(manager::BottleManager::new(
-                manager_store,
-                connect,
-            ))),
+            manager: Some(manager),
         });
         pipe::serve(bottle_core::ipc::DAEMON_PIPE, daemon, shutdown).await
     }

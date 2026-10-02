@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::copy::copy_bidirectional;
-use crate::forward::{resolve_target, TargetAddr};
+use crate::forward::{resolve_target, Dial, TargetAddr};
 
 /// Версия протокола SOCKS5.
 const SOCKS_VERSION: u8 = 0x05;
@@ -59,10 +59,18 @@ enum Request {
 /// Логируются только метаданные (адреса, коды ответов), без payload.
 /// Ошибка возвращается только при отказе самого слушателя (`accept`).
 pub async fn serve_socks5(listener: TcpListener) -> io::Result<()> {
+    serve_socks5_with_dial(listener, crate::forward::default_dial()).await
+}
+
+/// [`serve_socks5`] с инъекцией способа установки исходящего соединения
+/// ([`Dial`]): host-релеи демона передают диал с привязкой сокета
+/// к интерфейсу VPN (спека §7.2, шаг 4).
+pub async fn serve_socks5_with_dial(listener: TcpListener, dial: Dial) -> io::Result<()> {
     loop {
         let (client, peer) = listener.accept().await?;
+        let dial = std::sync::Arc::clone(&dial);
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(client, peer).await {
+            if let Err(error) = handle_connection(client, peer, &dial).await {
                 tracing::warn!(%peer, %error, "socks5 connection failed");
             }
         });
@@ -81,7 +89,7 @@ pub async fn serve_socks5(listener: TcpListener) -> io::Result<()> {
 /// с оставшихся байтов рассинхронизировало бы поток. Также соединение
 /// закрывается при некорректном протоколе (чужая версия, обрезанные
 /// байты) и после завершения копирования успешного CONNECT.
-async fn handle_connection(mut client: TcpStream, peer: SocketAddr) -> io::Result<()> {
+async fn handle_connection(mut client: TcpStream, peer: SocketAddr, dial: &Dial) -> io::Result<()> {
     client.set_nodelay(true)?;
     negotiate_method(&mut client).await?;
     loop {
@@ -113,7 +121,7 @@ async fn handle_connection(mut client: TcpStream, peer: SocketAddr) -> io::Resul
             }
         };
 
-        let upstream = match TcpStream::connect(addr).await {
+        let upstream = match dial(addr).await {
             Ok(upstream) => upstream,
             Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
                 tracing::debug!(%peer, target = %addr, %error, "socks5 target refused");
@@ -226,6 +234,8 @@ fn protocol_error(message: impl Into<String>) -> io::Error {
 mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
+
+    use std::sync::Arc;
 
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -523,6 +533,36 @@ mod tests {
             .await?;
         assert_connection_closed(&mut client).await;
 
+        assert!(!server.is_finished(), "accept loop must survive");
+        server.abort();
+        Ok(())
+    }
+
+    /// Пин инъекции диала (M2 T9): сервер вызывает переданный [`Dial`],
+    /// а не `TcpStream::connect` напрямую — отказ инъектированного диала
+    /// отражается ответом `0x01` (общий сбой), соединение переживает.
+    #[tokio::test]
+    async fn injected_dial_failure_maps_to_general_failure() -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let socks_addr = listener.local_addr()?;
+        let echo_addr = spawn_echo().await?;
+        let failing: Dial = Arc::new(|_addr| {
+            Box::pin(async {
+                Err(io::Error::other("инъектированный диал отказал (тест)"))
+            })
+        });
+        let server = tokio::spawn(serve_socks5_with_dial(listener, failing));
+
+        let mut client = TcpStream::connect(socks_addr).await?;
+        negotiate(&mut client).await?;
+        client.write_all(&connect_ipv4(echo_addr)).await?;
+        assert_eq!(
+            read_reply(&mut client).await?,
+            0x01,
+            "отказ инъектированного диала → REP 0x01"
+        );
+
+        // Соединение живо после отказа; сервер не падает.
         assert!(!server.is_finished(), "accept loop must survive");
         server.abort();
         Ok(())

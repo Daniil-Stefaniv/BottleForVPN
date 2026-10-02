@@ -38,6 +38,7 @@ use tokio::task::JoinSet;
 
 use crate::appliance::{ensure_appliance, ApplianceHandle, WslRunner};
 use crate::error::DaemonError;
+use crate::host_manager::{HostManager, HostParts, HostTiming};
 use crate::store::Store;
 
 /// Нижняя граница диапазона автоподбора портов (dynamic, RFC 6335).
@@ -50,8 +51,6 @@ const PORT_DYNAMIC_ATTEMPTS: usize = 1000;
 /// Сколько [`RealAgentConnect`] ждёт соединения с агентом после wake
 /// (агент стартует при первом обращении к VM; спека §4.3 — ≤30 с).
 pub const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// M1: поддерживаются только env-бутылки (host — спека §7.2, этап M2).
-const HOST_KIND_MESSAGE: &str = "host-бутылки поддерживаются начиная с M2";
 /// Сообщение `stop` на не запущенной бутылке.
 const BOTTLE_NOT_RUNNING: &str = "бутылка не запущена";
 
@@ -133,8 +132,9 @@ impl HostListeners {
             .map_err(|e| format!("порт слушателя SOCKS5 недоступен: {e}"))
     }
 
-    /// Спецификации пробросов для `UpArgs`/`RuntimeState`.
-    fn forward_specs(&self) -> Vec<ForwardPort> {
+    /// Спецификации пробросов для `UpArgs`/`RuntimeState`
+    /// (переиспользуются host-менеджером).
+    pub(crate) fn forward_specs(&self) -> Vec<ForwardPort> {
         self.forwards.iter().map(|(spec, _)| spec.clone()).collect()
     }
 }
@@ -161,12 +161,15 @@ struct Provisioned {
     tasks: JoinSet<()>,
 }
 
-/// Менеджер бутылок: старт/стоп/статус env-бутылок (спека §7.1).
+/// Менеджер бутылок: старт/стоп/статус env- и host-бутылок (спека §7.1/§7.2).
 pub struct BottleManager {
     /// Хранилище профилей (операции короткие, чтения потокобезопасны).
     store: Store,
     /// Подключение к агенту аплаенса.
     connect: Arc<dyn AgentConnect>,
+    /// Менеджер host-бутылок (маршрутизация по `kind`, спека §7.2);
+    /// `Arc` — фоновый цикл DNS-перепроверки держит его после старта.
+    host: Arc<HostManager>,
     /// Живые (и упавшие с ошибкой) бутылки по id.
     runtime: Mutex<HashMap<String, Runtime>>,
     /// Счётчик поколений маркеров `starting` (см. [`Runtime::generation`]).
@@ -174,17 +177,53 @@ pub struct BottleManager {
 }
 
 impl BottleManager {
-    /// Создаёт менеджера над хранилищем и подключением.
+    /// Создаёт менеджера над хранилищем и подключением; host-часть —
+    /// продакшн-инъекции ([`crate::host_manager::HostParts::real`]).
     pub fn new(store: Store, connect: Arc<dyn AgentConnect>) -> Self {
+        Self::new_with_host(
+            store,
+            connect,
+            HostManager::new(HostParts::real(), HostTiming::default()),
+        )
+    }
+
+    /// Создаёт менеджера с явно переданным host-менеджером (инъекция
+    /// для тестов и dev-сборок).
+    pub fn new_with_host(store: Store, connect: Arc<dyn AgentConnect>, host: HostManager) -> Self {
         Self {
             store,
             connect,
+            host: Arc::new(host),
             runtime: Mutex::new(HashMap::new()),
             generations: AtomicU64::new(0),
         }
     }
 
-    /// Поднимает env-бутылку по спеке §7.1.
+    /// Запускает фоновый цикл DNS-перепроверки host-бутылок (T10,
+    /// спека §7.2 шаг 5): каждые 30 с активые endpoint'ы re-resolve'ятся,
+    /// новые адреса получают маршруты. Задача завершается отменой
+    /// `shutdown` (вместе с демоном).
+    pub fn spawn_host_dns_recheck(&self, shutdown: tokio_util::sync::CancellationToken) {
+        let host = Arc::clone(&self.host);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(crate::host_manager::DNS_RECHECK_STEP);
+            // Долгий проход (несколько PS-запросов) не должен собирать
+            // очередь пропущенных тиков — следующий через полный шаг.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::info!("цикл DNS-перепроверки остановлен вместе с демоном");
+                        break;
+                    }
+                    _ = ticker.tick() => host.recheck_dns().await,
+                }
+            }
+        });
+    }
+
+    /// Поднимает бутылку: env — по спеке §7.1, host — делегируется
+    /// [`HostManager`] (спека §7.2).
     ///
     /// Три фазы: (1) короткий лок — пометка `starting` со свежим номером
     /// поколения (активная бутылка — no-op по §5.2); (2) без лока — резерв
@@ -199,10 +238,8 @@ impl BottleManager {
     pub async fn start(&self, id: &str) -> Result<CliReply, DaemonError> {
         let profile = self.store.load(id)?;
         if profile.kind == BottleKind::Host {
-            // Спека §7.2 (host-бутылки) — этап M2.
-            return Ok(CliReply::Error {
-                message: HOST_KIND_MESSAGE.to_string(),
-            });
+            // Спека §7.2 (host-бутылки) — жизненный цикл в host-менеджере.
+            return self.host.start(&profile).await;
         }
 
         // Фаза 1: пометка starting; активная бутылка — no-op (RF#3).
@@ -306,11 +343,19 @@ impl BottleManager {
         }
     }
 
-    /// Опускает бутылку: `Down` агенту, задачи и слушатели — вниз.
+    /// Опускает бутылку: env — `Down` агенту, задачи и слушатели — вниз;
+    /// host — делегируется [`HostManager`] (спека §7.2, шаг 6).
     ///
     /// Ошибки агента не мешают локальному teardown (агент мог упасть);
     /// не запущенная бутылка — понятная ошибка, не сбой.
     pub async fn stop(&self, id: &str) -> Result<CliReply, DaemonError> {
+        // Маршрутизация по kind профиля (профиль недоступен — путь env
+        // ответит «не запущена»).
+        if let Ok(profile) = self.store.load(id) {
+            if profile.kind == BottleKind::Host {
+                return self.host.stop(id).await;
+            }
+        }
         // Короткий лок: активную бутылку вынуть из карты целиком.
         let runtime = {
             let mut runtime = self.runtime.lock().await;
@@ -341,10 +386,14 @@ impl BottleManager {
         }
         runtime.listeners = None;
         tracing::info!(id, "бутылка остановлена");
-        Ok(CliReply::Stopped { id: id.to_string() })
+        Ok(CliReply::Stopped {
+            id: id.to_string(),
+            warning: None,
+        })
     }
 
-    /// Рантайм-состояние всех бутылок (включая `failed`), по id.
+    /// Рантайм-состояние всех бутылок (включая `failed` и host-сессии),
+    /// по id.
     pub async fn status(&self) -> Vec<RuntimeState> {
         let runtime = self.runtime.lock().await;
         let mut bottles: Vec<RuntimeState> = runtime
@@ -365,6 +414,8 @@ impl BottleManager {
                 }
             })
             .collect();
+        drop(runtime);
+        bottles.extend(self.host.status().await);
         bottles.sort_by(|a, b| a.id.cmp(&b.id));
         bottles
     }
@@ -380,7 +431,7 @@ impl BottleManager {
         instance: u64,
     ) -> Result<Provisioned, String> {
         let VpnConfig::Env { protocol, .. } = &profile.vpn else {
-            return Err(HOST_KIND_MESSAGE.to_string()); // start() уже отфильтровал
+            return Err("конфиг есть только у env-бутылок".to_string()); // start() уже отфильтровал
         };
         let protocol = *protocol;
 
@@ -513,7 +564,8 @@ fn spawn_launch(command: &str) {
 /// Резервирует слушатели портов: автоподбор из 49152–65535 для нулевых
 /// портов, точный bind для фиксированных (занятый порт — понятная ошибка).
 /// Резерв — сам слушатель: порт занят, пока слушатель жив.
-fn reserve_ports(profile: &BottleProfile) -> Result<HostListeners, String> {
+/// Переиспользуется host-менеджером (релеи host-бутылок на 127.0.0.1).
+pub(crate) fn reserve_ports(profile: &BottleProfile) -> Result<HostListeners, String> {
     let socks5 = match profile.expose.socks5 {
         0 => reserve_dynamic_port()?,
         port => bind_reserved(port, "SOCKS5")?,
@@ -1441,7 +1493,8 @@ mod tests {
         assert_eq!(
             reply,
             CliReply::Stopped {
-                id: "office-a".into()
+                id: "office-a".into(),
+                warning: None
             }
         );
 
@@ -1492,7 +1545,8 @@ mod tests {
         assert_eq!(
             reply,
             CliReply::Stopped {
-                id: "office-a".into()
+                id: "office-a".into(),
+                warning: None
             }
         );
         assert_eq!(
@@ -1590,7 +1644,8 @@ mod tests {
         assert_eq!(
             reply,
             CliReply::Stopped {
-                id: "office-a".into()
+                id: "office-a".into(),
+                warning: None
             }
         );
 
@@ -1623,8 +1678,10 @@ mod tests {
         assert!(manager.status().await.is_empty());
     }
 
+    /// Host-старт без службы маршрутов — текст установки T7 (спека §2:
+    /// без UAC-fallback). Проверка идёт раньше любых эффектов.
     #[tokio::test]
-    async fn host_profiles_are_rejected_until_m2() {
+    async fn host_profile_start_without_svc_answers_installation_message() {
         let (_tmp, store) = store_with(&host_profile("corp-vpn"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
         let (manager, _store) = manager_with(store.data_root(), fake.clone());
@@ -1633,11 +1690,16 @@ mod tests {
         let CliReply::Error { message } = reply else {
             panic!("ожидали Error, получили {reply:?}");
         };
-        assert_eq!(message, "host-бутылки поддерживаются начиная с M2");
+        assert_eq!(
+            message,
+            crate::svc_client::SVC_MISSING_MESSAGE,
+            "текст установки службы T7"
+        );
         assert!(
             fake.journal.ups().is_empty(),
             "к агенту host-профиль не доходит"
         );
+        // Состояния нет: бутылка не поднималась (предусловие).
         assert!(manager.status().await.is_empty());
     }
 
@@ -1727,7 +1789,8 @@ mod tests {
         assert_eq!(
             reply,
             CliReply::Stopped {
-                id: "office-a".into()
+                id: "office-a".into(),
+                warning: None
             }
         );
         let reply =

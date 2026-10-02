@@ -206,7 +206,7 @@ where
 #[cfg(windows)]
 mod real {
     use std::io;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -220,7 +220,7 @@ mod real {
     use tokio_util::codec::{Decoder, Encoder, Framed};
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
 
-    use super::SvcTransport;
+    use super::{SvcTransport, POISONED_MESSAGE};
 
     /// Сколько пытаться подключиться к каналу службы: `ERROR_PIPE_BUSY`
     /// (все экземпляры заняты) и `ERROR_FILE_NOT_FOUND` (служба ещё
@@ -290,6 +290,12 @@ mod real {
             // не добавляется к окну таймаута.
             let exchange = async {
                 let mut conn = self.conn.lock().await;
+                // Раздражитель из ledger (T9): ожидание в очереди могло
+                // пережить таймаут соседнего обмена — транспорт уже
+                // отравлен, на провод не выходим.
+                if self.poisoned.load(Ordering::SeqCst) {
+                    return Err(io::Error::other(POISONED_MESSAGE));
+                }
                 let mut buf = BytesMut::new();
                 conn.codec_mut()
                     .encode(req.clone(), &mut buf)

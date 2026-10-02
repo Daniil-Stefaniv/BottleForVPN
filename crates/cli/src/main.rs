@@ -136,8 +136,13 @@ fn handle_reply(command: &Command, reply: CliReply) -> ExitCode {
             println!("Бутылка {id} поднята");
             ExitCode::SUCCESS
         }
-        (Command::Stop { .. }, CliReply::Stopped { id }) => {
+        (Command::Stop { .. }, CliReply::Stopped { id, warning }) => {
             println!("Бутылка {id} опущена");
+            // Host-бутылка: VPN-клиент остаётся работать (спека §7.2) —
+            // предупреждение демона доходит до пользователя.
+            if let Some(warning) = warning {
+                eprintln!("Внимание: {warning}");
+            }
             ExitCode::SUCCESS
         }
         (Command::Status, CliReply::Status { bottles }) => {
