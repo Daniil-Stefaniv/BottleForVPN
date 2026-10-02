@@ -14,7 +14,9 @@
 
 use std::io;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bottle_core::svcrpc::{RouteEntry, SvcReply, SvcRequest};
@@ -153,6 +155,49 @@ impl SvcClient {
 }
 
 // ----------------------------------------------------------------------
+// Обмен с таймаутом и отравлением (общая часть реального транспорта;
+// unit-тестируется на любой платформе).
+// ----------------------------------------------------------------------
+
+/// Сообщение отравленного таймаутом транспорта: соединение в
+/// рассинхроне, нужен новый клиент (соединение и сессия).
+const POISONED_MESSAGE: &str = "транспорт отравлен таймаутом — пересоздайте клиент";
+
+/// Выполняет один обмен с таймаутом; таймаут отравляет транспорт.
+///
+/// Протокол — строгий запрос-ответ по одному соединению: опоздавший
+/// ответ таймаутнутого запроса был бы прочитан как ответ СЛЕДУЮЩЕГО
+/// (окно рассинхрона). Поэтому первый таймаут поднимает `poisoned` —
+/// все дальнейшие вызовы падают сразу, не выходя на провод; вызывающий
+/// пересоздаёт клиент.
+///
+/// Захват соединения происходит внутри `exchange` — ожидание в очереди
+/// к занятому соединению не съедает окно таймаута (и не добавляется к
+/// чужому).
+async fn exchange_with_timeout<F>(
+    exchange: F,
+    timeout: Duration,
+    poisoned: &AtomicBool,
+) -> io::Result<SvcReply>
+where
+    F: std::future::Future<Output = io::Result<SvcReply>>,
+{
+    if poisoned.load(Ordering::SeqCst) {
+        return Err(io::Error::other(POISONED_MESSAGE));
+    }
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(result) => result,
+        Err(_) => {
+            poisoned.store(true, Ordering::SeqCst);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("служба маршрутов не ответила за {timeout:?}"),
+            ))
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
 // Windows-транспорт: named pipe SVC_PIPE + LengthJsonCodec
 // (паттерн appliance::AgentCodec). Поведение — windows-CI/ручная
 // проверка (T9); локально проверяется компиляцией msvc-таргета.
@@ -161,6 +206,7 @@ impl SvcClient {
 #[cfg(windows)]
 mod real {
     use std::io;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -194,6 +240,10 @@ mod real {
         /// Запрос-ответ по одному соединению — обмен сериализуется
         /// мьютексом (строгий request-response протокол).
         conn: Mutex<Framed<NamedPipeClient, SvcCodec>>,
+        /// Отравлен таймаутом ([`super::exchange_with_timeout`]):
+        /// опоздавший ответ не должен удовлетворить следующий запрос —
+        /// транспорт требует пересоздания (новое соединение/сессия).
+        poisoned: AtomicBool,
     }
 
     impl RealSvcPipe {
@@ -208,6 +258,7 @@ mod real {
                         tracing::info!(pipe = SVC_PIPE, "соединение со службой маршрутов открыто");
                         return Ok(Self {
                             conn: Mutex::new(Framed::new(client, SvcCodec)),
+                            poisoned: AtomicBool::new(false),
                         });
                     }
                     Err(error) => {
@@ -234,12 +285,15 @@ mod real {
     #[async_trait]
     impl SvcTransport for RealSvcPipe {
         async fn request(&self, req: &SvcRequest) -> io::Result<SvcReply> {
-            let mut conn = self.conn.lock().await;
-            let mut buf = BytesMut::new();
-            conn.codec_mut()
-                .encode(req.clone(), &mut buf)
-                .map_err(io::Error::other)?;
+            // Кодирование, захват соединения, запись и чтение — всё
+            // внутри обмениваемого future: ожидание мьютекса в очереди
+            // не добавляется к окну таймаута.
             let exchange = async {
+                let mut conn = self.conn.lock().await;
+                let mut buf = BytesMut::new();
+                conn.codec_mut()
+                    .encode(req.clone(), &mut buf)
+                    .map_err(io::Error::other)?;
                 conn.get_mut().write_all(&buf).await?;
                 match conn.next().await {
                     Some(Ok(reply)) => Ok(reply),
@@ -252,16 +306,7 @@ mod real {
                     )),
                 }
             };
-            match tokio::time::timeout(REPLY_TIMEOUT, exchange).await {
-                Ok(result) => result,
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "служба маршрутов не ответила за {} с",
-                        REPLY_TIMEOUT.as_secs()
-                    ),
-                )),
-            }
+            super::exchange_with_timeout(exchange, REPLY_TIMEOUT, &self.poisoned).await
         }
     }
 
@@ -339,9 +384,11 @@ mod tests {
             .expect("buffer must contain a complete frame")
     }
 
-    /// Фейк-служба: скриптованные ответы по порядку (дальше — `Ok`),
-    /// журнал запросов (после round-trip через кодек), флаг «служба
-    /// закрыла соединение».
+    /// Фейк-служба: скриптованные ответы по порядку, журнал запросов
+    /// (после round-trip через кодек), флаг «служба закрыла
+    /// соединение». Скрипт обязан покрывать каждый обмен: исчерпание
+    /// — паника с именем неожиданного запроса (дефолтного ответа нет —
+    /// иначе тест забывший запрограммировать ответ проходит пусто).
     struct FakeSvc {
         requests: StdMutex<Vec<SvcRequest>>,
         replies: StdMutex<VecDeque<SvcReply>>,
@@ -366,12 +413,10 @@ mod tests {
             self.requests.lock().unwrap().clone()
         }
 
-        fn next_reply(&self) -> SvcReply {
-            self.replies
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(SvcReply::Ok)
+        fn next_reply(&self, req: &SvcRequest) -> SvcReply {
+            self.replies.lock().unwrap().pop_front().unwrap_or_else(|| {
+                panic!("фейк-служба: нет запрограммированного ответа на запрос {req:?}")
+            })
         }
     }
 
@@ -387,7 +432,7 @@ mod tests {
             // Запрос и ответ гоняются через настоящий кодек канала.
             let on_wire = round_trip(req.clone());
             self.requests.lock().unwrap().push(on_wire);
-            Ok(round_trip(self.next_reply()))
+            Ok(round_trip(self.next_reply(req)))
         }
     }
 
@@ -406,7 +451,8 @@ mod tests {
 
     #[tokio::test]
     async fn connect_hello_ok_opens_session_with_daemon_pid() {
-        let fake = FakeSvc::new(vec![]);
+        // Оба обмена (Hello и add) запрограммированы явно.
+        let fake = FakeSvc::new(vec![SvcReply::Ok, SvcReply::Ok]);
         let client = SvcClient::connect(fake.clone()).await.expect("Hello → Ok");
 
         // Проверяем, что Hello реально ушёл (и пережил кодек) с PID демона.
@@ -444,7 +490,8 @@ mod tests {
 
     #[tokio::test]
     async fn add_del_cleanup_send_exact_requests() {
-        let fake = FakeSvc::new(vec![]);
+        // Hello + add + del + cleanup — по ответу на каждый.
+        let fake = FakeSvc::new(vec![SvcReply::Ok, SvcReply::Ok, SvcReply::Ok, SvcReply::Ok]);
         let client = SvcClient::connect(fake.clone()).await.expect("сессия");
 
         client
@@ -498,7 +545,8 @@ mod tests {
 
     #[tokio::test]
     async fn closed_connection_maps_io_error_to_daemon_error() {
-        let fake = FakeSvc::new(vec![]);
+        // Ответ — только на Hello; add ударяется в закрытое соединение.
+        let fake = FakeSvc::new(vec![SvcReply::Ok]);
         let client = SvcClient::connect(fake.clone()).await.expect("сессия");
 
         // Служба умерла/закрыла соединение — следующий запрос падает
@@ -568,5 +616,60 @@ mod tests {
     #[test]
     fn svc_pipe_exists_is_false_off_windows() {
         assert!(!svc_pipe_exists());
+    }
+
+    /// Finding 2 (ревью): таймаут обмена отравляет транспорт —
+    /// опоздавший ответ не должен удовлетворить следующий запрос.
+    /// После таймаута каждый следующий вызов падает сразу, не выходя
+    /// на провод (обмен даже не начинает выполняться).
+    #[tokio::test]
+    async fn timeout_poisons_transport_next_request_fails_without_wire() {
+        let poisoned = AtomicBool::new(false);
+
+        // «Служба молчит»: обмен падает таймаутом.
+        let error =
+            exchange_with_timeout(std::future::pending(), Duration::from_millis(50), &poisoned)
+                .await
+                .expect_err("таймаут обмена");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(poisoned.load(Ordering::SeqCst), "транспорт отравлен");
+
+        // Следующий запрос: обмен не выполняется вовсе (провод не
+        // тронут), сразу отказ с требованием пересоздать клиент.
+        let touched = AtomicBool::new(false);
+        let exchange = async {
+            touched.store(true, Ordering::SeqCst);
+            Ok(SvcReply::Ok)
+        };
+        let error = exchange_with_timeout(exchange, Duration::from_secs(35), &poisoned)
+            .await
+            .expect_err("отравленный транспорт отказывает сразу");
+        assert_eq!(
+            error.to_string(),
+            "транспорт отравлен таймаутом — пересоздайте клиент",
+            "{error}"
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "обмен не начинался: провод не тронут"
+        );
+    }
+
+    /// Здоровый транспорт остаётся здоровым: успешные обмены подряд
+    /// не отравляют его.
+    #[tokio::test]
+    async fn successful_exchanges_keep_transport_healthy() {
+        let poisoned = AtomicBool::new(false);
+        for _ in 0..2 {
+            let reply = exchange_with_timeout(
+                async { Ok(SvcReply::Ok) },
+                Duration::from_secs(1),
+                &poisoned,
+            )
+            .await
+            .expect("успешный обмен");
+            assert_eq!(reply, SvcReply::Ok);
+        }
+        assert!(!poisoned.load(Ordering::SeqCst));
     }
 }

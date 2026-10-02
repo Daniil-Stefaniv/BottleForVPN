@@ -7,17 +7,45 @@
 //! дедуплицируется с сохранением порядка ([`collect_addrs`] — чистая,
 //! unit-тестируемая).
 //!
-//! Физический шлюз — первый маршрут `0.0.0.0/0` по возрастанию
+//! Физический шлюз — первый маршрут default-префикса выбранного
+//! семейства ([`GwFamily`]: `0.0.0.0/0` или `::/0`) по возрастанию
 //! метрики интерфейса, чей адаптер не в списке исключений
-//! (WSL/loopback/isatap/teredo и адаптеры host-бутылок по индексу).
+//! (WSL/loopback/isatap/teredo и адаптеры host-бутылок по индексу);
+//! спека §9 требует раздельного поиска: при наличии v6-endpoint'ов
+//! без v6-шлюза физики их нужно блокировать (T9 решает по семействам).
 //! Запрос идёт читающим PowerShell ([`physical_gateway_ps`]) — правила
 //! квотирования значений см. [`crate::ps_query`]; разбор вывода —
-//! чистый [`parse_gateway_table`] на фикс-фрагментах. Поведенческая
-//! проверка (реальный `Get-NetRoute`) — windows-CI/ручная.
+//! чистый [`parse_gateway_table`] на фикс-фрагментах (v6 next-hop'ы
+//! парсятся тем же якорем `IpAddr`). Поведенческая проверка
+//! (реальный `Get-NetRoute`) — windows-CI/ручная.
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 use crate::error::DaemonError;
+
+/// Семейство физического шлюза: default-маршрут IPv4 или IPv6.
+///
+/// Шлюз каждого семейства ищется своим запросом `Get-NetRoute`
+/// (`0.0.0.0/0` / `::/0`): у адаптера может не быть v6-шлюза при
+/// живом v4 — тогда pin-маршруты v6-endpoint'ов ставить нельзя
+/// (спека §9, решает вызывающий T9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GwFamily {
+    /// Default-маршрут IPv4 (`0.0.0.0/0`).
+    V4,
+    /// Default-маршрут IPv6 (`::/0`).
+    V6,
+}
+
+impl GwFamily {
+    /// Default-префикс семейства для `Get-NetRoute -DestinationPrefix`.
+    fn default_prefix(self) -> &'static str {
+        match self {
+            GwFamily::V4 => "0.0.0.0/0",
+            GwFamily::V6 => "::/0",
+        }
+    }
+}
 
 /// Псевдонимы интерфейсов, исключаемые из поиска физического шлюза
 /// по умолчанию (передаются в [`parse_gateway_table`] из
@@ -79,17 +107,18 @@ pub async fn resolve_endpoints_async(hosts: &[String]) -> Result<Vec<IpAddr>, Da
         .map_err(|e| DaemonError::HostNet(format!("задача резолва endpoint'ов отменена: {e}")))?
 }
 
-/// Собирает аргументы PowerShell-запроса физических маршрутов:
-/// `Get-NetRoute -DestinationPrefix '0.0.0.0/0'` (пустая выборка — не
-/// ошибка: `SilentlyContinue`, как в svc/routes.rs), сортировка по
-/// метрике интерфейса, текстовые колонки без заголовков. `-Width 512`
-/// страховает от усечения длинных имён адаптеров `Format-Table`
-/// (усечённый «vEthernet (WS…» перестал бы матчиться фильтром).
-pub fn physical_gateway_ps() -> Vec<String> {
+/// Собирает аргументы PowerShell-запроса физических маршрутов
+/// выбранного семейства: `Get-NetRoute -DestinationPrefix '0.0.0.0/0'`
+/// или `'::/0'` (пустая выборка — не ошибка: `SilentlyContinue`, как
+/// в svc/routes.rs), сортировка по метрике интерфейса, текстовые
+/// колонки без заголовков. `-Width 512` страховает от усечения
+/// длинных имён адаптеров `Format-Table` (усечённый «vEthernet (WS…»
+/// перестал бы матчиться фильтром).
+pub fn physical_gateway_ps(family: GwFamily) -> Vec<String> {
     vec![
         "Get-NetRoute".to_string(),
         "-DestinationPrefix".to_string(),
-        crate::ps_query::ps_value("0.0.0.0/0"),
+        crate::ps_query::ps_value(family.default_prefix()),
         // Пустая выборка (нет default route) — не ошибка, пустой вывод
         // (прецедент: List в svc/routes.rs).
         "-ErrorAction".to_string(),
@@ -125,8 +154,9 @@ pub fn physical_gateway_ps() -> Vec<String> {
 /// Фильтры: `InterfaceIndex` в `exclude_idx` (адаптеры host-бутылок),
 /// псевдоним содержит любую из `exclude_alias_parts` (кейс-
 /// инсенситивно; паттерны передаёт вызвавший — по умолчанию их нет).
-/// On-link маршруты (`NextHop 0.0.0.0`) пропускаются: unspecified —
-/// не адрес шлюза, pin-маршрут через него молча разъюздился бы.
+/// On-link маршруты (`NextHop 0.0.0.0` / `::`) пропускаются:
+/// unspecified — не адрес шлюза, pin-маршрут через него молча
+/// разъюздился бы.
 /// Первый прошедший ряд — ответ; пусто — «физический шлюз не найден».
 pub fn parse_gateway_table(
     text: &str,
@@ -143,7 +173,7 @@ pub fn parse_gateway_table(
         let Ok(next_hop) = tokens[0].parse::<IpAddr>() else {
             continue;
         };
-        // On-link default (NextHop 0.0.0.0) — не адрес шлюза.
+        // On-link default (NextHop 0.0.0.0/::) — не адрес шлюза.
         if next_hop.is_unspecified() {
             continue;
         }
@@ -174,21 +204,24 @@ pub fn parse_gateway_table(
     ))
 }
 
-/// Физический шлюз ОС: запуск [`physical_gateway_ps`] (только
-/// Windows) и разбор вывода с фильтрами по умолчанию
-/// ([`DEFAULT_EXCLUDE_ALIAS_PARTS`]) и индексам адаптеров
-/// host-бутылок вызывающего.
-pub async fn physical_gateway(exclude_idx: &[u32]) -> Result<(IpAddr, String), DaemonError> {
+/// Физический шлюз ОС выбранного семейства: запуск
+/// [`physical_gateway_ps`] (только Windows) и разбор вывода с
+/// фильтрами по умолчанию ([`DEFAULT_EXCLUDE_ALIAS_PARTS`]) и
+/// индексам адаптеров host-бутылок вызывающего.
+pub async fn physical_gateway(
+    exclude_idx: &[u32],
+    family: GwFamily,
+) -> Result<(IpAddr, String), DaemonError> {
     #[cfg(not(windows))]
     {
-        let _ = exclude_idx;
+        let _ = (exclude_idx, family);
         Err(DaemonError::HostNet(
             "поиск физического шлюза доступен только на Windows".to_string(),
         ))
     }
     #[cfg(windows)]
     {
-        let output = crate::ps_query::run_ps_readonly(&physical_gateway_ps()).await?;
+        let output = crate::ps_query::run_ps_readonly(&physical_gateway_ps(family)).await?;
         parse_gateway_table(&output, exclude_idx, DEFAULT_EXCLUDE_ALIAS_PARTS)
     }
 }
@@ -267,8 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_gateway_ps_pins_readonly_query_shape() {
-        let args = physical_gateway_ps();
+    fn physical_gateway_ps_pins_readonly_query_shape_for_both_families() {
         let expected: Vec<&str> = vec![
             "Get-NetRoute",
             "-DestinationPrefix",
@@ -297,10 +329,26 @@ mod tests {
             "-Width",
             "512",
         ];
-        assert_eq!(args, expected, "точная форма запроса");
+        assert_eq!(
+            physical_gateway_ps(GwFamily::V4),
+            expected,
+            "точная форма запроса v4"
+        );
+
+        // V6-семейство отличается только заквоченным префиксом '::/0'.
+        let mut v6 = physical_gateway_ps(GwFamily::V6);
+        assert_eq!(v6[2], "'::/0'", "v6-префикс — PS-литерал");
+        v6[2] = "'0.0.0.0/0'".to_string();
+        assert_eq!(v6, expected, "остальная форма запроса неизменна");
+
         // Запрос только читает: нет изменяющих командлетов.
-        assert!(!args.iter().any(|a| a.contains("New-NetRoute")));
-        assert!(!args.iter().any(|a| a.contains("Remove-NetRoute")));
+        for args in [
+            physical_gateway_ps(GwFamily::V4),
+            physical_gateway_ps(GwFamily::V6),
+        ] {
+            assert!(!args.iter().any(|a| a.contains("New-NetRoute")));
+            assert!(!args.iter().any(|a| a.contains("Remove-NetRoute")));
+        }
     }
 
     #[test]
@@ -369,5 +417,47 @@ mod tests {
             parse_gateway_table(table, &[], &[]).expect("мусор пропущен, годный ряд выбран");
         assert_eq!(gateway, ip("192.168.1.1"), "on-link 0.0.0.0 — не шлюз");
         assert_eq!(alias, "Wi-Fi");
+    }
+
+    /// V6-таблица (спека §9: при v6-endpoint'ах нужен v6-шлюз):
+    /// ULA/global next-hop'ы парсятся якорем IpAddr, фильтры работают
+    /// так же; on-link `::` пропускается.
+    #[test]
+    fn parse_gateway_table_v6_picks_first_filters_wsl_and_onlink() {
+        let table = "fd00::1  vEthernet (WSL)  28  5000\n\
+                     ::  Wi-Fi  12  25\n\
+                     2001:db8::1  Wi-Fi  12  25\n\
+                     fd00::2  Ethernet  11  30\n";
+        let (gateway, alias) = parse_gateway_table(
+            table,
+            &[],
+            &["vEthernet (WSL", "Loopback", "isatap", "teredo"],
+        )
+        .expect("v6-шлюз найден");
+        assert_eq!(gateway, ip("2001:db8::1"), "WSL-ряд и on-link :: пропущены");
+        assert_eq!(alias, "Wi-Fi");
+
+        // exclude_idx работает и на v6-рядах.
+        let (gateway, alias) =
+            parse_gateway_table(table, &[12], &["vEthernet (WSL"]).expect("следующий v6-ряд");
+        assert_eq!(gateway, ip("fd00::2"));
+        assert_eq!(alias, "Ethernet");
+    }
+
+    /// V6-семейство без годного ряда (пусто/всё отфильтровано) — та же
+    /// ошибка «физический шлюз не найден» (спека §9: v6-endpoint'ы
+    /// без v6-шлюза блокирует вызывающий по этому отказу).
+    #[test]
+    fn parse_gateway_table_v6_empty_is_error() {
+        let error = parse_gateway_table("\n", &[], &[]).expect_err("v6-таблица пуста");
+        assert!(
+            matches!(error, DaemonError::HostNet(ref m) if m.contains("физический шлюз не найден")),
+            "{error}"
+        );
+        let wsl_only = "fd00::1  vEthernet (WSL)  28  5000\n";
+        assert!(
+            parse_gateway_table(wsl_only, &[], &["vEthernet (WSL"]).is_err(),
+            "единственный v6-ряд отфильтрован — ошибка, не успех"
+        );
     }
 }
