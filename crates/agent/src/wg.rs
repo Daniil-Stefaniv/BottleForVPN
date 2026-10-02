@@ -61,7 +61,10 @@ type Entry = (String, String);
 
 /// Разбирает текст `.conf` WireGuard (формат wg-quick).
 ///
-/// Поддерживается один пир. Секции `[Interface]`/`[Peer]`, строки
+/// Поддерживается один пир: конфиг с несколькими секциями `[Peer]`
+/// отвергается явной ошибкой (без барьера ключи пиров молча
+/// сливались в один кусок `wg setconf` и падали невнятным отказом
+/// wg на дубликатах). Секции `[Interface]`/`[Peer]`, строки
 /// «ключ = значение», комментарии `#`; посторонние для ядра ключи
 /// wg-quick (`DNS`, `Table`, `MTU`, …) игнорируются. Обязательные ключи:
 /// `Address` и `PrivateKey` в `[Interface]`; `PublicKey`, `AllowedIPs`
@@ -77,6 +80,7 @@ pub fn parse_wg_config(text: &str) -> Result<ParsedWg, AgentError> {
 
     let mut section = Section::None;
     let (mut iface, mut peer): (Vec<Entry>, Vec<Entry>) = (Vec::new(), Vec::new());
+    let mut peer_sections = 0usize;
 
     for (num, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -86,7 +90,16 @@ pub fn parse_wg_config(text: &str) -> Result<ParsedWg, AgentError> {
         if let Some(name) = line.strip_prefix('[') {
             section = match name {
                 "Interface]" => Section::Interface,
-                "Peer]" => Section::Peer,
+                "Peer]" => {
+                    peer_sections += 1;
+                    if peer_sections > 1 {
+                        return Err(invalid_config(format!(
+                            "строка {}: поддерживается один пир, секций [Peer] несколько",
+                            num + 1
+                        )));
+                    }
+                    Section::Peer
+                }
                 _ => {
                     // Первый токен — имя секции в скобках; значение секции
                     // не бывает секретом, а остаток строки в ошибку не
@@ -493,6 +506,38 @@ mod tests {
         assert!(
             matches!(err, AgentError::InvalidConfig(_)),
             "ожидалась InvalidConfig: {err}"
+        );
+    }
+
+    #[test]
+    fn multiple_peer_sections_are_rejected_explicitly() {
+        // До барьера второй [Peer] молча сливался в один setconf-кусок
+        // и падал невнятной ошибкой wg setconf; теперь — явный отказ
+        // на этапе разбора (ledger T10).
+        let two_peers = format!(
+            "[Interface]\n\
+             Address = 10.8.0.2/32\n\
+             PrivateKey = {PRIV}\n\
+             \n\
+             [Peer]\n\
+             PublicKey = {PUB}\n\
+             AllowedIPs = 10.0.0.0/8\n\
+             Endpoint = vpn.example.com:51820\n\
+             \n\
+             [Peer]\n\
+             PublicKey = FpCyhaw9L4Bk9CVnTuxEjpvGCnVPaKtIWQCBiV6LsSg=\n\
+             AllowedIPs = 192.168.0.0/16\n\
+             Endpoint = vpn2.example.com:51820\n"
+        );
+        let err = parse_wg_config(&two_peers).expect_err("два пира должны быть отклонены");
+        assert!(
+            matches!(err, AgentError::InvalidConfig(_)),
+            "ожидалась InvalidConfig: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("один пир"),
+            "ошибка обязана называть причину: {message}"
         );
     }
 

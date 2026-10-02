@@ -1078,14 +1078,39 @@ fn set_nonblocking(listener: &StdTcpListener, port: u16) -> Result<(), String> {
 }
 
 /// Читает содержимое конфига туннеля из хранилища (`bottles/<id>.conf`):
-/// агент получает текст, а не имя файла.
+/// агент получает текст, а не имя файла. Имя из профиля проходит барьер
+/// [`is_plain_config_filename`] ДО обращения к файловой системе.
 fn read_config(data_root: &Path, vpn: &VpnConfig) -> Result<String, String> {
     let VpnConfig::Env { config, .. } = vpn else {
         return Err("конфиг есть только у env-бутылок".to_string());
     };
+    if !is_plain_config_filename(config) {
+        return Err(format!(
+            "недопустимое имя файла конфига в профиле: {config:?} \
+             (ожидается плоское имя из A-Z a-z 0-9 . _ -, например office-a.conf)"
+        ));
+    }
     let path = data_root.join("bottles").join(config);
     std::fs::read_to_string(&path)
         .map_err(|error| format!("не удалось прочитать конфиг {}: {error}", path.display()))
+}
+
+/// Плоское имя файла конфига `^[A-Za-z0-9._-]+$` без разделителей пути.
+///
+/// `config` приходит из профиля на диске — рукописного toml, а не только
+/// из [`Store::save`] (который нормализует его в `<id>.conf`): без
+/// барьера `../../etc/passwd` читал бы произвольные файлы хоста и
+/// отправлял их содержимое агенту аплаенса. `.` и `..` проходят
+/// посимвольный фильтр, но отвергаются явно — это traversal-намерение
+/// (обе ссылки резолвятся в каталоги и чтением не дырявят, но барьер
+/// не должен зависеть от этого нюанса).
+fn is_plain_config_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Собирает запрос `Up` из профиля, выбранного резерва портов и
@@ -2641,5 +2666,45 @@ mod tests {
         assert!(degraded.socks5.is_some(), "порт остаётся за бутылкой");
         // Агент ни при чём: бутылка в аплаенсе жива, Down не уходил.
         assert!(fake.journal.downs().is_empty());
+    }
+
+    /// `read_config` принимает плоское имя конфига в профиле
+    /// (`Store::save` нормализует его в `<id>.conf`).
+    #[test]
+    fn read_config_accepts_plain_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bottles = tmp.path().join("bottles");
+        std::fs::create_dir_all(&bottles).unwrap();
+        std::fs::write(bottles.join("office-a.conf"), "wg-office-a").unwrap();
+
+        let vpn = VpnConfig::Env {
+            protocol: TunnelProtocol::WireGuard,
+            config: "office-a.conf".to_string(),
+        };
+        assert_eq!(
+            read_config(tmp.path(), &vpn).expect("плоское имя читается"),
+            "wg-office-a"
+        );
+    }
+
+    /// Имя конфига из профиля валидируется `^[A-Za-z0-9._-]+$` до
+    /// каких-либо обращений к файловой системе: профиль — рукописный
+    /// toml на диске, и без барьера `../..` читал бы произвольные файлы
+    /// хоста и отправлял их содержимое в аплаенс (ledger-минор T16).
+    #[test]
+    fn read_config_rejects_traversal_and_absolute_names() {
+        // «..» и «.» проходят посимвольный фильтр, но являются
+        // traversal-намерением — отвергаются явно.
+        for name in ["../../etc/passwd", "/abs/path", "..", "."] {
+            let vpn = VpnConfig::Env {
+                protocol: TunnelProtocol::WireGuard,
+                config: name.to_string(),
+            };
+            let err = read_config(Path::new("/data"), &vpn).expect_err("имя должно быть отклонено");
+            assert!(
+                err.contains("недопустимое имя файла конфига"),
+                "отказ обязан называть барьер, для {name:?}: {err}"
+            );
+        }
     }
 }
