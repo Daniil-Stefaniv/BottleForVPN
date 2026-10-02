@@ -10,7 +10,7 @@ use std::ffi::{OsStr, OsString};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 // Реквизиты службы используются windows-обвязкой SCM ниже; на других
 // платформах каркас проверяется только unit-тестами парсера (паттерн
@@ -108,14 +108,14 @@ fn dispatch(mode: Mode) -> ExitCode {
     }
 }
 
-/// Отладочный режим без SCM: трейсинг + внутренний сервер-заглушка
-/// (задача 6 подключит сюда pipe-сервер), остановка по Ctrl+C.
+/// Отладочный режим без SCM: полный цикл службы (журнал, сверка,
+/// pipe-сервер), остановка по Ctrl+C.
 fn run_console() -> ExitCode {
     init_tracing();
     println!("bottle-svc: консольный режим отладки (без SCM)");
     println!(
-        "bottle-svc: сервер-заглушка; именованный канал {} подключит задача 6",
-        bottle_core::svcrpc::SVC_PIPE
+        "bottle-svc: журнал маршрутов: {}",
+        svc::journal::default_journal_path().display()
     );
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -130,25 +130,48 @@ fn run_console() -> ExitCode {
         }
     };
 
-    let shutdown = Arc::new(Notify::new());
+    let shutdown = CancellationToken::new();
     let watcher = shutdown.clone();
     runtime.spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             println!("получен Ctrl+C, останавливаю bottle-svc");
-            watcher.notify_one();
+            watcher.cancel();
         }
     });
-    runtime.block_on(run_stub_server(shutdown));
+    let outcome = runtime.block_on(run_server(shutdown));
+    if let Err(error) = outcome {
+        eprintln!("bottle-svc: {error}");
+        return ExitCode::FAILURE;
+    }
     println!("bottle-svc остановлен");
     ExitCode::SUCCESS
 }
 
-/// Внутренний сервер службы: заглушка до задачи 6 (pipe-сервер на
-/// [`bottle_core::svcrpc::SVC_PIPE`]); ждёт сигнала остановки.
-async fn run_stub_server(shutdown: Arc<Notify>) {
-    tracing::info!("внутренний сервер службы запущен (заглушка)");
-    shutdown.notified().await;
-    tracing::info!("получен сигнал остановки, останавливаю сервер");
+/// Внутренний сервер службы: открыть журнал → сверка с ОС →
+/// pipe-сервер на [`bottle_core::svcrpc::SVC_PIPE`] до сигнала
+/// остановки. Отказ журнала фатален: без него служба не может
+/// гарантировать контракт «маршруты не переживают смерть демона».
+async fn run_server(shutdown: CancellationToken) -> Result<(), String> {
+    let journal_path = svc::journal::default_journal_path();
+    let mut store = svc::journal::RouteStore::open(&journal_path)
+        .map_err(|error| format!("журнал маршрутов недоступен: {error}"))?;
+    tracing::info!(journal = %journal_path.display(), "журнал маршрутов открыт");
+
+    // При старте службы живых сессий нет: все live-маршруты из журнала
+    // сверяются с ОС (сироты удаляются, отсутствующие вычищаются).
+    let report = svc::journal::reconcile(&mut store, |_| false).await;
+    tracing::info!(
+        removed = report.removed,
+        vanished = report.vanished,
+        kept = report.kept,
+        undecided = report.undecided,
+        "сверка журнала при старте завершена"
+    );
+
+    let store = Arc::new(tokio::sync::Mutex::new(store));
+    svc::pipe::serve(bottle_core::svcrpc::SVC_PIPE, store, shutdown)
+        .await
+        .map_err(|error| format!("pipe-сервер службы маршрутов: {error}"))
 }
 
 /// Инициализирует логирование: уровень из `RUST_LOG`, по умолчанию
@@ -164,10 +187,9 @@ fn init_tracing() {
 mod win_service {
     use std::ffi::OsString;
     use std::process::ExitCode;
-    use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
     use windows_service::service::{
         ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
         ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
@@ -177,7 +199,7 @@ mod win_service {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     use windows_service::{define_windows_service, Error as ScmError};
 
-    use super::run_stub_server;
+    use super::run_server;
     use crate::{SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME};
 
     /// Win32 ERROR_ACCESS_DENIED — установка/удаление без прав
@@ -234,14 +256,14 @@ mod win_service {
     /// best-effort переводом в Stopped перед аварийным выходом (иначе
     /// служба зависает в StartPending до таймаута SCM).
     fn run_service() -> Result<(), Box<dyn std::error::Error>> {
-        let shutdown = Arc::new(Notify::new());
+        let shutdown = CancellationToken::new();
         let stop_watcher = shutdown.clone();
         let event_handler = move |control_event| -> ServiceControlHandlerResult {
             match control_event {
                 // Обязателен к приёму даже без реализации.
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
                 ServiceControl::Stop => {
-                    stop_watcher.notify_one();
+                    stop_watcher.cancel();
                     ServiceControlHandlerResult::NoError
                 }
                 _ => ServiceControlHandlerResult::NotImplemented,
@@ -262,10 +284,12 @@ mod win_service {
     }
 
     /// Полный цикл состояний после register: StartPending → Running →
-    /// сервер-заглушка → Stopped; сигнал Stop пробуждает сервер.
+    /// внутренний сервер (журнал, сверка, pipe) → Stopped; сигнал Stop
+    /// пробуждает сервер, открытые сессии закрываются с удалением их
+    /// маршрутов из ОС.
     fn serve_until_stop(
         status_handle: windows_service::service_control_handler::ServiceStatusHandle,
-        shutdown: Arc<Notify>,
+        shutdown: CancellationToken,
     ) -> Result<(), Box<dyn std::error::Error>> {
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
@@ -280,7 +304,7 @@ mod win_service {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(async {
+        let server_error = runtime.block_on(async {
             if let Err(error) = status_handle.set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: ServiceState::Running,
@@ -291,14 +315,17 @@ mod win_service {
                 process_id: None,
             }) {
                 tracing::error!(%error, "не удалось перевести службу в Running");
-                return;
+                return None;
             }
             tracing::info!("служба маршрутов BottleForApps запущена");
-            run_stub_server(shutdown).await;
+            run_server(shutdown).await.err()
         });
 
         status_handle.set_service_status(stopped_status())?;
-        Ok(())
+        match server_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     }
 
     /// Статус «служба остановлена» для доклада SCM.

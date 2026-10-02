@@ -28,6 +28,10 @@ jobs:
       # add/del точечного маршрута через шлюз по умолчанию (раннер
       # под администратором).
       - run: cargo test -p svc --test routes_win -- --ignored
+      # Поведенческий тест службы целиком: install → RPC (Hello/Add/
+      # List) → обрыв соединения демона → маршруты сессии сняты ≤10 с →
+      # сверка журнала при повторном старте подбирает сироту → uninstall.
+      - run: cargo test -p svc --test svc_win -- --ignored
 
   agent-integration:
     runs-on: ubuntu-latest

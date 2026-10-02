@@ -13,12 +13,15 @@ path = "src/main.rs"
 
 [dependencies]
 bottle-core = { path = "../core" }
-# Внутренний runtime службы: сервер-заглушка (Task 6 подключит pipe),
-# graceful-остановка в консольном режиме — по Ctrl+C; run_ps: процесс
-# PowerShell с таймаутом.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time"] }
+# Внутренний runtime службы: pipe-сервер (named pipe + FramedRead),
+# graceful-остановка, run_ps: процесс PowerShell с таймаутом.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "net", "io-util", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Кадры LengthJsonCodec pipe-сервера (SVC_PIPE) + CancellationToken.
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+bytes = "1"
 # RouteOpError в routes.rs, JournalError в journal.rs.
 thiserror = "2"
 # Записи журнала маршрутов (JSONL): JournalRecord в journal.rs.
@@ -32,3 +35,8 @@ tempfile = "3"
 # Обвязка Windows-службы: SCM dispatcher, install/uninstall, статусы.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
+
+# Поведенческий тест службы (tests/svc_win.rs): кодек клиента и коды
+# ошибок named pipe при ожидании экземпляра канала.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
