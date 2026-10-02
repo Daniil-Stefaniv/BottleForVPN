@@ -1,0 +1,21 @@
+[package]
+name = "svc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "bottle-svc"
+path = "src/main.rs"
+
+[dependencies]
+bottle-core = { path = "../core" }
+# Внутренний runtime службы: сервер-заглушка (Task 6 подключит pipe),
+# graceful-остановка в консольном режиме — по Ctrl+C.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Обвязка Windows-службы: SCM dispatcher, install/uninstall, статусы.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
