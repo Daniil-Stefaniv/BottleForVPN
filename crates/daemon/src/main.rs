@@ -42,6 +42,8 @@ mod manager;
 mod pipe;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod store;
+#[allow(dead_code)]
+mod svc_client;
 
 #[tokio::main]
 async fn main() -> ExitCode {

@@ -58,4 +58,8 @@ pub enum DaemonError {
     /// сформулирован для пользователя (CLI → IPC).
     #[error("{0}")]
     Appliance(String),
+    /// Ошибка службы маршрутов `bottle-svc`: текст — русское сообщение
+    /// службы (VALIDATION/IO/INTERNAL), уже готовое для пользователя.
+    #[error("{0}")]
+    Svc(String),
 }
