@@ -7,10 +7,23 @@
 //! резолвит порты сам (диапазон 49152–65535 при автоподборе) — агенту
 //! уходят только конкретные номера, `socks5_port = 0` не отправляется.
 //!
-//! Протокол v2: `Up` и `Down` несут instance-поколение бутылки (номер
-//! поколения маркера `starting`). Агент опускает бутылку только `Down`
-//! с сохранным поколением — `Down` проигравшего рестарта получает
+//! Протокол v2: `Up` и `Down` несут instance-поколение бутылки. Номер —
+//! `(boot_seed << 20) | counter`: старшие биты читаются из файла
+//! `<data>/generation-seed` при старте демона (персистентные поколения,
+//! T11) и различаются у любых двух запусков, младшие 20 бит — монотонный
+//! счётчик стартов в пределах запуска. Агент опускает бутылку только
+//! `Down` с сохранным поколением — `Down` проигравшего рестарта получает
 //! `STALE_INSTANCE` и не гасит живую бутылку победителя.
+//!
+//! Живучесть (T11, спека §9): health-цикл ([`BottleManager::health_pass`],
+//! период [`HEALTH_CHECK_PERIOD`]) опрашивает агента; смерть агента
+//! переводит env-бутылки в `Degraded` (локальная метка — бутылки не
+//! трогаем, WSL лежит), воскрешение — пере-поднимает их (новые порты,
+//! свежий конфиг, новое поколение; призраки в аплаенсе гасит `Down`
+//! старого поколения). Host-бутылки цикл проверяет по живости их
+//! собственного интерфейса (рулинг префлайта: не слепой stop). Смерть
+//! relay-задачи (не по остановке) помечает бутылку `Degraded{причина}`.
+//! Сон/резюме хоста покрывается тем же циклом.
 //!
 //! Контракт конкурентности: runtime-карта живёт под одним мьютексом,
 //! лок удерживается только на коротких участках без `await`; долгие
@@ -21,8 +34,11 @@
 //! поколением), сделанное полностью разбирается.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,13 +49,13 @@ use bottle_core::profile::{BottleKind, BottleProfile, TunnelProtocol, VpnConfig}
 use bottle_core::protocol::{err, AgentReply, AgentRequest, ForwardPort, UpArgs};
 use relay_lib::forward::{serve_forward, TargetAddr};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 
 use crate::appliance::{ensure_appliance, ApplianceHandle, WslRunner};
 use crate::error::DaemonError;
 use crate::host_manager::{HostManager, HostParts, HostTiming, BOTTLE_NOT_RUNNING};
-use crate::store::Store;
+use crate::store::{atomic_write, Store};
 
 /// Нижняя граница диапазона автоподбора портов (dynamic, RFC 6335).
 pub const PORT_DYNAMIC_MIN: u16 = 49152;
@@ -51,16 +67,31 @@ const PORT_DYNAMIC_ATTEMPTS: usize = 1000;
 /// Сколько [`RealAgentConnect`] ждёт соединения с агентом после wake
 /// (агент стартует при первом обращении к VM; спека §4.3 — ≤30 с).
 pub const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Период health-цикла демона (T11, спека §9): поллинг агента, живость
+/// host-интерфейсов, разбор смертей relay-задач.
+pub const HEALTH_CHECK_PERIOD: Duration = Duration::from_secs(10);
+/// Имя файла персистентного поколения в корне данных демона.
+const GENERATION_SEED_FILE: &str = "generation-seed";
+/// Число бит счётчика стартов в младшей части instance-поколения
+/// (рулинг T11: `instance = (seed << 20) | counter`, counter < 2^20).
+const INSTANCE_COUNTER_BITS: u32 = 20;
 
 /// Точка подключения к агенту аплаенса; инъекция для тестов.
 ///
 /// Каждая операция жизненного цикла (`start`/`stop`) открывает своё
 /// соединение: `connect` дешёвый (пока жива хоть одна бутылка, VM не
-/// гаснет), агент обслуживает последовательных клиентов.
+/// гаснет), агент обслуживает последовательных клиентов. Health-цикл
+/// (T11) опрашивает живость через [`AgentConnect::alive`] тем же
+/// способом — контрольное соединение с `Status`.
 #[async_trait]
 pub trait AgentConnect: Send + Sync {
     /// Устанавливает соединение с агентом (handshake включён).
     async fn connect(&self) -> Result<ApplianceHandle, DaemonError>;
+
+    /// Жив ли агент: контрольное соединение и опрос `Status` без id.
+    /// Используется health-циклом (T11, спека §9); `false` — умер или
+    /// недоступен (WSL выключен, сон хоста, рестарт VM).
+    async fn alive(&self) -> bool;
 }
 
 /// Продакшн-подключение: [`ensure_appliance`] — импорт дистрибутива,
@@ -105,6 +136,128 @@ impl AgentConnect for RealAgentConnect {
         )
         .await
     }
+
+    async fn alive(&self) -> bool {
+        match self.connect().await {
+            Ok(mut handle) => handle.alive().await,
+            Err(error) => {
+                tracing::debug!(%error, "health-проба агента не удалась");
+                false
+            }
+        }
+    }
+}
+
+/// Текущее время в unix-миллисекундах (источник значения generation-seed).
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Вычисляет seed очередного запуска демона: текущее время; если файл
+/// уже содержит не меньшее значение (два запуска в одну миллисекунду,
+/// часы ушли назад) — увеличить. Любые два запуска получают разные
+/// seed, значит их instance-диапазоны `(seed << 20)..(seed+1 << 20)`
+/// не пересекаются.
+fn next_seed(previous: Option<u64>, now_ms: u64) -> u64 {
+    match previous {
+        Some(prev) if prev >= now_ms => prev + 1,
+        _ => now_ms,
+    }
+}
+
+/// Читает/обновляет файл поколения `<data>/generation-seed` и возвращает
+/// seed этого запуска (T11: персистентные поколения). Файл создаётся при
+/// первом старте с текущим временем; каждый следующий старт продвигает
+/// значение (см. [`next_seed`]); битое содержимое перезаписывается.
+fn advance_generation_seed(data_root: &Path) -> io::Result<u64> {
+    let path = data_root.join(GENERATION_SEED_FILE);
+    let previous = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    let seed = next_seed(previous, unix_ms());
+    atomic_write(&path, seed.to_string().as_bytes())?;
+    Ok(seed)
+}
+
+/// Тайминги живучести (T11): паузы переподключения к аплаенсу после
+/// неудачных health-проб; период задаётся отдельно при спавне цикла
+/// (продакшн — [`HEALTH_CHECK_PERIOD`], тесты сжимают).
+#[derive(Debug, Clone)]
+pub struct ResilienceTiming {
+    /// Паузы между попытками reconnect: берётся элемент с индексом
+    /// попытки, за пределами списка — последняя (5с/15с/60с/60с…,
+    /// бесконечно).
+    pub reconnect_backoff: Vec<Duration>,
+}
+
+impl Default for ResilienceTiming {
+    fn default() -> Self {
+        Self {
+            reconnect_backoff: vec![
+                Duration::from_secs(5),
+                Duration::from_secs(15),
+                Duration::from_secs(60),
+            ],
+        }
+    }
+}
+
+impl ResilienceTiming {
+    /// Пауза перед повторной пробой после `attempt`-й неудачи подряд
+    /// (счёт с нуля); за пределами списка — 60 с.
+    fn backoff(&self, attempt: u32) -> Duration {
+        self.reconnect_backoff
+            .get(attempt as usize)
+            .copied()
+            .unwrap_or(Duration::from_secs(60))
+    }
+}
+
+/// Состояние health-цикла одного менеджера (T11).
+#[derive(Debug)]
+struct HealthState {
+    /// Агент отвечал на последней пробе. Переход `true → false`
+    /// деградирует env-бутылки, `false → true` — восстанавливает.
+    agent_up: bool,
+    /// Число неудачных проб подряд (индекс бэкоффа reconnect).
+    attempts: u32,
+    /// Когда разрешена следующая проба после неудач (бэкофф).
+    next_attempt: Option<tokio::time::Instant>,
+}
+
+impl Default for HealthState {
+    fn default() -> Self {
+        Self {
+            agent_up: true,
+            attempts: 0,
+            next_attempt: None,
+        }
+    }
+}
+
+/// Смерть relay-задачи бутылки (T11, п.3): задача завершилась ошибкой,
+/// а не по остановке — туннель жив, бутылка помечается `Degraded`.
+pub(crate) struct RelayDeath {
+    /// Бутылка, чей релей умер.
+    pub id: String,
+    /// Причина (ошибка акцепт-цикла релея с портом).
+    pub reason: String,
+}
+
+/// Будущее одного сервера релея (см. [`RelayServe`]).
+type ServeFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
+
+/// Сервер одного релея env-бутылки `127.0.0.1:port → vm_ip:port`;
+/// продакшн — [`serve_forward`], тест смерти relay-задачи (T11, п.3)
+/// подменяет немедленно падающим сервером.
+pub(crate) type RelayServe = Arc<dyn Fn(TcpListener, TargetAddr) -> ServeFuture + Send + Sync>;
+
+/// Продакшн-сервер релея: [`serve_forward`] без обёрток.
+fn real_relay_serve() -> RelayServe {
+    Arc::new(|listener, target| Box::pin(serve_forward(listener, target)))
 }
 
 /// Зарезервированные слушатели бутылки на `127.0.0.1` (резерв = сам
@@ -146,6 +299,10 @@ pub struct Runtime {
     /// фаза 3 старта признаёт результат своим, только если поколение
     /// записи совпадает (гонка stop → restart, см. [`BottleManager::start`]).
     pub generation: u64,
+    /// Деградирована health-циклом из-за смерти агента (не локальной
+    /// смерти релея): такие бутылки пере-поднимаются после воскрешения
+    /// агента (T11).
+    pub health_degraded: bool,
     /// Зарезервированные слушатели; `None` после teardown — порты
     /// освобождены (бутылка `failed`, но видна в `status` с причиной).
     pub listeners: Option<HostListeners>,
@@ -170,8 +327,20 @@ pub struct BottleManager {
     host: Arc<HostManager>,
     /// Живые (и упавшие с ошибкой) бутылки по id.
     runtime: Mutex<HashMap<String, Runtime>>,
-    /// Счётчик поколений маркеров `starting` (см. [`Runtime::generation`]).
+    /// Счётчик поколений маркеров `starting` в пределах запуска —
+    /// младшие биты instance (см. [`Runtime::generation`]).
     generations: AtomicU64,
+    /// Seed запуска из `generation-seed` — старшие биты instance.
+    boot_seed: u64,
+    /// Тайминги живучести (бэкофф reconnect).
+    resilience: ResilienceTiming,
+    /// Состояние health-цикла.
+    health: Mutex<HealthState>,
+    /// Сервер одного релея (инъекция для теста смерти задачи).
+    relay_serve: RelayServe,
+    /// Канал смертей relay-задач env-бутылок (дренируется health-циклом).
+    relay_tx: mpsc::UnboundedSender<RelayDeath>,
+    relay_rx: Mutex<mpsc::UnboundedReceiver<RelayDeath>>,
 }
 
 impl BottleManager {
@@ -188,13 +357,40 @@ impl BottleManager {
     /// Создаёт менеджера с явно переданным host-менеджером (инъекция
     /// для тестов и dev-сборок).
     pub fn new_with_host(store: Store, connect: Arc<dyn AgentConnect>, host: HostManager) -> Self {
+        let boot_seed = advance_generation_seed(store.data_root()).unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                "не удалось обновить файл поколения: instance без персистентности между запусками"
+            );
+            unix_ms()
+        });
+        let (relay_tx, relay_rx) = mpsc::unbounded_channel();
         Self {
             store,
             connect,
             host: Arc::new(host),
             runtime: Mutex::new(HashMap::new()),
             generations: AtomicU64::new(0),
+            boot_seed,
+            resilience: ResilienceTiming::default(),
+            health: Mutex::new(HealthState::default()),
+            relay_serve: real_relay_serve(),
+            relay_tx,
+            relay_rx: Mutex::new(relay_rx),
         }
+    }
+
+    /// Переопределяет тайминги живучести (тесты сжимают бэкофф).
+    pub fn with_resilience_timing(mut self, timing: ResilienceTiming) -> Self {
+        self.resilience = timing;
+        self
+    }
+
+    /// Переопределяет сервер одного релея (тест смерти relay-задачи,
+    /// T11 п.3: немедленно падающий сервер вместо `serve_forward`).
+    pub fn with_relay_serve(mut self, serve: RelayServe) -> Self {
+        self.relay_serve = serve;
+        self
     }
 
     /// Запускает фоновый цикл DNS-перепроверки host-бутылок (T10,
@@ -220,6 +416,179 @@ impl BottleManager {
         });
     }
 
+    /// Запускает фоновый цикл живучести (T11, спека §9): каждый период —
+    /// [`BottleManager::health_pass`]. Живёт до отмены `shutdown`
+    /// (вместе с демоном); сон/резюме хоста покрывается этим же циклом
+    /// (первая проба после пробуждения замечает смерть агента).
+    pub fn spawn_health_loop(
+        self: &Arc<Self>,
+        shutdown: tokio_util::sync::CancellationToken,
+        period: Duration,
+    ) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            // Долгий проход (reconnect, восстановление бутылок) не должен
+            // собирать очередь пропущенных тиков.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::info!("health-цикл остановлен вместе с демоном");
+                        break;
+                    }
+                    _ = ticker.tick() => manager.health_pass().await,
+                }
+            }
+        });
+    }
+
+    /// Один проход цикла живучести (T11, спека §9):
+    ///
+    /// 1. Смерти relay-задач env- и host-бутылок → `Degraded{причина}`
+    ///    (туннель жив, задача — нет; остановка сюда не попадает —
+    ///    задачи гасятся abort'ом).
+    /// 2. Host-бутылки: живость их интерфейса (рулинг префлайта — не
+    ///    слепой stop по агенту); умерший интерфейс → полный host-stop
+    ///    путь + метка `stopped`.
+    /// 3. Агент: проба [`AgentConnect::alive`]; смерть → env-бутылки
+    ///    `Degraded` (локальная метка, слушатели не трогаем — WSL лежит),
+    ///    повторные пробы по бэкоффу; воскрешение → пере-подъём всех
+    ///    бутылок, деградированных по здоровью.
+    pub async fn health_pass(&self) {
+        self.collect_relay_deaths().await;
+        self.host.collect_relay_deaths().await;
+        self.host.check_iface_alive().await;
+
+        let mut health = self.health.lock().await;
+        // Бэкофф: пока аплаенс мёртв, пробы идут не чаще расписания.
+        if !health.agent_up
+            && health
+                .next_attempt
+                .is_some_and(|at| tokio::time::Instant::now() < at)
+        {
+            return;
+        }
+        if self.connect.alive().await {
+            if !health.agent_up {
+                health.agent_up = true;
+                health.attempts = 0;
+                health.next_attempt = None;
+                drop(health);
+                tracing::info!("агент аплаенса снова отвечает: восстановление env-бутылок");
+                self.restore_after_recovery().await;
+            }
+        } else {
+            let first_failure = health.agent_up;
+            health.agent_up = false;
+            let backoff = self.resilience.backoff(health.attempts);
+            health.attempts += 1;
+            health.next_attempt = Some(tokio::time::Instant::now() + backoff);
+            drop(health);
+            if first_failure {
+                tracing::warn!(
+                    ?backoff,
+                    "агент аплаенса не отвечает: env-бутылки деградированы, повторная проба по бэкоффу"
+                );
+                self.degrade_env_bottles().await;
+            }
+        }
+    }
+
+    /// Смерть агента: env-бутылки `Up`/`Degraded` получают локальную
+    /// метку `Degraded` (T11): туннель мёртв вместе с WSL, но слушатели
+    /// и задачи демона не трогаем — после воскрешения они заменяются
+    /// пере-подъёмом, а до него порты остаются занятыми за бутылкой.
+    async fn degrade_env_bottles(&self) {
+        const REASON: &str =
+            "агент аплаенса не отвечает (WSL не работает?); авто-восстановление продолжается";
+        let mut runtime = self.runtime.lock().await;
+        for (id, entry) in runtime.iter_mut() {
+            if matches!(entry.state, BottleState::Up | BottleState::Degraded { .. }) {
+                entry.state = BottleState::Degraded {
+                    reason: REASON.to_string(),
+                };
+                entry.health_degraded = true;
+                tracing::warn!(id = %id, "бутылка деградирована: агент аплаенса недоступен");
+            }
+        }
+    }
+
+    /// Воскрешение агента: пере-подъём всех env-бутылок, деградированных
+    /// health-циклом (T11). Полный путь stop → start: старые слушатели
+    /// закрываются, порты резервируются заново, конфиг перечитывается,
+    /// `Down` старого поколения гасит призрак в аплаенсе (если агент
+    /// пережил обрыв соединения), свежий `Up` несёт новое поколение.
+    /// Результат — `up` или `failed{причина}`; бутылку, остановленную
+    /// пользователем за время обрыва, не трогаем.
+    async fn restore_after_recovery(&self) {
+        let ids: Vec<String> = {
+            let runtime = self.runtime.lock().await;
+            runtime
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.health_degraded
+                        && matches!(entry.state, BottleState::Up | BottleState::Degraded { .. })
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in ids {
+            match self.stop(&id).await {
+                Ok(CliReply::Stopped { .. }) => {
+                    if let Err(error) = self.start(&id).await {
+                        // Профиль недоступен и т.п.: маркер failed с
+                        // причиной, иначе бутылка исчезнет из status молча.
+                        self.runtime.lock().await.insert(
+                            id.clone(),
+                            Runtime {
+                                state: BottleState::Failed {
+                                    reason: error.to_string(),
+                                },
+                                generation: 0,
+                                health_degraded: false,
+                                listeners: None,
+                                tasks: JoinSet::new(),
+                            },
+                        );
+                        tracing::warn!(id = %id, %error, "восстановление бутылки не удалось");
+                    }
+                }
+                _ => tracing::info!(id = %id, "восстановление пропущено: бутылка уже остановлена"),
+            }
+        }
+    }
+
+    /// Разбирает накопленные смерти relay-задач env-бутылок: живая
+    /// (`up`/`degraded`) бутылка получает `Degraded{причина}` — не
+    /// `failed`: туннель и остальные релеи живут (T11, п.3).
+    async fn collect_relay_deaths(&self) {
+        let deaths: Vec<RelayDeath> = {
+            let mut rx = self.relay_rx.lock().await;
+            let mut drained = Vec::new();
+            while let Ok(death) = rx.try_recv() {
+                drained.push(death);
+            }
+            drained
+        };
+        for death in deaths {
+            let mut runtime = self.runtime.lock().await;
+            match runtime.get_mut(&death.id) {
+                Some(entry)
+                    if matches!(entry.state, BottleState::Up | BottleState::Degraded { .. }) =>
+                {
+                    entry.state = BottleState::Degraded {
+                        reason: death.reason.clone(),
+                    };
+                    tracing::warn!(id = %death.id, reason = %death.reason, "relay-задача погибла: бутылка деградирована");
+                }
+                // Остановленную/упавшую бутылку смерть её задачи не
+                // оживляет и не перезаписывает её состояние.
+                _ => {}
+            }
+        }
+    }
+
     /// Поднимает бутылку: env — по спеке §7.1, host — делегируется
     /// [`HostManager`] (спека §7.2).
     ///
@@ -241,7 +610,15 @@ impl BottleManager {
         }
 
         // Фаза 1: пометка starting; активная бутылка — no-op (RF#3).
-        let generation = self.generations.fetch_add(1, Ordering::Relaxed);
+        // Поколение = персистентный seed запуска (старшие биты) + счётчик
+        // стартов (младшие): у любых двух запусков демона множества
+        // поколений не пересекаются (T11).
+        let counter = self.generations.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(
+            counter < (1 << INSTANCE_COUNTER_BITS),
+            "счётчик поколений вышел за младшие {INSTANCE_COUNTER_BITS} бит"
+        );
+        let generation = (self.boot_seed << INSTANCE_COUNTER_BITS) | counter;
         {
             let mut runtime = self.runtime.lock().await;
             if let Some(existing) = runtime.get(id) {
@@ -259,6 +636,7 @@ impl BottleManager {
                 Runtime {
                     state: BottleState::Starting,
                     generation,
+                    health_degraded: false,
                     listeners: None,
                     tasks: JoinSet::new(),
                 },
@@ -281,6 +659,7 @@ impl BottleManager {
                     Runtime {
                         state: BottleState::Up,
                         generation,
+                        health_degraded: false,
                         listeners: Some(made.listeners),
                         tasks: made.tasks,
                     },
@@ -329,6 +708,7 @@ impl BottleManager {
                                 reason: reason.clone(),
                             },
                             generation,
+                            health_degraded: false,
                             listeners: None,
                             tasks: JoinSet::new(),
                         },
@@ -347,8 +727,13 @@ impl BottleManager {
     /// Ошибки агента не мешают локальному teardown (агент мог упасть);
     /// не запущенная бутылка — понятная ошибка, не сбой.
     pub async fn stop(&self, id: &str) -> Result<CliReply, DaemonError> {
-        // Маршрутизация по kind профиля (профиль недоступен — путь env
-        // ответит «не запущена»).
+        // Маршрутизация. Сначала runtime-состояние: host-сессия могла
+        // остаться при удалённом/битом профиле, и её нужно разобрать
+        // (T11 carried minor из T9/T10 — не отвечать «не запущена» на
+        // живую сессию); затем kind профиля.
+        if self.host.has_active_session(id).await {
+            return self.host.stop(id).await;
+        }
         if let Ok(profile) = self.store.load(id) {
             if profile.kind == BottleKind::Host {
                 return self.host.stop(id).await;
@@ -487,7 +872,15 @@ impl BottleManager {
         // Если задачи не поднялись, бутылка уже создана в аплаенсе —
         // опустить её (`Down` за наш `Up`) и вернуть ошибку.
         let mut tasks = JoinSet::new();
-        if let Err(reason) = spawn_forwards(&mut tasks, &selection, vm_ip) {
+        let spawned = spawn_forwards(
+            &mut tasks,
+            &selection,
+            vm_ip,
+            &profile.id,
+            Arc::clone(&self.relay_serve),
+            self.relay_tx.clone(),
+        );
+        if let Err(reason) = spawned {
             tasks.abort_all();
             while tasks.join_next().await.is_some() {}
             drop(selection);
@@ -546,7 +939,10 @@ impl BottleManager {
 fn is_active(state: &BottleState) -> bool {
     matches!(
         state,
-        BottleState::Starting | BottleState::Up | BottleState::Degraded | BottleState::Stopping
+        BottleState::Starting
+            | BottleState::Up
+            | BottleState::Degraded { .. }
+            | BottleState::Stopping
     )
 }
 
@@ -714,26 +1110,52 @@ fn up_args(
 
 /// Поднимает задачи проброса для всего резерва: SOCKS5 + пробросы,
 /// каждый `127.0.0.1:port → vm_ip:port` (relay агента слушает те же
-/// порты на VM).
+/// порты на VM). Смерть задачи (не по остановке) докладывается в
+/// `reporter` — health-цикл пометит бутылку `Degraded` (T11, п.3).
 fn spawn_forwards(
     tasks: &mut JoinSet<()>,
     selection: &HostListeners,
     vm_ip: Ipv4Addr,
+    id: &str,
+    serve: RelayServe,
+    reporter: mpsc::UnboundedSender<RelayDeath>,
 ) -> Result<(), String> {
-    spawn_forward(tasks, &selection.socks5, vm_ip, selection.socks5_port()?)?;
+    spawn_forward(
+        tasks,
+        &selection.socks5,
+        vm_ip,
+        selection.socks5_port()?,
+        id,
+        Arc::clone(&serve),
+        reporter.clone(),
+    )?;
     for (spec, listener) in &selection.forwards {
-        spawn_forward(tasks, listener, vm_ip, spec.port)?;
+        spawn_forward(
+            tasks,
+            listener,
+            vm_ip,
+            spec.port,
+            id,
+            Arc::clone(&serve),
+            reporter.clone(),
+        )?;
     }
     Ok(())
 }
 
 /// Ставит слушателя на проброс `127.0.0.1:port → vm_ip:port`
-/// (relay агента слушает тот же порт на VM).
+/// (relay агента слушает тот же порт на VM). Ошибка сервера проброса
+/// (акцепт-цикл слушателя) уходит репортёру — задача умерла, но не по
+/// остановке (остановка гасит задачи abort'ом без доклада).
+#[allow(clippy::too_many_arguments)]
 fn spawn_forward(
     tasks: &mut JoinSet<()>,
     listener: &StdTcpListener,
     vm_ip: Ipv4Addr,
     port: u16,
+    id: &str,
+    serve: RelayServe,
+    reporter: mpsc::UnboundedSender<RelayDeath>,
 ) -> Result<(), String> {
     // tokio TcpListener не Clone (AsFd у него только на unix): задача
     // проброса работает на кроссплатформенном дубликате сокета —
@@ -744,9 +1166,14 @@ fn spawn_forward(
         .and_then(|dup| TcpListener::from_std(dup))
         .map_err(|e| format!("не удалось клонировать слушателя порта {port}: {e}"))?;
     let target = TargetAddr::Ip(SocketAddr::new(IpAddr::V4(vm_ip), port));
+    let id = id.to_string();
     tasks.spawn(async move {
-        if let Err(error) = serve_forward(dup, target).await {
+        if let Err(error) = serve(dup, target).await {
             tracing::warn!(port, %error, "сервер проброса остановлен");
+            let _ = reporter.send(RelayDeath {
+                id,
+                reason: format!("релей 127.0.0.1:{port} остановлен: {error}"),
+            });
         }
     });
     Ok(())
@@ -911,6 +1338,19 @@ mod tests {
                 }
             }
         }
+
+        /// «Смерть VM»: гасит ВСЕ релеи и реестр бутылок — модель
+        /// рестарта аплаенса для таймлайнов живучести (T11).
+        fn drop_everything(&self) {
+            let mut relays = self.relays.lock().unwrap();
+            for handles in relays.values_mut() {
+                for handle in handles.iter() {
+                    handle.abort();
+                }
+            }
+            relays.clear();
+            self.live.lock().unwrap().clear();
+        }
     }
 
     /// In-process фейк-агент: control-сервер на кадрах `bottle_core::frame`
@@ -937,6 +1377,10 @@ mod tests {
     struct FakeAgent {
         addr: SocketAddr,
         journal: AgentJournal,
+        /// Жив ли агент (переключатель таймлайнов живучести T11):
+        /// «мёртвый» агент не обслуживает соединения, его релеи и реестр
+        /// бутылок снесены (рестарт VM).
+        alive: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FakeAgent {
@@ -947,8 +1391,35 @@ mod tests {
                 .expect("bind control");
             let addr = listener.local_addr().expect("local_addr");
             let journal = AgentJournal::default();
-            tokio::spawn(run_agent(listener, vm_ip, behavior, journal.clone()));
-            FakeAgent { addr, journal }
+            let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            tokio::spawn(run_agent(
+                listener,
+                vm_ip,
+                behavior,
+                journal.clone(),
+                Arc::clone(&alive),
+            ));
+            FakeAgent {
+                addr,
+                journal,
+                alive,
+            }
+        }
+
+        /// Убивает агента: соединения отвергаются, релеи и реестр
+        /// бутылок сносятся (модель `wsl --shutdown`).
+        fn kill(&self) {
+            self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
+            self.journal.drop_everything();
+        }
+
+        /// Воскрешает агента: свежий реестр (REST-арт VM).
+        fn resurrect(&self) {
+            self.alive.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn is_alive(&self) -> bool {
+            self.alive.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -970,17 +1441,32 @@ mod tests {
     #[async_trait]
     impl AgentConnect for FakeAgent {
         async fn connect(&self) -> Result<ApplianceHandle, DaemonError> {
+            if !self.is_alive() {
+                return Err(DaemonError::Appliance(
+                    "фейк-агент недоступен (умер по сценарию теста)".to_string(),
+                ));
+            }
             let mut stream = TcpStream::connect(self.addr)
                 .await
                 .map_err(|e| DaemonError::Appliance(format!("фейк-агент недоступен: {e}")))?;
             stream.set_nodelay(true).expect("nodelay");
-            let vm_ip = client_handshake(&mut stream).await;
+            let vm_ip = client_handshake(&mut stream).await?;
             Ok(ApplianceHandle::wrap(vm_ip, stream))
+        }
+
+        async fn alive(&self) -> bool {
+            match self.connect().await {
+                Ok(mut handle) => handle.alive().await,
+                Err(_) => false,
+            }
         }
     }
 
     /// `Hello` → `HelloAck` на «сыром» потоке; возвращает vm_ip из ответа.
-    async fn client_handshake(stream: &mut TcpStream) -> Ipv4Addr {
+    /// Обрыв до ответа — ошибка, не паника: агент может умереть между
+    /// принятием соединения и handshake (таймлайны живучести T11) —
+    /// демону это обычный «аплаенс недоступен».
+    async fn client_handshake(stream: &mut TcpStream) -> Result<Ipv4Addr, DaemonError> {
         let hello = AgentRequest::Hello {
             version: PROTOCOL_VERSION,
             token: "test-token".to_string(),
@@ -988,32 +1474,47 @@ mod tests {
         stream
             .write_all(&encode_frame(&hello))
             .await
-            .expect("отправка Hello");
+            .map_err(|e| DaemonError::Appliance(format!("фейк-агент: отправка Hello: {e}")))?;
 
         let mut buf = BytesMut::new();
         loop {
             if let Some(reply) = decode_frame(&mut buf).expect("кадр HelloAck") {
                 let AgentReply::HelloAck { vm_ip, .. } = reply else {
-                    panic!("ожидали HelloAck, получили {reply:?}");
+                    return Err(DaemonError::Appliance(format!(
+                        "ожидали HelloAck, получили {reply:?}"
+                    )));
                 };
-                return vm_ip;
+                return Ok(vm_ip);
             }
-            let n = stream.read_buf(&mut buf).await.expect("чтение HelloAck");
-            assert!(n > 0, "фейк-агент закрыл соединение до HelloAck");
+            let n = stream
+                .read_buf(&mut buf)
+                .await
+                .map_err(|e| DaemonError::Appliance(format!("фейк-агент: чтение HelloAck: {e}")))?;
+            if n == 0 {
+                return Err(DaemonError::Appliance(
+                    "фейк-агент закрыл соединение до HelloAck (умер по сценарию)".to_string(),
+                ));
+            }
         }
     }
 
     /// Принимает соединения демона; сессии обслуживаются конкурентно.
+    /// Мёртвый агент (T11) закрывает соединения без handshake.
     async fn run_agent(
         listener: TcpListener,
         vm_ip: Ipv4Addr,
         behavior: UpBehavior,
         journal: AgentJournal,
+        alive: Arc<std::sync::atomic::AtomicBool>,
     ) {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
+            if !alive.load(std::sync::atomic::Ordering::SeqCst) {
+                drop(stream); // соединение встречено мёртвым агентом
+                continue;
+            }
             let behavior = behavior.clone();
             let journal = journal.clone();
             tokio::spawn(async move {
@@ -1215,6 +1716,79 @@ mod tests {
         )
     }
 
+    /// Менеджер над хранилищем и фейк-агентом с инъекциями живучести
+    /// (сжатый бэкофф reconnect для таймлайнов health-цикла).
+    fn manager_with_timing(
+        store_root: &std::path::Path,
+        fake: FakeAgent,
+        timing: ResilienceTiming,
+    ) -> (Arc<BottleManager>, Store) {
+        let store = Store::open(store_root).unwrap();
+        (
+            Arc::new(BottleManager::new(store, Arc::new(fake)).with_resilience_timing(timing)),
+            Store::open(store_root).unwrap(),
+        )
+    }
+
+    /// Читает seed запуска из `generation-seed` корня данных.
+    fn read_generation_seed(data_root: &std::path::Path) -> u64 {
+        let text =
+            std::fs::read_to_string(data_root.join("generation-seed")).expect("файл поколения");
+        text.trim().parse().expect("seed — десятичное u64")
+    }
+
+    /// Рантайм-состояние бутылки `id` из status (одна должна быть).
+    async fn runtime_of(manager: &BottleManager, id: &str) -> RuntimeState {
+        manager
+            .status()
+            .await
+            .into_iter()
+            .find(|b| b.id == id)
+            .unwrap_or_else(|| panic!("нет бутылки {id} в status"))
+    }
+
+    /// Крутится до состояния, удовлетворяющего `want` (реальный дедлайн
+    /// 5 с, шаг 5 мс) — для таймлайнов фонового health-цикла. Отсутствие
+    /// бутылки в status — не ошибка: между teardown и пере-подъёмом
+    /// восстановления записи нет (транзитное окно).
+    async fn wait_state(
+        manager: &BottleManager,
+        id: &str,
+        want: fn(&BottleState) -> bool,
+        what: &str,
+    ) -> RuntimeState {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(state) = manager.status().await.into_iter().find(|b| b.id == id) {
+                if want(&state.state) {
+                    return state;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "не дождались: {what}; текущее состояние: {:?}",
+                    state.state
+                );
+            } else {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "не дождались: {what}; бутылки {id} нет в status"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn is_up(state: &BottleState) -> bool {
+        matches!(state, BottleState::Up)
+    }
+
+    fn is_degraded_by_agent(state: &BottleState) -> bool {
+        matches!(
+            state,
+            BottleState::Degraded { reason } if reason.contains("агент аплаенса не отвечает")
+        )
+    }
+
     #[tokio::test]
     async fn start_answers_ready_socks5_works_and_status_is_up() {
         let (_tmp, store) = store_with(&env_profile("office-a", "ignored-by-save.conf"));
@@ -1265,7 +1839,8 @@ mod tests {
 
         // Агент получил ровно один Up с содержимым конфига, конкретными
         // портами (socks5_port=0 не отправляется — см. T11) и
-        // instance-поколением старта (первый start — поколение 0).
+        // instance-поколением старта: старшие биты — seed запуска из
+        // generation-seed, младшие — счётчик (первый start — 0).
         let ups = fake.journal.ups();
         assert_eq!(ups.len(), 1);
         assert_eq!(ups[0].id, "office-a");
@@ -1274,7 +1849,12 @@ mod tests {
         assert_eq!(ups[0].dns, Some("10.20.30.1".parse().unwrap()));
         assert_ne!(ups[0].socks5_port, 0, "нулевые порты не отправляются");
         assert_ne!(ups[0].forwards[0].port, 0, "нулевые порты не отправляются");
-        assert_eq!(ups[0].instance, 0, "Up несёт instance-поколение");
+        let seed = read_generation_seed(store.data_root());
+        assert_eq!(
+            ups[0].instance,
+            seed << 20,
+            "Up несёт персистентное instance-поколение"
+        );
     }
 
     #[tokio::test]
@@ -1498,9 +2078,10 @@ mod tests {
 
         // Агенту ушёл Down с поколением поднятой бутылки; слушатели
         // закрыты; из status бутылка исчезла.
+        let instance = fake.journal.ups()[0].instance;
         assert_eq!(
             fake.journal.downs(),
-            vec![("office-a".to_string(), 0)],
+            vec![("office-a".to_string(), instance)],
             "Down несёт instance-поколение"
         );
         assert!(
@@ -1549,7 +2130,10 @@ mod tests {
         );
         assert_eq!(
             fake.journal.downs(),
-            vec![("office-a".to_string(), 999), ("office-a".to_string(), 0)],
+            vec![
+                ("office-a".to_string(), 999),
+                ("office-a".to_string(), fake.journal.ups()[0].instance),
+            ],
             "чужой Down затем свой Down"
         );
     }
@@ -1617,9 +2201,10 @@ mod tests {
 
         // Down отправлял только stop: teardown проигравшего НЕ гасит
         // бутылку победителя (под тем же id в аплаенсе уже новая).
+        let loser_instance = fake.journal.ups()[0].instance;
         assert_eq!(
             fake.journal.downs(),
-            vec![("office-a".to_string(), 0)],
+            vec![("office-a".to_string(), loser_instance)],
             "Down только от stop, с поколением проигравшего старта"
         );
     }
@@ -1660,7 +2245,10 @@ mod tests {
         assert_eq!(ups.len(), 1);
         assert_eq!(
             fake.journal.downs(),
-            vec![("office-a".to_string(), 0), ("office-a".to_string(), 0)],
+            vec![
+                ("office-a".to_string(), ups[0].instance),
+                ("office-a".to_string(), ups[0].instance),
+            ],
             "Down от stop и Down от teardown"
         );
 
@@ -1795,5 +2383,263 @@ mod tests {
             crate::pipe::dispatch(&store, Some(&manager), bottle_core::ipc::CliRequest::Status)
                 .await;
         assert_eq!(reply, CliReply::Status { bottles: vec![] });
+    }
+
+    // ------------------------------------------------------------------
+    // Живучесть T11 (спека §9): персистентные поколения, health-цикл,
+    // смерти relay-задач.
+    // ------------------------------------------------------------------
+
+    /// Seed очередного запуска: без файла — текущее время; при коллизии
+    /// содержимого (тот же ms, часы ушли назад) — увеличение.
+    #[test]
+    fn next_seed_advances_on_collision() {
+        const NOW: u64 = 1_700_000_000_123;
+        assert_eq!(next_seed(None, NOW), NOW, "первое создание — now");
+        assert_eq!(
+            next_seed(Some(NOW), NOW),
+            NOW + 1,
+            "коллизия содержимого — увеличить"
+        );
+        assert_eq!(
+            next_seed(Some(NOW + 7), NOW),
+            NOW + 8,
+            "часы ушли назад — увеличить за файлом"
+        );
+        assert_eq!(
+            next_seed(Some(NOW - 5), NOW),
+            NOW,
+            "время ушло вперёд — просто now"
+        );
+    }
+
+    /// (д) generation-seed: файл создаётся при первом менеджере, повторный
+    /// «запуск демона» над тем же каталогом читает/продвигает его;
+    /// instance-диапазоны двух запусков не пересекаются (разные seed).
+    #[tokio::test]
+    async fn generation_seed_persists_and_boot_instances_are_disjoint() {
+        let (tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+
+        // Первый запуск: файл создан, instance = seed << 20 | 0.
+        let fake1 = FakeAgent::spawn(UpBehavior::Ready).await;
+        let (boot1, _s1) = manager_with(store.data_root(), fake1.clone());
+        boot1.start("office-a").await.expect("start boot1");
+        let seed1 = read_generation_seed(store.data_root());
+        let instance1 = fake1.journal.ups()[0].instance;
+        assert_eq!(instance1, seed1 << 20, "младшие 20 бит — счётчик с нуля");
+        drop(boot1);
+
+        // Второй запуск над тем же каталогом: seed прочитан и продвинут
+        // (даже если оба менеджера созданы в одну миллисекунду).
+        let fake2 = FakeAgent::spawn(UpBehavior::Ready).await;
+        let (boot2, _s2) = manager_with(store.data_root(), fake2.clone());
+        let seed2 = read_generation_seed(store.data_root());
+        assert!(
+            seed2 > seed1,
+            "seed второго запуска больше: {seed2} vs {seed1}"
+        );
+        boot2.start("office-a").await.expect("start boot2");
+        let instance2 = fake2.journal.ups()[0].instance;
+        assert_eq!(instance2, seed2 << 20);
+        assert_ne!(
+            instance1 >> 20,
+            instance2 >> 20,
+            "instance-диапазоны запусков не пересекаются"
+        );
+        assert!(instance2 > instance1);
+
+        // Файл на месте и содержит десятичное u64 (формат переживает
+        // перезапуск демона).
+        let _ = tmp; // держим каталог живым
+        let text = std::fs::read_to_string(store.data_root().join("generation-seed")).unwrap();
+        assert_eq!(text.trim().parse::<u64>().unwrap(), seed2);
+    }
+
+    /// instance монотонно растёт в пределах запуска (каждый start — новый
+    /// номер, общий префикс seed).
+    #[tokio::test]
+    async fn instances_rise_monotonically_within_boot() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let (manager, _s) = manager_with(store.data_root(), fake.clone());
+
+        manager.start("office-a").await.expect("start 1");
+        manager.stop("office-a").await.expect("stop 1");
+        manager.start("office-a").await.expect("start 2");
+        manager.stop("office-a").await.expect("stop 2");
+        manager.start("office-a").await.expect("start 3");
+
+        let instances: Vec<u64> = fake.journal.ups().iter().map(|up| up.instance).collect();
+        assert_eq!(instances.len(), 3);
+        assert!(instances[0] < instances[1] && instances[1] < instances[2]);
+        let seed = read_generation_seed(store.data_root());
+        for instance in instances {
+            assert_eq!(instance >> 20, seed, "префикс запуска общий");
+        }
+    }
+
+    /// Пины продакшн-таймингов живучести: период 10 с, бэкофф 5/15/60/60…
+    #[test]
+    fn health_period_and_backoff_pins() {
+        assert_eq!(HEALTH_CHECK_PERIOD, Duration::from_secs(10));
+        let timing = ResilienceTiming::default();
+        assert_eq!(timing.backoff(0), Duration::from_secs(5));
+        assert_eq!(timing.backoff(1), Duration::from_secs(15));
+        assert_eq!(timing.backoff(2), Duration::from_secs(60));
+        assert_eq!(
+            timing.backoff(700),
+            Duration::from_secs(60),
+            "дальше — 60 с"
+        );
+    }
+
+    /// (а-env, б) Таймлайн живучести: агент умер → env-бутылка `Degraded`
+    /// (метка агента, порты за бутылкой); агент воскрес → бутылка снова
+    /// `up`: повторный Up с ДРУГИМ instance-поколением, Down старого
+    /// поколения гасил призрака, свежий socks5-порт слушает и negotiate
+    /// проходит, старые слушатели закрыты.
+    #[tokio::test]
+    async fn agent_death_degrades_env_bottle_and_recovery_restores_it() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let no_backoff = ResilienceTiming {
+            reconnect_backoff: vec![Duration::from_millis(0)],
+        };
+        let (manager, _s) = manager_with_timing(store.data_root(), fake.clone(), no_backoff);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        manager.spawn_health_loop(shutdown.clone(), Duration::from_millis(25));
+
+        manager.start("office-a").await.expect("start");
+        let first = wait_state(&manager, "office-a", is_up, "первичный подъём").await;
+        let socks5_first = first.socks5.expect("порт назначен");
+        let instance_first = fake.journal.ups()[0].instance;
+
+        // Агент умер (wsl --shutdown): ≤ пары периодов — Degraded.
+        fake.kill();
+        let degraded = wait_state(
+            &manager,
+            "office-a",
+            is_degraded_by_agent,
+            "деградация после смерти агента",
+        )
+        .await;
+        assert!(degraded.socks5.is_some(), "порты остаются за бутылкой");
+
+        // Агент воскрес (рестарт VM с чистым реестром): бутылка снова up.
+        fake.resurrect();
+        let restored = wait_state(&manager, "office-a", is_up, "восстановление").await;
+
+        // Повторный Up — новое instance-поколение того же запуска
+        // (старшие биты — seed, младшие — следующий счётчик).
+        let ups = fake.journal.ups();
+        assert_eq!(ups.len(), 2, "ровно один повторный Up: {:?}", ups);
+        assert_ne!(
+            ups[1].instance, instance_first,
+            "поколение восстановления новое"
+        );
+        assert_eq!(
+            ups[1].instance >> 20,
+            instance_first >> 20,
+            "тот же запуск демона — тот же seed"
+        );
+        // Призрак убран: перед повторным Up уходил Down старого поколения.
+        assert!(
+            fake.journal
+                .downs()
+                .contains(&("office-a".to_string(), instance_first)),
+            "Down старого поколения: {:?}",
+            fake.journal.downs()
+        );
+
+        // Новый socks5-порт слушает и обслуживает negotiate (новые порты
+        // допустимы — ассерт «какой-то порт слушает и negotiate проходит»).
+        let socks5_restored = restored.socks5.expect("порт восстановления");
+        let mut sock = TcpStream::connect(("127.0.0.1", socks5_restored))
+            .await
+            .expect("подключение к восстановленному socks5");
+        sock.write_all(b"\x05\x01\x00").await.expect("greeting");
+        let mut method = [0u8; 2];
+        sock.read_exact(&mut method).await.expect("выбор метода");
+        assert_eq!(&method, b"\x05\x00", "воскресший релей ответил no-auth");
+
+        // Старые слушатели закрыты (если порт не переиспользован).
+        if socks5_restored != socks5_first {
+            assert!(
+                TcpStream::connect(("127.0.0.1", socks5_first))
+                    .await
+                    .is_err(),
+                "старый порт закрыт после восстановления"
+            );
+        }
+
+        // Цикл стабилен: агент жив, лишних Up нет.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fake.journal.ups().len(),
+            2,
+            "повторных Up при живом агенте нет"
+        );
+        shutdown.cancel();
+    }
+
+    /// Деградация не трогает host-часть и не требует бэкоффа при живом
+    /// агенте: бутылка остаётся up, Up не дублируются.
+    #[tokio::test]
+    async fn health_pass_with_alive_agent_keeps_bottle_up() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let (manager, _s) = manager_with(store.data_root(), fake.clone());
+
+        manager.start("office-a").await.expect("start");
+        for _ in 0..3 {
+            manager.health_pass().await;
+        }
+        assert!(matches!(
+            runtime_of(&manager, "office-a").await.state,
+            BottleState::Up
+        ));
+        assert_eq!(fake.journal.ups().len(), 1, "лишних Up нет");
+    }
+
+    /// (в-env) Смерть relay-задачи (не по остановке): бутылка получает
+    /// `Degraded{причина}` — не `failed`, слушатели живут.
+    #[tokio::test]
+    async fn relay_task_death_degrades_bottle_with_reason() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let store_root = store.data_root().to_path_buf();
+        let manager = Arc::new(
+            BottleManager::new(Store::open(&store_root).unwrap(), Arc::new(fake.clone()))
+                .with_relay_serve(Arc::new(|_listener, _target| {
+                    // Фейк-релей: акцепт-цикл падает сразу (модель смерти
+                    // слушателя); исходный слушатель жив в рантайме.
+                    Box::pin(async {
+                        Err(std::io::Error::other("фейк: акцепт-цикл релея умер"))
+                    })
+                })),
+        );
+
+        manager.start("office-a").await.expect("start");
+
+        // Задача умерла сразу после старта; health-цикл (сжатый период)
+        // подбирает доклад и помечает бутылку деградированной.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        manager.spawn_health_loop(shutdown.clone(), Duration::from_millis(25));
+        let degraded = wait_state(
+            &manager,
+            "office-a",
+            |state| matches!(state, BottleState::Degraded { .. }),
+            "деградация после смерти релея",
+        )
+        .await;
+        shutdown.cancel();
+        assert!(
+            matches!(&degraded.state, BottleState::Degraded { reason } if reason.contains("релей")),
+            "причина от релея: {:?}",
+            degraded.state
+        );
+        assert!(degraded.socks5.is_some(), "порт остаётся за бутылкой");
+        // Агент ни при чём: бутылка в аплаенсе жива, Down не уходил.
+        assert!(fake.journal.downs().is_empty());
     }
 }

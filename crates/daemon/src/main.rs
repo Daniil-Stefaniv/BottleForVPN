@@ -108,6 +108,9 @@ pub async fn serve_daemon(
         // Фоновый цикл DNS-перепроверки host-бутылок (спека §7.2, шаг 5)
         // живёт до остановки демона.
         manager.spawn_host_dns_recheck(shutdown.clone());
+        // Фоновый цикл живучести (T11, спека §9): поллинг агента,
+        // авто-восстановление env-бутылок, живость host-интерфейсов.
+        manager.spawn_health_loop(shutdown.clone(), manager::HEALTH_CHECK_PERIOD);
         let daemon = Arc::new(Daemon {
             store,
             manager: Some(manager),

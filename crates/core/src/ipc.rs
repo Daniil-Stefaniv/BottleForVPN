@@ -76,8 +76,10 @@ pub enum BottleState {
     Starting,
     /// Поднята и работает.
     Up,
-    /// Работает с деградацией (например, часть пробросов недоступна).
-    Degraded,
+    /// Работает с деградацией: умерла relay-задача или агент аплаенса
+    /// не отвечает — туннель/часть пробросов недоступна, локальные
+    /// слушатели и сессия живут (T11, спека §9).
+    Degraded { reason: String },
     /// Поднятие или работа завершились ошибкой.
     Failed { reason: String },
     /// Останавливается.
@@ -92,7 +94,7 @@ impl BottleState {
         match self {
             BottleState::Starting => "starting",
             BottleState::Up => "up",
-            BottleState::Degraded => "degraded",
+            BottleState::Degraded { .. } => "degraded",
             BottleState::Failed { .. } => "failed",
             BottleState::Stopping => "stopping",
             BottleState::Stopped => "stopped",
@@ -262,6 +264,12 @@ mod tests {
                             reason: "туннель не поднялся".to_string(),
                         },
                     ),
+                    sample_runtime(
+                        "office-b",
+                        BottleState::Degraded {
+                            reason: "агент аплаенса не отвечает".to_string(),
+                        },
+                    ),
                     RuntimeState {
                         id: "empty".to_string(),
                         state: BottleState::Stopped,
@@ -284,7 +292,13 @@ mod tests {
     fn bottle_state_as_str_matches_wire_contract() {
         assert_eq!(BottleState::Starting.as_str(), "starting");
         assert_eq!(BottleState::Up.as_str(), "up");
-        assert_eq!(BottleState::Degraded.as_str(), "degraded");
+        assert_eq!(
+            BottleState::Degraded {
+                reason: "агент не отвечает".to_string()
+            }
+            .as_str(),
+            "degraded"
+        );
         assert_eq!(
             BottleState::Failed {
                 reason: "туннель не поднялся".to_string()
@@ -303,6 +317,21 @@ mod tests {
         };
         let json = serde_json::to_string(&state).expect("serialize BottleState");
         assert_eq!(json, r#"{"Failed":{"reason":"туннель не поднялся"}}"#);
+        assert_eq!(round_trip(state.clone()), state);
+    }
+
+    /// `Degraded` несёт причину на проводе (T11): машина состояний
+    /// показывает, чем именно деградирована бутылка.
+    #[test]
+    fn degraded_state_round_trips_with_reason() {
+        let state = BottleState::Degraded {
+            reason: "агент аплаенса не отвечает".to_string(),
+        };
+        let json = serde_json::to_string(&state).expect("serialize BottleState");
+        assert_eq!(
+            json,
+            r#"{"Degraded":{"reason":"агент аплаенса не отвечает"}}"#
+        );
         assert_eq!(round_trip(state.clone()), state);
     }
 

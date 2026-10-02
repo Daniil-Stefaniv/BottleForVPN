@@ -118,10 +118,12 @@ fn runtime_lines(runtime: &RuntimeState) -> Vec<String> {
     lines
 }
 
-/// Состояние каноническим именем; `failed` дополнительно печатает причину.
+/// Состояние каноническим именем; `failed` и `degraded` дополнительно
+/// печатают причину.
 fn state_str(state: &BottleState) -> String {
     match state {
         BottleState::Failed { reason } => format!("failed ({reason})"),
+        BottleState::Degraded { reason } => format!("degraded ({reason})"),
         other => other.as_str().to_string(),
     }
 }
@@ -258,6 +260,19 @@ mod tests {
         })]);
         assert!(out.contains("failed"), "нет состояния:\n{out}");
         assert!(out.contains("туннель не поднялся"), "нет причины:\n{out}");
+    }
+
+    /// T11: деградация видна с причиной (агент недоступен / умер релей).
+    #[test]
+    fn status_degraded_prints_reason() {
+        let out = render_status(&[runtime(BottleState::Degraded {
+            reason: "агент аплаенса не отвечает".to_string(),
+        })]);
+        assert!(out.contains("degraded"), "нет состояния:\n{out}");
+        assert!(
+            out.contains("агент аплаенса не отвечает"),
+            "нет причины:\n{out}"
+        );
     }
 
     // Бриф Task 17 Step 1: state None отображается как «-».

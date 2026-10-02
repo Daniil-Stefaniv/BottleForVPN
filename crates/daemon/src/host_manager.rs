@@ -42,12 +42,12 @@ use bottle_core::profile::{BottleProfile, VpnConfig};
 use relay_lib::forward::{serve_forward_with_dial, Dial, DialFuture, TargetAddr};
 use relay_lib::socks5::serve_socks5_with_dial;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 
 use crate::error::DaemonError;
 use crate::host_net::{resolve_endpoints_async, GwFamily};
-use crate::manager::{reserve_ports, HostListeners};
+use crate::manager::{reserve_ports, HostListeners, RelayDeath};
 use crate::svc_client::{svc_pipe_exists, SvcClient, SVC_MISSING_MESSAGE};
 
 /// Сколько ждать появления VPN-интерфейса после запуска клиента
@@ -443,12 +443,12 @@ pub struct HostRoutes {
     /// Живое множество адресов сессии: начальный резолв + накопление
     /// DNS-циклом; убирается только stop (спека §7.2 шаг 5).
     pub addrs: Vec<IpAddr>,
-    /// Выбранный адаптер VPN (после обнаружения интерфейса). Читается
-    /// циклом живучести T11 (поллинг интерфейса по имени); до него —
-    /// только фиксируется при старте.
-    #[allow(dead_code)]
+    /// Выбранный адаптер VPN (после обнаружения интерфейса);
+    /// информационное поле сессии (живость цикл T11 проверяет по
+    /// индексу ниже).
     pub iface_alias: Option<String>,
-    /// Индекс адаптера VPN (привязка релеев, исключения шлюза).
+    /// Индекс адаптера VPN: привязка релеев, исключения шлюза и
+    /// живость интерфейса в health-цикле (T11, поллинг по idx).
     pub iface_idx: Option<u32>,
     /// Резерв портов релеев; `None` после teardown.
     pub listeners: Option<HostListeners>,
@@ -528,11 +528,17 @@ pub struct HostManager {
     endpoints_state: Mutex<HashMap<String, HostRoutes>>,
     /// Счётчик поколений маркеров `starting`.
     generations: AtomicU64,
+    /// Канал смертей relay-задач host-сессий (T11, п.3): задачи релеев
+    /// докладывают ошибки акцепт-цикла; health-цикл демона дренирует
+    /// канал и помечает сессию `Degraded{причина}`.
+    relay_tx: mpsc::UnboundedSender<RelayDeath>,
+    relay_rx: Mutex<mpsc::UnboundedReceiver<RelayDeath>>,
 }
 
 impl HostManager {
     /// Создаёт менеджера из частей и таймингов.
     pub fn new(parts: HostParts, timing: HostTiming) -> Self {
+        let (relay_tx, relay_rx) = mpsc::unbounded_channel();
         Self {
             parts,
             timing,
@@ -542,6 +548,8 @@ impl HostManager {
             restore_waits: std::sync::atomic::AtomicUsize::new(0),
             endpoints_state: Mutex::new(HashMap::new()),
             generations: AtomicU64::new(0),
+            relay_tx,
+            relay_rx: Mutex::new(relay_rx),
         }
     }
 
@@ -691,6 +699,135 @@ impl HostManager {
             id: id.to_string(),
             warning: Some(HOST_STOP_CLIENT_WARNING.to_string()),
         })
+    }
+
+    /// Есть ли активная (`starting`/`up`/`degraded`/`stopping`) сессия
+    /// `id`. Маршрутизация `stop` менеджера проверяет её ДО загрузки
+    /// профиля: сессия могла остаться при удалённом/битом профиле и всё
+    /// равно подлежит разбору (T11 carried minor из T9/T10).
+    pub async fn has_active_session(&self, id: &str) -> bool {
+        self.endpoints_state
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|r| host_is_active(&r.state))
+    }
+
+    /// Один проход живости host-интерфейсов (T11, health-цикл демона,
+    /// рулинг префлайта: проверка живости СВОЕГО интерфейса, а не слепой
+    /// stop по агенту). Сессии `up`/`degraded` сверяют адаптер из
+    /// снапшота `Get-NetAdapter` по индексу: живой (`Up`) — не трогаем;
+    /// исчез — полный host-stop путь (релеи вниз, svc.del всех адресов
+    /// сессии) и метка `stopped`: VPN-клиент мёртв вместе с интерфейсом,
+    /// нужен человек для его перезапуска (спека §9).
+    ///
+    /// Недоступный снапшот адаптеров — `warn`, сессии не трогаем:
+    /// разовый сбой PowerShell не должен останавливать живые бутылки.
+    pub async fn check_iface_alive(&self) {
+        let watched: Vec<(String, u32)> = {
+            let state = self.endpoints_state.lock().await;
+            state
+                .iter()
+                .filter(|(_, r)| {
+                    matches!(r.state, BottleState::Up | BottleState::Degraded { .. })
+                        && r.iface_idx.is_some()
+                })
+                .filter_map(|(id, r)| r.iface_idx.map(|idx| (id.clone(), idx)))
+                .collect()
+        };
+        if watched.is_empty() {
+            return;
+        }
+        let adapters = match self.parts.adapters.list_adapters().await {
+            Ok(list) => list,
+            Err(error) => {
+                tracing::warn!(%error, "снапшот адаптеров не получен: живость host-интерфейсов не проверена");
+                return;
+            }
+        };
+        for (id, idx) in watched {
+            if adapters.iter().any(|a| a.idx == idx && a.up) {
+                continue;
+            }
+            // Умер: полный host-stop путь (запись вынимается — Routes
+            // больше не владеет endpoint'ами), затем метка stopped.
+            let removed = {
+                let mut state = self.endpoints_state.lock().await;
+                if state.get(&id).is_some_and(|r| host_is_active(&r.state)) {
+                    state.remove(&id)
+                } else {
+                    None
+                }
+            };
+            let Some(mut session) = removed else {
+                continue; // сессию остановили, пока снимок добирался
+            };
+            session.tasks.abort_all();
+            while session.tasks.join_next().await.is_some() {}
+            session.listeners = None;
+            self.del_session_routes(&session.addrs).await;
+            let endpoints = std::mem::take(&mut session.endpoints);
+            let iface_alias = session.iface_alias.take();
+            let iface_idx = session.iface_idx.take();
+            self.endpoints_state.lock().await.insert(
+                id.clone(),
+                HostRoutes {
+                    state: BottleState::Stopped,
+                    generation: session.generation,
+                    endpoints,
+                    addrs: Vec::new(),
+                    iface_alias,
+                    iface_idx,
+                    listeners: None,
+                    tasks: JoinSet::new(),
+                },
+            );
+            tracing::warn!(
+                id = %id,
+                iface_index = idx,
+                "VPN-интерфейс host-бутылки исчез: сессия остановлена (нужен человек для клиента)"
+            );
+        }
+    }
+
+    /// Разбирает накопленные смерти relay-задач host-сессий: живая
+    /// (`up`/`degraded`) сессия получает `Degraded{причина}` — не
+    /// `failed`: туннель/маршруты живут, умер локальный релей (T11, п.3).
+    pub async fn collect_relay_deaths(&self) {
+        let deaths: Vec<RelayDeath> = {
+            let mut rx = self.relay_rx.lock().await;
+            let mut drained = Vec::new();
+            while let Ok(death) = rx.try_recv() {
+                drained.push(death);
+            }
+            drained
+        };
+        for death in deaths {
+            let mut state = self.endpoints_state.lock().await;
+            match state.get_mut(&death.id) {
+                Some(routes)
+                    if matches!(routes.state, BottleState::Up | BottleState::Degraded { .. }) =>
+                {
+                    routes.state = BottleState::Degraded {
+                        reason: death.reason.clone(),
+                    };
+                    tracing::warn!(id = %death.id, reason = %death.reason, "relay-задача host-сессии погибла: деградация");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Доклад о смерти relay-задачи сессии — тот же вызов, что делает
+    /// задача релея при ошибке акцепт-цикла ([`Self::relay_tx`]).
+    /// Только тесты: гибель настоящего релея воспроизвести кросс-
+    /// платформенно нельзя (акцепт-цикл падает лишь на сбое слушателя).
+    #[cfg(test)]
+    pub(crate) fn report_relay_death_for_test(&self, id: &str, reason: &str) {
+        let _ = self.relay_tx.send(RelayDeath {
+            id: id.to_string(),
+            reason: reason.to_string(),
+        });
     }
 
     /// Один проход фоновой DNS-перепроверки (T10, спека §7.2 шаг 5):
@@ -978,6 +1115,8 @@ impl HostManager {
             &selection,
             Arc::clone(&self.parts.binder),
             iface.idx,
+            &profile.id,
+            self.relay_tx.clone(),
         ) {
             tasks.abort_all();
             while tasks.join_next().await.is_some() {}
@@ -1208,7 +1347,6 @@ impl HostManager {
     /// пропускает своё (дубликаты `New-NetRoute` не нужны).
     async fn restore_live_routes(&self) {
         // Держатель гварда восстанавливает; ожидавшие — нет.
-        // Держатель гварда восстанавливает; ожидавшие — нет.
         let Ok(_guard) = self.restore_lock.try_lock() else {
             // Ждём завершения чужого восстановления; гвард отпускаем
             // сразу — своё пропускаем (дублей New-NetRoute не нужно).
@@ -1281,7 +1419,10 @@ impl HostManager {
 fn host_is_active(state: &BottleState) -> bool {
     matches!(
         state,
-        BottleState::Starting | BottleState::Up | BottleState::Degraded | BottleState::Stopping
+        BottleState::Starting
+            | BottleState::Up
+            | BottleState::Degraded { .. }
+            | BottleState::Stopping
     )
 }
 
@@ -1313,14 +1454,19 @@ fn spawn_launch_split(command: &str) {
 }
 
 /// Поднимает задачи релеев host-бутылки: SOCKS5 + пробросы, исходящие
-/// соединения — через [`dial_bound`] с привязкой к адаптеру VPN.
+/// соединения — через [`dial_bound`] с привязкой к адаптеру VPN. Ошибки
+/// акцепт-цикла (смерть задачи, не по остановке) докладываются в
+/// `reporter` — health-цикл пометит сессию `Degraded` (T11, п.3).
 fn spawn_host_relays(
     tasks: &mut JoinSet<()>,
     selection: &HostListeners,
     binder: Arc<dyn IfaceBinder>,
     ifindex: u32,
+    id: &str,
+    reporter: mpsc::UnboundedSender<RelayDeath>,
 ) -> Result<(), String> {
     let dial = bound_dial(Arc::clone(&binder), ifindex);
+    let id = id.to_string();
 
     let socks5_port = selection
         .socks5_port()
@@ -1331,9 +1477,15 @@ fn spawn_host_relays(
         .and_then(|dup| tokio::net::TcpListener::from_std(dup))
         .map_err(|e| format!("не удалось клонировать слушателя SOCKS5: {e}"))?;
     let socks5_dial = Arc::clone(&dial);
+    let socks5_id = id.clone();
+    let socks5_reporter = reporter.clone();
     tasks.spawn(async move {
         if let Err(error) = serve_socks5_with_dial(socks5_dup, socks5_dial).await {
             tracing::warn!(port = socks5_port, %error, "сервер SOCKS5 остановлен");
+            let _ = socks5_reporter.send(RelayDeath {
+                id: socks5_id,
+                reason: format!("релей SOCKS5 127.0.0.1:{socks5_port} остановлен: {error}"),
+            });
         }
     });
 
@@ -1348,9 +1500,15 @@ fn spawn_host_relays(
             .map_err(|e| format!("не удалось клонировать слушателя порта {}: {e}", spec.port))?;
         let port = spec.port;
         let forward_dial = Arc::clone(&dial);
+        let forward_id = id.clone();
+        let forward_reporter = reporter.clone();
         tasks.spawn(async move {
             if let Err(error) = serve_forward_with_dial(dup, target, forward_dial).await {
                 tracing::warn!(port, %error, "сервер проброса остановлен");
+                let _ = forward_reporter.send(RelayDeath {
+                    id: forward_id,
+                    reason: format!("релей 127.0.0.1:{port} остановлен: {error}"),
+                });
             }
         });
     }
@@ -1717,6 +1875,8 @@ mod tests {
     struct TestSetup {
         resolver: Arc<FakeResolver>,
         svc_factory: Arc<FakeSvcFactory>,
+        /// Снапшоты адаптеров (тест убивает «интерфейсы» через retain).
+        adapters: Arc<FakeAdapters>,
         host: HostManager,
         ops: Ops,
     }
@@ -1778,6 +1938,7 @@ mod tests {
         TestSetup {
             resolver,
             svc_factory,
+            adapters,
             host: HostManager::new(parts, timing),
             ops,
         }
@@ -2540,5 +2701,185 @@ mod tests {
                 "агент недоступен (фейк host-теста)".to_string(),
             ))
         }
+
+        async fn alive(&self) -> bool {
+            false
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Живучесть T11 (спека §9 + рулинг префлайта): живость интерфейса,
+    // смерти relay-задач, stop при удалённом профиле.
+    // ------------------------------------------------------------------
+
+    /// (а-host) Health-проход: host-бутылка с ЖИВЫМ интерфейсом не
+    /// тронута (рулинг — проверка живости, не слепой stop), с умершим —
+    /// полный host-stop путь: метка `stopped`, маршруты её endpoint'ов
+    /// сняты, чужие живут. Проверка идёт через менеджера (wiring
+    /// health_pass) и при МЁРТВОМ агенте — host-бутылки от него не
+    /// зависят.
+    #[tokio::test]
+    async fn health_pass_stops_host_bottle_on_dead_iface_and_spares_alive() {
+        let setup = test_host_spawns(
+            true,
+            vec![
+                vec![adapter("CorpVPN", 42, true)],
+                vec![adapter("PartnerVPN", 44, true)],
+            ],
+        );
+        let TestSetup {
+            resolver,
+            host,
+            adapters,
+            ops,
+            ..
+        } = setup;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("store")).unwrap();
+        store
+            .save(&host_profile("corp", "vpn.example.com"))
+            .unwrap();
+        store
+            .save(&host_profile("partner", "partner.example.com"))
+            .unwrap();
+        let manager = BottleManager::new_with_host(
+            Store::open(store.data_root()).unwrap(),
+            Arc::new(FailingAgentConnect),
+            host,
+        );
+
+        manager.start("corp").await.expect("первая бутылка");
+        // Вторая бутылка резолвится в другой адрес (B).
+        resolver.set(vec![ip("198.51.100.20")]);
+        manager.start("partner").await.expect("вторая бутылка");
+        let corp_socks5 = manager
+            .status()
+            .await
+            .into_iter()
+            .find(|b| b.id == "corp")
+            .unwrap()
+            .socks5
+            .expect("порт corp");
+
+        // Интерфейс второй бутылки исчез (адаптер 44 removed).
+        adapters.0.lock().unwrap().retain(|a| a.idx != 44);
+
+        // Health-проход (агент мёртв — host-путь всё равно исполняется).
+        manager.health_pass().await;
+
+        let bottles = manager.status().await;
+        let corp_state = bottles
+            .iter()
+            .find(|b| b.id == "corp")
+            .unwrap_or_else(|| panic!("corp жива: {bottles:?}"));
+        assert!(matches!(corp_state.state, BottleState::Up), "{bottles:?}");
+        let partner_state = bottles
+            .iter()
+            .find(|b| b.id == "partner")
+            .unwrap_or_else(|| panic!("partner видна с меткой: {bottles:?}"));
+        assert!(
+            matches!(partner_state.state, BottleState::Stopped),
+            "умерший интерфейс → stopped: {:?}",
+            partner_state.state
+        );
+        assert_eq!(partner_state.socks5, None, "релеи погашены");
+
+        // Маршрут умершей сессии снят, живой — на месте.
+        let ops_now = ops.snapshot();
+        assert!(
+            ops_now.iter().any(|e| e == "svc:Del(198.51.100.20)"),
+            "svc.del адреса умершей сессии: {ops_now:?}"
+        );
+        assert!(
+            !ops_now.iter().any(|e| e == "svc:Del(203.0.113.10)"),
+            "маршрут живой сессии не снят: {ops_now:?}"
+        );
+
+        // Живая бутылка работает: SOCKS5 negotiate проходит.
+        let mut sock = socks_negotiate(corp_socks5).await;
+        sock.shutdown().await.ok();
+
+        // Повторный проход ничего не меняет (stopped не активна).
+        manager.health_pass().await;
+        let bottles = manager.status().await;
+        assert_eq!(bottles.len(), 2, "метки стабильны: {bottles:?}");
+        assert!(matches!(
+            bottles.iter().find(|b| b.id == "corp").unwrap().state,
+            BottleState::Up
+        ));
+    }
+
+    /// (г) carried minor T9/T10: stop при удалённом/битом профиле всё
+    /// равно разбирает host-сессию (маршруты сняты) — routing по
+    /// runtime-состоянию, не по kind из профиля.
+    #[tokio::test]
+    async fn stop_with_deleted_profile_still_tears_down_host_session() {
+        let setup = test_host(true, vec![adapter("CorpVPN", 42, true)]);
+        let TestSetup { host, ops, .. } = setup;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("store")).unwrap();
+        store
+            .save(&host_profile("corp", "vpn.example.com"))
+            .unwrap();
+        let manager = BottleManager::new_with_host(
+            Store::open(store.data_root()).unwrap(),
+            Arc::new(FailingAgentConnect),
+            host,
+        );
+        manager.start("corp").await.expect("start");
+
+        // Профиль удалён (load → NotFound): раньше stop уходил в env-ветку
+        // «не запущена»; теперь сессия разбирается по runtime-состоянию.
+        std::fs::remove_file(store.data_root().join("bottles/corp.toml")).unwrap();
+
+        let reply = manager.stop("corp").await.expect("stop без сбоя");
+        assert_eq!(
+            reply,
+            CliReply::Stopped {
+                id: "corp".into(),
+                warning: Some(HOST_STOP_CLIENT_WARNING.to_string()),
+            }
+        );
+        assert!(
+            ops.snapshot().iter().any(|e| e == "svc:Del(203.0.113.10)"),
+            "маршруты сессии сняты несмотря на удалённый профиль"
+        );
+        assert!(manager.status().await.is_empty());
+    }
+
+    /// (в-host) Смерть relay-задачи host-сессии → `Degraded{причина}`:
+    /// сессия активна (stop работает, маршруты живут). Доклад о смерти —
+    /// тот же вызов, что делает задача релея (см. report_relay_death_for_test).
+    #[tokio::test]
+    async fn host_relay_death_degrades_session() {
+        let setup = test_host(true, vec![adapter("CorpVPN", 42, true)]);
+        let TestSetup { host, ops, .. } = setup;
+        let profile = host_profile("corp", "vpn.example.com");
+        host.start(&profile).await.expect("start");
+
+        host.report_relay_death_for_test(
+            "corp",
+            "релей 127.0.0.1:49222 остановлен: сбой слушателя",
+        );
+        host.collect_relay_deaths().await;
+
+        let bottles = host.status().await;
+        assert!(
+            matches!(
+                &bottles[0].state,
+                BottleState::Degraded { reason } if reason.contains("релей")
+            ),
+            "деградация с причиной релея: {:?}",
+            bottles[0].state
+        );
+        // Сессия жива: маршруты не сняты, stop отрабатывает.
+        assert!(
+            !ops.snapshot().iter().any(|e| e.starts_with("svc:Del")),
+            "маршруты деградированной сессии живы"
+        );
+        let reply = host.stop("corp").await.expect("stop деградированной");
+        assert!(matches!(reply, CliReply::Stopped { .. }));
     }
 }
