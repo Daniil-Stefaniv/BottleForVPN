@@ -19,8 +19,15 @@ bottle-core = { path = "../core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-# RouteOpError в routes.rs.
+# RouteOpError в routes.rs, JournalError в journal.rs.
 thiserror = "2"
+# Записи журнала маршрутов (JSONL): JournalRecord в journal.rs.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Тесты журнала работают во временном каталоге.
+tempfile = "3"
 
 # Обвязка Windows-службы: SCM dispatcher, install/uninstall, статусы.
 [target.'cfg(windows)'.dependencies]
