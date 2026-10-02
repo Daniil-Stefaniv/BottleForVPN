@@ -2,9 +2,12 @@
 //!
 //! [`dispatch`] — чистая функция над хранилищем, исполняется на любой
 //! платформе и покрывается unit-тестами. Транспорт (Windows named pipe
-//! `\\.\pipe\bottled`, [`serve`]) обслуживает клиентов по одному: для
-//! каждого соединения создаётся свежий экземпляр канала, после отключения
-//! клиента — следующий.
+//! `\\.\pipe\bottled`, [`serve`]) обслуживает клиентов параллельно:
+//! принятое соединение уходит в свою задачу `tokio::spawn`, а цикл
+//! сразу пересоздаёт экземпляр канала для следующих подключений.
+//! Одновременно обслуживается столько клиентов, сколько живых
+//! экземпляров канала; долгий `start` одного клиента не блокирует
+//! ответы остальным (T13).
 
 use bottle_core::ipc::{BottleSummary, CliReply, CliRequest};
 use bottle_core::profile::BottleProfile;
@@ -26,6 +29,8 @@ use bytes::BytesMut;
 use tokio::io::{split, AsyncWriteExt};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+#[cfg(windows)]
+use tokio::task::JoinSet;
 #[cfg(windows)]
 use tokio_stream::StreamExt;
 #[cfg(windows)]
@@ -129,14 +134,21 @@ fn show_profile(store: &Store, id: &str) -> Option<BottleProfile> {
     }
 }
 
-/// Обслуживает named pipe `pipe_name`: по одному клиенту на соединение,
-/// свежий экземпляр канала на каждый цикл, до отмены `shutdown`.
+/// Обслуживает named pipe `pipe_name` параллельно: принятое соединение
+/// уходит в свою задачу, цикл немедленно создаёт следующий экземпляр
+/// канала — до отмены `shutdown`.
 ///
-/// Это named pipe, а не сокет: «следующий клиент» появляется только после
-/// создания очередного экземпляра канала — цикл пересоздаёт его после
-/// каждого соединения. Ошибки отдельных соединений логируются и не
-/// останавливают сервер; наружу уходит только отказ создать экземпляр
-/// канала или сбой ожидания подключения.
+/// Это named pipe, а не сокет: параллельные клиенты требуют нескольких
+/// экземпляров канала (один клиент занимает экземпляр на всё время
+/// соединения), поэтому цикл держит один «ожидающий подключение»
+/// экземпляр, а принятые живут в своих задачах. Состояние демона
+/// потокобезопасно: [`Store`] — stateless-обёртка над файлами,
+/// [`BottleManager`] держит runtime-карту под мьютексами с короткими
+/// критическими секциями без `await` (контракт конкурентности в его
+/// модуле). Ошибки отдельных соединений логируются и не останавливают
+/// сервер; наружу уходит только отказ создать экземпляр канала или сбой
+/// ожидания подключения. Отмена `shutdown` завершает акцепт-цикл
+/// и все задачи соединений (каждая следит за тем же токеном).
 #[cfg(windows)]
 pub async fn serve(
     pipe_name: &str,
@@ -144,27 +156,40 @@ pub async fn serve(
     shutdown: CancellationToken,
 ) -> io::Result<()> {
     let mut server = ServerOptions::new().create(pipe_name)?;
+    let mut connections: JoinSet<()> = JoinSet::new();
     tracing::info!(pipe = pipe_name, "pipe-сервер запущен");
     loop {
         tokio::select! {
             connected = server.connect() => connected?,
             () = shutdown.cancelled() => {
                 tracing::info!("pipe-сервер остановлен по отмене");
+                connections.abort_all();
+                while connections.join_next().await.is_some() {
+                    // Ждём фактического завершения задач (порты/каналы
+                    // освобождаются до возврата из serve).
+                }
                 return Ok(());
             }
         }
-        handle_connection(server, &daemon, &shutdown).await;
+        let connection = handle_connection(server, Arc::clone(&daemon), shutdown.clone());
+        connections.spawn(connection);
         server = ServerOptions::new().create(pipe_name)?;
     }
 }
 
 /// Обслуживает одно подключение CLI: кадры запросов → ответы диспетчера.
 ///
-/// Завершается при отключении клиента, некорректном кадре или отмене
-/// `shutdown`; после обмена экземпляр канала отключается от клиента
-/// (следующий обслуживается свежим экземпляром, см. [`serve`]).
+/// Живёт в своей задаче со своим экземпляром канала (см. [`serve`]):
+/// параллельные соединения не ждут друг друга. Завершается при
+/// отключении клиента, некорректном кадре или отмене `shutdown`
+/// (в том числе посреди исполнения запроса — на остановке демона);
+/// после обмена экземпляр канала отключается от клиента.
 #[cfg(windows)]
-async fn handle_connection(pipe: NamedPipeServer, daemon: &Daemon, shutdown: &CancellationToken) {
+async fn handle_connection(
+    pipe: NamedPipeServer,
+    daemon: Arc<Daemon>,
+    shutdown: CancellationToken,
+) {
     let (read_half, mut write_half) = split(pipe);
     let mut reader = FramedRead::new(read_half, LengthJsonCodec::<CliRequest>::new());
     let mut reply_codec = LengthJsonCodec::<CliReply>::new();
@@ -183,7 +208,13 @@ async fn handle_connection(pipe: NamedPipeServer, daemon: &Daemon, shutdown: &Ca
             () = shutdown.cancelled() => break,
         };
 
-        let reply = dispatch(&daemon.store, daemon.manager.as_deref(), req).await;
+        // Исполнение тоже отменяемо: остановка демона не ждёт долгих
+        // команд (start с handshake туннеля); незавершённые операции
+        // менеджера разбираются штатными путями его контракта.
+        let reply = tokio::select! {
+            reply = dispatch(&daemon.store, daemon.manager.as_deref(), req) => reply,
+            () = shutdown.cancelled() => break,
+        };
         if let Err(e) = send_reply(&mut write_half, &mut reply_codec, reply).await {
             tracing::warn!(error = %e, "не удалось отправить ответ CLI");
             break;
@@ -418,9 +449,10 @@ endpoints = ["e.example"]
         format!(r"\\.\pipe\bottled-test-{label}-{}-{n}", std::process::id())
     }
 
-    /// Подключается к тестовому каналу с повторами: сервер обслуживает
-    /// клиентов по одному, и на стыке соединений клиент видит «канал занят»
-    /// или «канал ещё не создан» — это ожидаемо, а не ошибка.
+    /// Подключается к тестовому каналу с повторами: между созданием
+    /// очередного ожидающего экземпляра и принятием предыдущего клиента
+    /// видит «канал занят» или «канал ещё не создан» — это ожидаемо,
+    /// а не ошибка.
     #[cfg(windows)]
     async fn connect_client(pipe_name: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
         use tokio::net::windows::named_pipe::ClientOptions;
@@ -564,9 +596,120 @@ endpoints = ["e.example"]
             };
             assert_eq!(bottles.len(), 1, "раунд {round}: один профиль");
             assert_eq!(bottles[0].id, "solo");
-            // Клиент отключается в конце итерации — следующий обслуживается
-            // свежим экземпляром канала (connect_client пережидает стык).
+            // Клиент отключается в конце итерации; его экземпляр канала
+            // уходит с задачей, следующий клиент берёт свежий ожидающий
+            // экземпляр (connect_client пережидает стык).
         }
+
+        shutdown.cancel();
+        server.await.unwrap().expect("serve завершился без ошибки");
+    }
+
+    /// T13: параллельное обслуживание — два ОДНОВРЕМЕННЫХ клиента.
+    ///
+    /// Первый держит длинный `start` (фейк-менеджер с задержкой подключения
+    /// к аплаенсу 2 с), второй за это время получает ответ `List`: таймаут
+    /// ассерта меньше задержки, поэтому последовательное обслуживание
+    /// (ответ второму только после первого) тест проваливает.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_answers_second_client_while_start_is_in_flight() {
+        use std::time::Duration;
+
+        use tokio_util::sync::CancellationToken;
+
+        use crate::appliance::ApplianceHandle;
+        use crate::manager::{AgentConnect, BottleManager};
+
+        const AGENT_DELAY: Duration = Duration::from_secs(2);
+        const SECOND_CLIENT_TIMEOUT: Duration = Duration::from_secs(1);
+
+        /// Фейк-подключение к аплаенсу с задержкой: `start` уходит в
+        /// `connect` и висит `AGENT_DELAY`, после чего отказывается.
+        /// Достаточно для параллельного стенда — бутылка не поднимается.
+        struct SlowAgentConnect;
+
+        #[async_trait::async_trait]
+        impl AgentConnect for SlowAgentConnect {
+            async fn connect(&self) -> Result<ApplianceHandle, DaemonError> {
+                tokio::time::sleep(AGENT_DELAY).await;
+                Err(DaemonError::Appliance(
+                    "фейк-аплаенс с задержкой: соединение не состоялось".to_string(),
+                ))
+            }
+
+            async fn alive(&self) -> bool {
+                false
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("store")).unwrap();
+        let src = tmp.path().join("wg-office.conf");
+        fs::write(&src, "wg-secret").unwrap();
+        store
+            .save(&env_profile("office-a", src.to_str().unwrap()))
+            .unwrap();
+
+        // Менеджер владеет своим экземпляром хранилища того же корня
+        // (паттерн main::serve_daemon).
+        let manager_store = Store::open(store.data_root()).unwrap();
+        let manager = Arc::new(BottleManager::new(
+            manager_store,
+            Arc::new(SlowAgentConnect),
+        ));
+
+        let pipe_name = unique_pipe_name("par");
+        let shutdown = CancellationToken::new();
+        let daemon = Arc::new(crate::Daemon {
+            store,
+            manager: Some(manager),
+        });
+        let (server_pipe_name, server_shutdown) = (pipe_name.clone(), shutdown.clone());
+        let server =
+            tokio::spawn(async move { serve(&server_pipe_name, daemon, server_shutdown).await });
+
+        // Первый клиент отправляет start и держит соединение открытым,
+        // пока ответ не придёт (задача, не await).
+        let mut slow_client = connect_client(&pipe_name).await;
+        let slow_reply = tokio::spawn(async move {
+            exchange(
+                &mut slow_client,
+                CliRequest::Start {
+                    id: "office-a".to_string(),
+                },
+            )
+            .await
+        });
+        // Даём серверу войти в диспетчер (до задержки фейк-агента).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Второй клиент: List отвечает, НЕ дожидаясь чужого start.
+        let mut fast_client = connect_client(&pipe_name).await;
+        let reply = tokio::time::timeout(
+            SECOND_CLIENT_TIMEOUT,
+            exchange(&mut fast_client, CliRequest::List),
+        )
+        .await
+        .expect("List не должен ждать чужой start (параллельные клиенты)");
+        let CliReply::List { bottles } = reply else {
+            panic!("ожидали List, получили {reply:?}");
+        };
+        assert_eq!(
+            bottles.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            ["office-a"]
+        );
+        drop(fast_client);
+
+        // Первый клиент в итоге получает ошибку (после задержки фейка).
+        let slow_reply = tokio::time::timeout(AGENT_DELAY * 5, slow_reply)
+            .await
+            .expect("start отвечает после задержки фейк-агента (сервер не потерял соединение)")
+            .expect("задача slow-клиента не паниковала");
+        assert!(
+            matches!(slow_reply, CliReply::Error { .. }),
+            "start против фейка с отказом → Error, получено {slow_reply:?}"
+        );
 
         shutdown.cancel();
         server.await.unwrap().expect("serve завершился без ошибки");

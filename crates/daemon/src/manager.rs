@@ -667,7 +667,7 @@ impl BottleManager {
                 drop(runtime);
                 tracing::info!(id, "бутылка поднята");
                 if let Some(command) = &profile.expose.launch {
-                    spawn_launch(command);
+                    crate::launch::spawn_launch(command);
                 }
                 Ok(CliReply::Started { id: id.to_string() })
             }
@@ -944,15 +944,6 @@ fn is_active(state: &BottleState) -> bool {
             | BottleState::Degraded { .. }
             | BottleState::Stopping
     )
-}
-
-/// Запускает команду `expose.launch` после перехода в `up` (спека §7.1);
-/// вывод не ждём, ошибка запуска — только журнал.
-fn spawn_launch(command: &str) {
-    match std::process::Command::new(command).spawn() {
-        Ok(child) => tracing::info!(command, pid = child.id(), "launch запущен"),
-        Err(error) => tracing::warn!(command, %error, "не удалось запустить launch"),
-    }
 }
 
 /// Резервирует слушатели портов: автоподбор из 49152–65535 для нулевых

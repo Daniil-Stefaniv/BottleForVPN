@@ -127,8 +127,13 @@ fn handle_reply(command: &Command, reply: CliReply) -> ExitCode {
                 ExitCode::SUCCESS
             }
             // Демон отвечает пустым Show на отсутствующий/битый профиль.
+            // Рантайм при этом может быть живым (профиль удалили при
+            // поднятой бутылке): показываем его до отказа — T13.
             None => {
-                eprintln!("Бутылка не найдена: {id}");
+                if let Some(runtime) = runtime {
+                    println!("{}", render::render_show_runtime_only(runtime));
+                }
+                eprintln!("Профиль бутылки не найден или недоступен: {id}");
                 ExitCode::FAILURE
             }
         },
@@ -178,12 +183,12 @@ mod client {
     use tokio_util::codec::{Encoder, FramedRead};
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
 
-    /// Окно повторных попыток подключения. Демон обслуживает клиентов по
-    /// одному и пересоздаёт экземпляр канала между соединениями — в этот
-    /// момент канал «занят» или «не существует», и это ожидаемо. Пока идёт
-    /// чужой длинный `start`, канал занят всю его длительность, поэтому
-    /// окно должно покрывать холодный старт целиком: импорт аплаенса +
-    /// подключение агента + handshake туннеля. 60 с хватает с запасом.
+    /// Окно повторных попыток подключения. Демон обслуживает клиентов
+    /// параллельно, но между созданием очередного ожидающего экземпляра
+    /// канала и освобождением предыдущего клиент видит «канал занят» или
+    /// «канал не существует» — это стык экземпляров, а не отсутствие
+    /// демона; 60 с покрывают его с запасом (включая холодный старт
+    /// bottled).
     const CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(60);
     /// Пауза между попытками подключения.
     const CONNECT_RETRY_PAUSE: Duration = Duration::from_millis(50);
@@ -356,6 +361,44 @@ mod tests {
             CliRequest::Stop {
                 id: "office-a".to_string()
             }
+        );
+    }
+
+    /// T13: Show без профиля — отказ (exit 1) и при живом рантайме:
+    /// рендер блока проверяет `render::render_show_runtime_only`,
+    /// здесь — только код возврата.
+    #[test]
+    fn show_missing_profile_fails_even_with_runtime() {
+        let runtime = bottle_core::ipc::RuntimeState {
+            id: "office-a".to_string(),
+            state: bottle_core::ipc::BottleState::Up,
+            socks5: Some(55001),
+            forwards: Vec::new(),
+        };
+        let command = Command::Show {
+            id: "office-a".to_string(),
+        };
+        assert_eq!(
+            handle_reply(
+                &command,
+                CliReply::Show {
+                    profile: None,
+                    runtime: Some(runtime),
+                }
+            ),
+            ExitCode::FAILURE,
+            "недоступный профиль — отказ, даже если бутылка жива"
+        );
+        // Базовый случай: ни профиля, ни рантайма — тоже отказ.
+        assert_eq!(
+            handle_reply(
+                &command,
+                CliReply::Show {
+                    profile: None,
+                    runtime: None,
+                }
+            ),
+            ExitCode::FAILURE
         );
     }
 }

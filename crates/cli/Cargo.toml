@@ -12,7 +12,6 @@ path = "src/main.rs"
 bottle-core = { path = "../core" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
-serde_json = "1"
 # Обмен с демоном: кадры LengthJsonCodec по named pipe.
 bytes = "1"
 tokio-stream = "0.1"

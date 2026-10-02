@@ -90,14 +90,29 @@ pub fn render_show(profile: &BottleProfile, runtime: Option<&RuntimeState>) -> S
         lines.push(format!("  launch: {launch}"));
     }
     if let Some(runtime) = runtime {
-        lines.push("runtime:".to_string());
-        lines.extend(
-            runtime_lines(runtime)
-                .into_iter()
-                .map(|line| format!("  {line}")),
-        );
+        lines.extend(runtime_section(runtime));
     }
     lines.join("\n")
+}
+
+/// Рендерит только блок рантайма ответа `Show` с недоступным профилем
+/// (удалён/бит, но бутылка поднята): то же оформление секции `runtime:`
+/// из [`render_show`], чтобы пользователь видел живое состояние, а не
+/// голое «не найдена» (T13).
+pub fn render_show_runtime_only(runtime: &RuntimeState) -> String {
+    runtime_section(runtime).join("\n")
+}
+
+/// Строки секции `runtime:` (заголовок + отступ) — общая для
+/// [`render_show`] и [`render_show_runtime_only`].
+fn runtime_section(runtime: &RuntimeState) -> Vec<String> {
+    let mut lines = vec!["runtime:".to_string()];
+    lines.extend(
+        runtime_lines(runtime)
+            .into_iter()
+            .map(|line| format!("  {line}")),
+    );
+    lines
 }
 
 /// Строки рантайм-блока (общий для `status` и секции `runtime:` в `show`):
@@ -361,6 +376,34 @@ mod tests {
         assert!(
             out.contains("rdp 10.20.30.15:3389 → 127.0.0.1:55002"),
             "нет живого проброса:\n{out}"
+        );
+    }
+
+    /// T13: Show без профиля, но с живым рантаймом — рендерится блок
+    /// рантайма (то же оформление, что в полной секции show).
+    #[test]
+    fn show_runtime_only_renders_state_and_ports() {
+        let out = render_show_runtime_only(&runtime(BottleState::Up));
+        assert!(out.contains("runtime:"), "нет секции рантайма:\n{out}");
+        assert!(out.contains("office-a  up"), "нет строки состояния:\n{out}");
+        assert!(
+            out.contains("socks5 127.0.0.1:55001"),
+            "нет живого socks5:\n{out}"
+        );
+        assert!(
+            out.contains("rdp 10.20.30.15:3389 → 127.0.0.1:55002"),
+            "нет живого проброса:\n{out}"
+        );
+        // Оформление совпадает с полной секцией show.
+        let full = render_show(&env_profile(), Some(&runtime(BottleState::Up)));
+        let full_section = full
+            .split("runtime:")
+            .nth(1)
+            .expect("полный рендер содержит runtime:");
+        assert_eq!(
+            out.split("runtime:").nth(1).expect("секция есть"),
+            full_section,
+            "блок рантайма должен совпадать с секцией полного show:\n{out}\nvs\n{full}"
         );
     }
 

@@ -41,6 +41,8 @@ mod host_manager;
 mod host_net;
 #[allow(dead_code)]
 mod instance;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod launch;
 #[allow(dead_code)]
 mod manager;
 #[cfg_attr(not(windows), allow(dead_code))]

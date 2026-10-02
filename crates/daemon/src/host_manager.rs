@@ -47,6 +47,7 @@ use tokio::task::JoinSet;
 
 use crate::error::DaemonError;
 use crate::host_net::{resolve_endpoints_async, GwFamily};
+use crate::launch::{spawn_launch, split_command_line};
 use crate::manager::{reserve_ports, HostListeners, RelayDeath};
 use crate::svc_client::{svc_pipe_exists, SvcClient, SVC_MISSING_MESSAGE};
 
@@ -623,7 +624,7 @@ impl HostManager {
                 drop(state);
                 tracing::info!(id = %profile.id, "host-бутылка поднята");
                 if let Some(command) = &profile.expose.launch {
-                    spawn_launch_split(command);
+                    spawn_launch(command);
                 }
                 Ok(CliReply::Started {
                     id: profile.id.clone(),
@@ -1089,8 +1090,9 @@ impl HostManager {
             )
         })?;
 
-        // 7. Запуск клиента (мини-сплит аргументов).
-        let argv = split_args(args.as_deref());
+        // 7. Запуск клиента (мини-shlex: кавычки и экранированные пробелы
+        // в аргументах, см. `launch::split_command_line`).
+        let argv = split_command_line(args.as_deref().unwrap_or(""));
         if let Err(error) = self.parts.spawner.spawn(client, &argv).await {
             return Err(Failed::with_routes(
                 format!("не удалось запустить VPN-клиент {client}: {error}"),
@@ -1424,33 +1426,6 @@ fn host_is_active(state: &BottleState) -> bool {
             | BottleState::Degraded { .. }
             | BottleState::Stopping
     )
-}
-
-/// Мини-сплит аргументов клиента/launch: разбиение по пробелам.
-///
-/// Ограничение M2: кавычки не поддерживаются (аргумент с пробелом
-/// задать нельзя) — рулинг плана T9; полноценный shlex — при реальной
-/// потребности.
-pub(crate) fn split_args(args: Option<&str>) -> Vec<String> {
-    args.unwrap_or("")
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
-}
-
-/// Запускает `expose.launch` host-бутылки после перехода в `up`
-/// (мини-сплит как у аргументов клиента); вывод не ждём.
-fn spawn_launch_split(command: &str) {
-    let mut parts = command.split_whitespace();
-    let Some(program) = parts.next() else {
-        tracing::warn!(command, "launch пуст — не запущен");
-        return;
-    };
-    let args: Vec<&str> = parts.collect();
-    match std::process::Command::new(program).args(&args).spawn() {
-        Ok(child) => tracing::info!(command, pid = child.id(), "launch запущен"),
-        Err(error) => tracing::warn!(command, %error, "не удалось запустить launch"),
-    }
 }
 
 /// Поднимает задачи релеев host-бутылки: SOCKS5 + пробросы, исходящие
@@ -2641,17 +2616,6 @@ mod tests {
         // индекс 1 в сетевом (big-endian) порядке.
         assert_eq!(unicast_if_value(1, false).to_ne_bytes(), [0, 0, 0, 1]);
         assert_eq!(unicast_if_value(42, true), 42);
-    }
-
-    /// Мини-сплит аргументов.
-    #[test]
-    fn split_args_splits_on_whitespace() {
-        assert_eq!(
-            split_args(Some("connect office --silent")),
-            vec!["connect", "office", "--silent"]
-        );
-        assert!(split_args(None).is_empty());
-        assert!(split_args(Some("   ")).is_empty());
     }
 
     /// Разбор вывода Get-NetAdapter: имена с пробелами, статусы,

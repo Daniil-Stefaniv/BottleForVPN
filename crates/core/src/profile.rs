@@ -214,13 +214,19 @@ fn validate_vpn(kind: BottleKind, vpn: &VpnConfig) -> Result<(), ProfileError> {
     }
 }
 
-/// Проверяет цель проброса: `host:port`, host непустой, port 0..=65535.
-/// IPv6-хост допускается в скобочной форме (`[::1]:3389`).
+/// Проверяет цель проброса: `host:port`, host непустой, port 1..=65535
+/// (0 — автоподбор только локальных портов; цель с нулевым портом
+/// недостижима — релей отвергает её при разборе `TargetAddr`, профиль
+/// ловит то же на валидации). IPv6-хост допускается в скобочной форме
+/// (`[::1]:3389`).
 fn validate_target(target: &str) -> Result<(), ProfileError> {
     let Some((host, port)) = target.rsplit_once(':') else {
         return Err(ProfileError::InvalidTarget);
     };
-    if host.is_empty() || port.parse::<u16>().is_err() {
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| ProfileError::InvalidTarget)?;
+    if host.is_empty() || port == 0 {
         return Err(ProfileError::InvalidTarget);
     }
     Ok(())
@@ -462,6 +468,20 @@ config = "c.conf"
             parse_profile(&text),
             Err(ProfileError::InvalidTarget)
         ));
+    }
+
+    /// Порт 0 — автоподбор только для локальных портов (socks5/listen);
+    /// цель проброса с нулевым портом недостижима. Релей отвергает её
+    /// при разборе TargetAddr (1..=65535) — профиль должен ловить это
+    /// раньше, на валидации (T13: синхрон с relay-lib).
+    #[test]
+    fn target_with_port_zero_is_rejected() {
+        let text =
+            env_with_expose("[expose]\nforwards = [{ listen = 0, target = \"10.20.30.15:0\" }]");
+        assert!(
+            matches!(parse_profile(&text), Err(ProfileError::InvalidTarget)),
+            "порт 0 в цели проброса недостижим — InvalidTarget, не молчаливый приём"
+        );
     }
 
     #[test]
