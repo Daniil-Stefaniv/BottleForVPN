@@ -14,8 +14,9 @@ path = "src/main.rs"
 [dependencies]
 bottle-core = { path = "../core" }
 # Внутренний runtime службы: сервер-заглушка (Task 6 подключит pipe),
-# graceful-остановка в консольном режиме — по Ctrl+C.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# graceful-остановка в консольном режиме — по Ctrl+C; run_ps: процесс
+# PowerShell с таймаутом.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # RouteOpError в routes.rs.

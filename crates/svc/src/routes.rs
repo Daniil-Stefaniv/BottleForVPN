@@ -5,9 +5,18 @@
 //!
 //! Единая точка построения точечных префиксов — [`route_ps_args`]:
 //! `/32` для IPv4, `/128` для IPv6 (чистая функция, unit-тестируется
-//! на любой ОС); фактический запуск PowerShell — [`run_ps`].
+//! на любой ОС); фактический запуск PowerShell — [`run_ps`] через
+//! `-EncodedCommand` (base64 от UTF-16LE) — один однозначный путь
+//! разбора, без матрицы экранирования токенов.
 
 use std::net::IpAddr;
+use std::time::Duration;
+
+/// Предельное время выполнения PowerShell-командлета: зависший
+/// процесс не должен блокировать цикл службы навсегда.
+// На не-windows используется только windows-реализацией run_ps.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Команда над таблицей маршрутов.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,11 +38,6 @@ impl RouteCmd {
             RouteCmd::List => "Get-NetRoute",
         }
     }
-
-    /// Команда модифицирует таблицу маршрутов (не `List`).
-    fn is_write(self) -> bool {
-        !matches!(self, RouteCmd::List)
-    }
 }
 
 /// Ошибка операции над маршрутами.
@@ -45,6 +49,9 @@ pub enum RouteOpError {
     /// Не удалось запустить PowerShell.
     #[error("не удалось запустить PowerShell: {0}")]
     Spawn(#[from] std::io::Error),
+    /// PowerShell не завершился за [`PS_TIMEOUT`] — процесс убит.
+    #[error("PowerShell не завершился вовремя (таймаут 30 с)")]
+    TimedOut,
     /// Операции над маршрутами поддержаны только на Windows.
     #[error("операции над маршрутами доступны только на Windows")]
     NotWindows,
@@ -66,7 +73,9 @@ fn host_prefix(dest: IpAddr) -> String {
 /// только в активное хранилище (`-PolicyStore ActiveStore`) и падают
 /// при сбое (`-ErrorAction Stop`); `Del` дополнительно отключает
 /// запрос подтверждения (`-Confirm:$false`). `List` — читающий запрос
-/// по префиксу назначения.
+/// по префиксу назначения с `-ErrorAction SilentlyContinue`: отсутствующий
+/// маршрут — это пустой результат и код выхода 0 (Get-NetRoute пишет
+/// non-terminating error на пустую выборку), а не ошибка.
 pub fn route_ps_args(
     cmd: RouteCmd,
     dest: IpAddr,
@@ -86,11 +95,18 @@ pub fn route_ps_args(
         args.push("-InterfaceAlias".to_string());
         args.push(alias.to_string());
     }
-    if cmd.is_write() {
-        args.push("-PolicyStore".to_string());
-        args.push("ActiveStore".to_string());
-        args.push("-ErrorAction".to_string());
-        args.push("Stop".to_string());
+    match cmd {
+        RouteCmd::Add | RouteCmd::Del => {
+            args.extend([
+                "-PolicyStore".to_string(),
+                "ActiveStore".to_string(),
+                "-ErrorAction".to_string(),
+                "Stop".to_string(),
+            ]);
+        }
+        RouteCmd::List => {
+            args.extend(["-ErrorAction".to_string(), "SilentlyContinue".to_string()]);
+        }
     }
     if matches!(cmd, RouteCmd::Del) {
         args.push("-Confirm:$false".to_string());
@@ -98,52 +114,73 @@ pub fn route_ps_args(
     args
 }
 
-/// Собирает аргументы в командную строку для PowerShell `-Command`,
-/// заключая значения с пробелами и спецсимволами в литеральные
-/// одиночные кавычки (вложенный `'` удваивается): алиасы адаптеров
-/// вроде `vEthernet (WSL)` содержат пробелы и скобки.
-// На не-windows вызывается только windows-реализацией run_ps и
-// unit-тестами экранирования (паттерн daemon).
-#[cfg_attr(not(windows), allow(dead_code))]
-fn ps_command_line(args: &[String]) -> String {
-    args.iter()
-        .map(|arg| quote_ps_arg(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Экранирует один аргумент PowerShell при необходимости.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn quote_ps_arg(arg: &str) -> String {
-    let needs_quoting = arg.is_empty() || arg.chars().any(ps_special);
-    if needs_quoting {
-        format!("'{}'", arg.replace('\'', "''"))
-    } else {
-        arg.to_string()
+/// Кодирует аргументы в значение параметра `-EncodedCommand`
+/// PowerShell: аргументы, соединённые пробелами в строку скрипта →
+/// UTF-16LE → base64 (документированный формат ключа). Единственный
+/// путь разбора — сам PowerShell, без экранирования токенов.
+pub fn encode_ps_command(args: &[String]) -> String {
+    let script = args.join(" ");
+    let mut utf16le = Vec::with_capacity(script.len() * 2);
+    for unit in script.encode_utf16() {
+        utf16le.extend_from_slice(&unit.to_le_bytes());
     }
+    base64_encode(&utf16le)
 }
 
-/// Символы, из-за которых значение аргумента берётся в кавычки:
-/// пробельные, группировка `( )`, кавычки, подстановка `$`, разделитель
-/// `;`, запятая и escape-символ PowerShell — backtick.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn ps_special(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '(' | ')' | '\'' | '"' | '$' | ';' | ',' | '`')
+/// Кодирует байты в стандартный base64 (RFC 4648, базовый алфавит,
+/// с паддингом). Нужен только для [`encode_ps_command`] — внешний
+/// crate не заводился, корректность зафиксирована эталонами RFC 4648.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let triple = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(triple[0]) << 16) | (u32::from(triple[1]) << 8) | u32::from(triple[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 0b111111] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 0b111111] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 0b111111] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 0b111111] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Запускает PowerShell с собранными аргументами и возвращает stdout.
 ///
-/// `powershell -NoProfile -NonInteractive -Command <join(args)>`;
-/// ненулевой код выхода → [`RouteOpError::PsFailed`] со stderr.
+/// `powershell -NoProfile -NonInteractive -EncodedCommand <encode>` —
+/// сценарий передаётся одним base64-токеном (UTF-16LE), поэтому
+/// разбор не зависит от кавычек/метасимволов оболочки. Зависший
+/// PowerShell снимается по таймауту [`PS_TIMEOUT`] (`kill_on_drop`).
+/// Ненулевой код выхода → [`RouteOpError::PsFailed`] со stderr.
 #[cfg(windows)]
-pub fn run_ps(args: &[String]) -> Result<String, RouteOpError> {
-    let output = std::process::Command::new("powershell")
+pub async fn run_ps(args: &[String]) -> Result<String, RouteOpError> {
+    let child = tokio::process::Command::new("powershell")
         .arg("-NoProfile")
         .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(ps_command_line(args))
-        .output()
+        .arg("-EncodedCommand")
+        .arg(encode_ps_command(args))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .map_err(RouteOpError::Spawn)?;
+    let output = match tokio::time::timeout(PS_TIMEOUT, child.wait_with_output()).await {
+        Ok(output) => output.map_err(RouteOpError::Spawn)?,
+        // Будущее wait_with_output снято — kill_on_drop убивает процесс.
+        Err(_elapsed) => return Err(RouteOpError::TimedOut),
+    };
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -155,7 +192,7 @@ pub fn run_ps(args: &[String]) -> Result<String, RouteOpError> {
 
 /// Не-Windows стаб: операции над маршрутами недоступны.
 #[cfg(not(windows))]
-pub fn run_ps(_args: &[String]) -> Result<String, RouteOpError> {
+pub async fn run_ps(_args: &[String]) -> Result<String, RouteOpError> {
     Err(RouteOpError::NotWindows)
 }
 
@@ -316,11 +353,23 @@ mod tests {
     fn list_v4_and_v6_are_read_only_prefix_queries() {
         assert_eq!(
             route_ps_args(RouteCmd::List, ip("203.0.113.77"), None, None),
-            strs(&["Get-NetRoute", "-DestinationPrefix", "203.0.113.77/32"])
+            strs(&[
+                "Get-NetRoute",
+                "-DestinationPrefix",
+                "203.0.113.77/32",
+                "-ErrorAction",
+                "SilentlyContinue",
+            ])
         );
         assert_eq!(
             route_ps_args(RouteCmd::List, ip("2001:db8::10"), None, None),
-            strs(&["Get-NetRoute", "-DestinationPrefix", "2001:db8::10/128"])
+            strs(&[
+                "Get-NetRoute",
+                "-DestinationPrefix",
+                "2001:db8::10/128",
+                "-ErrorAction",
+                "SilentlyContinue",
+            ])
         );
     }
 
@@ -341,26 +390,53 @@ mod tests {
                 "192.168.1.1",
                 "-InterfaceAlias",
                 "Ethernet",
+                "-ErrorAction",
+                "SilentlyContinue",
             ])
         );
     }
 
     #[test]
-    fn command_line_quotes_only_special_values() {
+    fn encode_ps_command_known_vector_utf16le_base64() {
+        // Эталон посчитан независимо: python3 -c "base64.b64encode(
+        // 'Write-Output привет'.encode('utf-16-le'))".
         assert_eq!(
-            ps_command_line(&strs(&[
+            encode_ps_command(&strs(&["Write-Output", "привет"])),
+            "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIAA/BEAEOAQyBDUEQgQ="
+        );
+    }
+
+    #[test]
+    fn encode_ps_command_route_line_vector() {
+        // Эталон: base64('Get-NetRoute -DestinationPrefix
+        // 203.0.113.77/32' в UTF-16LE), посчитан независимо.
+        assert_eq!(
+            encode_ps_command(&strs(&[
                 "Get-NetRoute",
                 "-DestinationPrefix",
-                "203.0.113.7/32"
+                "203.0.113.77/32"
             ])),
-            "Get-NetRoute -DestinationPrefix 203.0.113.7/32"
+            concat!(
+                "RwBlAHQALQBOAGUAdABSAG8AdQB0AGUAIAAtAEQAZQBzAHQAaQBuAGEAdABpAG8A",
+                "bgBQAHIAZQBmAGkAeAAgADIAMAAzAC4AMAAuADEAMQAzAC4ANwA3AC8AMwAyAA=="
+            )
         );
-        // Пробелы и скобки в алиасе адаптера — литеральная строка PS.
-        assert_eq!(
-            ps_command_line(&strs(&["-InterfaceAlias", "vEthernet (WSL)"])),
-            "-InterfaceAlias 'vEthernet (WSL)'"
-        );
-        // Вложенная одинарная кавычка удваивается.
-        assert_eq!(ps_command_line(&strs(&["it's", "a'b"])), "'it''s' 'a''b'");
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_test_vectors() {
+        // Эталоны RFC 4648 §10 (базовый алфавит, с паддингом) — на
+        // самих байтах; UTF-16LE-склейку проверяют эталоны
+        // encode_ps_command выше.
+        for (text, expected) in [
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(text.as_bytes()), expected, "вектор {text:?}");
+        }
     }
 }

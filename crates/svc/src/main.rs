@@ -27,6 +27,7 @@ const SERVICE_DESCRIPTION: &str =
     "Служба маршрутов BottleForApps: точечные маршруты host-бутылок через физический шлюз";
 
 /// Режим запуска, выбираемый аргументами командной строки.
+#[derive(Debug)]
 enum Mode {
     /// Штатный режим службы под управлением SCM (без аргументов, `run`).
     Run,
@@ -52,7 +53,9 @@ fn main() -> ExitCode {
 
 /// Разбирает аргументы командной строки: без аргументов или `run` —
 /// режим службы; `--console`/`--install`/`--uninstall` — отладка и
-/// административные операции. Прочее и лишние аргументы — ошибка.
+/// административные операции. Первый токен проверяется на известность
+/// раньше проверки лишних аргументов (диагностика указывает на сам
+/// неверный флаг), прочее и лишние аргументы — ошибка.
 fn parse_cli_args<I>(args: I) -> Result<Mode, String>
 where
     I: Iterator<Item = OsString>,
@@ -61,20 +64,21 @@ where
     let Some(arg) = args.next() else {
         return Ok(Mode::Run);
     };
+    let mode = if arg == OsStr::new("run") {
+        Mode::Run
+    } else if arg == OsStr::new("--console") {
+        Mode::Console
+    } else if arg == OsStr::new("--install") {
+        Mode::Install
+    } else if arg == OsStr::new("--uninstall") {
+        Mode::Uninstall
+    } else {
+        return Err(format!("неизвестный аргумент: {}", arg.to_string_lossy()));
+    };
     if let Some(extra) = args.next() {
         return Err(format!("лишний аргумент: {}", extra.to_string_lossy()));
     }
-    if arg == OsStr::new("run") {
-        Ok(Mode::Run)
-    } else if arg == OsStr::new("--console") {
-        Ok(Mode::Console)
-    } else if arg == OsStr::new("--install") {
-        Ok(Mode::Install)
-    } else if arg == OsStr::new("--uninstall") {
-        Ok(Mode::Uninstall)
-    } else {
-        Err(format!("неизвестный аргумент: {}", arg.to_string_lossy()))
-    }
+    Ok(mode)
 }
 
 /// Запускает выбранный режим. Обвязка SCM доступна только на Windows:
@@ -179,6 +183,9 @@ mod win_service {
     /// Win32 ERROR_ACCESS_DENIED — установка/удаление без прав
     /// администратора падает именно с ним.
     const ERROR_ACCESS_DENIED: i32 = 5;
+    /// Win32 ERROR_SERVICE_EXISTS — повторная установка уже
+    /// установленной службы.
+    const ERROR_SERVICE_EXISTS: i32 = 1070;
     /// Win32 ERROR_SERVICE_DOES_NOT_EXIST — удаление неустановленной
     /// службы.
     const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
@@ -222,8 +229,10 @@ mod win_service {
         }
     }
 
-    /// Статусная машина службы: StartPending → Running → (сервер) →
-    /// Stopped; сигнал Stop из SCM пробуждает сервер-заглушку.
+    /// Регистрирует обработчик событий SCM и гоняет полный цикл
+    /// состояний. Любая ошибка ПОСЛЕ регистрации доложивается SCM
+    /// best-effort переводом в Stopped перед аварийным выходом (иначе
+    /// служба зависает в StartPending до таймаута SCM).
     fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let shutdown = Arc::new(Notify::new());
         let stop_watcher = shutdown.clone();
@@ -238,8 +247,26 @@ mod win_service {
                 _ => ServiceControlHandlerResult::NotImplemented,
             }
         };
+        // Ошибка register — статуса ещё нет, доложить SCM некому.
         let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
 
+        // ServiceStatusHandle — Copy: передача по значению не лишает
+        // возможности доложить Stopped в ветке ошибки ниже.
+        let result = serve_until_stop(status_handle, shutdown);
+        if result.is_err() {
+            if let Err(report_error) = status_handle.set_service_status(stopped_status()) {
+                tracing::warn!(error = %report_error, "не удалось доложить SCM о Stopped");
+            }
+        }
+        result
+    }
+
+    /// Полный цикл состояний после register: StartPending → Running →
+    /// сервер-заглушка → Stopped; сигнал Stop пробуждает сервер.
+    fn serve_until_stop(
+        status_handle: windows_service::service_control_handler::ServiceStatusHandle,
+        shutdown: Arc<Notify>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: ServiceState::StartPending,
@@ -270,7 +297,13 @@ mod win_service {
             run_stub_server(shutdown).await;
         });
 
-        status_handle.set_service_status(ServiceStatus {
+        status_handle.set_service_status(stopped_status())?;
+        Ok(())
+    }
+
+    /// Статус «служба остановлена» для доклада SCM.
+    fn stopped_status() -> ServiceStatus {
+        ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: ServiceState::Stopped,
             controls_accepted: ServiceControlAccept::empty(),
@@ -278,8 +311,7 @@ mod win_service {
             checkpoint: 0,
             wait_hint: Duration::default(),
             process_id: None,
-        })?;
-        Ok(())
+        }
     }
 
     /// `--install`: устанавливает службу (требует администратора).
@@ -323,9 +355,17 @@ mod win_service {
         let service = manager
             .create_service(&info, ServiceAccess::CHANGE_CONFIG)
             .map_err(|e| describe_scm_error("не удалось установить службу", &e))?;
-        service
-            .set_description(SERVICE_DESCRIPTION)
-            .map_err(|e| describe_scm_error("не удалось задать описание службы", &e))?;
+        // Служба уже создана: частичный сбой дальше честно сообщает об
+        // этом — повторный --install увидит переведённый
+        // ERROR_SERVICE_EXISTS, а не «сырую» ошибку; --uninstall удалит.
+        if let Err(e) = service.set_description(SERVICE_DESCRIPTION) {
+            return Err(format!(
+                "служба установлена, но не удалось задать описание ({}); \
+                 служба осталась в системе — повторная установка сообщит, \
+                 что она уже установлена, --uninstall удалит её",
+                describe_scm_error("set_description", &e)
+            ));
+        }
         Ok(())
     }
 
@@ -333,7 +373,10 @@ mod win_service {
     pub fn uninstall() -> ExitCode {
         match uninstall_service() {
             Ok(()) => {
-                println!("Служба «{SERVICE_DISPLAY_NAME}» ({SERVICE_NAME}) удалена");
+                println!(
+                    "Служба «{SERVICE_DISPLAY_NAME}» ({SERVICE_NAME}) помечена на удаление \
+                     (окончательно удалится после остановки процесса службы)"
+                );
                 ExitCode::SUCCESS
             }
             Err(message) => {
@@ -379,11 +422,15 @@ mod win_service {
     }
 
     /// Переводит ошибки SCM в русские сообщения; отказ в доступе —
-    /// явное требование прав администратора.
+    /// явное требование прав администратора, повторная установка —
+    /// сообщение, что служба уже установлена.
     fn describe_scm_error(context: &str, error: &ScmError) -> String {
         if let ScmError::Winapi(io) = error {
             if io.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
                 return format!("{context}: операция требует прав администратора");
+            }
+            if io.raw_os_error() == Some(ERROR_SERVICE_EXISTS) {
+                return format!("{context}: служба {SERVICE_NAME} уже установлена");
             }
         }
         format!("{context}: {error}")
@@ -448,5 +495,16 @@ mod tests {
     fn extra_argument_is_error() {
         assert!(parse_cli_args(args(&["run", "extra"])).is_err());
         assert!(parse_cli_args(args(&["--console", "--install"])).is_err());
+    }
+
+    #[test]
+    fn unknown_first_token_reported_before_extra_check() {
+        // «bottle-svc bogus extra»: ругань на первый токен, а не на
+        // «лишний аргумент extra».
+        let error = parse_cli_args(args(&["bogus", "extra"])).unwrap_err();
+        assert!(
+            error.contains("неизвестный аргумент: bogus"),
+            "ожидалась диагностика первого токена, получено: {error}"
+        );
     }
 }
