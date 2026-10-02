@@ -65,17 +65,30 @@ fn host_prefix(dest: IpAddr) -> String {
     }
 }
 
+/// Значение-аргумент командлета в PS-одинарных кавычках. Внутри них
+/// `$`, `;`, backtick, `|`, скобки — литералы; единственное экранирование —
+/// удвоение самой одинарной кавычки. Флаги и имена командлетов НЕ
+/// квотируются: квотированный `-Confirm:$false` перестал бы быть
+/// переключателем (PS принял бы его как позиционную строку).
+fn ps_value(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "''"))
+}
+
 /// Собирает аргументы PowerShell-командлета для операции над маршрутом.
 ///
 /// Общее начало: командлет + `-DestinationPrefix <ip>/32|/128`; при
 /// заданном `gateway` добавляется пара `-NextHop <gw>`, при заданном
-/// `iface_alias` — пара `-InterfaceAlias <alias>`. `Add`/`Del` пишут
-/// только в активное хранилище (`-PolicyStore ActiveStore`) и падают
-/// при сбое (`-ErrorAction Stop`); `Del` дополнительно отключает
-/// запрос подтверждения (`-Confirm:$false`). `List` — читающий запрос
-/// по префиксу назначения с `-ErrorAction SilentlyContinue`: отсутствующий
-/// маршрут — это пустой результат и код выхода 0 (Get-NetRoute пишет
-/// non-terminating error на пустую выборку), а не ошибка.
+/// `iface_alias` — пара `-InterfaceAlias <alias>`. Значения-аргументы
+/// оборачиваются в PS-одинарные кавычки ([`ps_value`]) — метасимволы
+/// языка PowerShell внутри данных (имя интерфейса вида `Ethernet|cmd`)
+/// интерпретироваться не могут; флаги и командлеты остаются голыми.
+/// `Add`/`Del` пишут только в активное хранилище (`-PolicyStore
+/// ActiveStore`) и падают при сбое (`-ErrorAction Stop`); `Del`
+/// дополнительно отключает запрос подтверждения (`-Confirm:$false`).
+/// `List` — читающий запрос по префиксу назначения с `-ErrorAction
+/// SilentlyContinue`: отсутствующий маршрут — это пустой результат и
+/// код выхода 0 (Get-NetRoute пишет non-terminating error на пустую
+/// выборку), а не ошибка.
 pub fn route_ps_args(
     cmd: RouteCmd,
     dest: IpAddr,
@@ -85,15 +98,15 @@ pub fn route_ps_args(
     let mut args = vec![
         cmd.cmdlet().to_string(),
         "-DestinationPrefix".to_string(),
-        host_prefix(dest),
+        ps_value(&host_prefix(dest)),
     ];
     if let Some(gateway) = gateway {
         args.push("-NextHop".to_string());
-        args.push(gateway.to_string());
+        args.push(ps_value(&gateway.to_string()));
     }
     if let Some(alias) = iface_alias {
         args.push("-InterfaceAlias".to_string());
-        args.push(alias.to_string());
+        args.push(ps_value(alias));
     }
     match cmd {
         RouteCmd::Add | RouteCmd::Del => {
@@ -220,11 +233,11 @@ mod tests {
             strs(&[
                 "New-NetRoute",
                 "-DestinationPrefix",
-                "203.0.113.77/32",
+                "'203.0.113.77/32'",
                 "-NextHop",
-                "192.168.1.1",
+                "'192.168.1.1'",
                 "-InterfaceAlias",
-                "Ethernet",
+                "'Ethernet'",
                 "-PolicyStore",
                 "ActiveStore",
                 "-ErrorAction",
@@ -245,11 +258,11 @@ mod tests {
             strs(&[
                 "New-NetRoute",
                 "-DestinationPrefix",
-                "2001:db8::10/128",
+                "'2001:db8::10/128'",
                 "-NextHop",
-                "fd00::1",
+                "'fd00::1'",
                 "-InterfaceAlias",
-                "vEthernet (WSL)",
+                "'vEthernet (WSL)'",
                 "-PolicyStore",
                 "ActiveStore",
                 "-ErrorAction",
@@ -265,7 +278,7 @@ mod tests {
             strs(&[
                 "New-NetRoute",
                 "-DestinationPrefix",
-                "203.0.113.77/32",
+                "'203.0.113.77/32'",
                 "-PolicyStore",
                 "ActiveStore",
                 "-ErrorAction",
@@ -281,9 +294,9 @@ mod tests {
             strs(&[
                 "New-NetRoute",
                 "-DestinationPrefix",
-                "10.1.2.3/32",
+                "'10.1.2.3/32'",
                 "-NextHop",
-                "10.0.0.1",
+                "'10.0.0.1'",
                 "-PolicyStore",
                 "ActiveStore",
                 "-ErrorAction",
@@ -295,9 +308,9 @@ mod tests {
             strs(&[
                 "New-NetRoute",
                 "-DestinationPrefix",
-                "10.1.2.3/32",
+                "'10.1.2.3/32'",
                 "-InterfaceAlias",
-                "Wi-Fi",
+                "'Wi-Fi'",
                 "-PolicyStore",
                 "ActiveStore",
                 "-ErrorAction",
@@ -318,11 +331,11 @@ mod tests {
             strs(&[
                 "Remove-NetRoute",
                 "-DestinationPrefix",
-                "203.0.113.77/32",
+                "'203.0.113.77/32'",
                 "-NextHop",
-                "192.168.1.1",
+                "'192.168.1.1'",
                 "-InterfaceAlias",
-                "Ethernet",
+                "'Ethernet'",
                 "-PolicyStore",
                 "ActiveStore",
                 "-ErrorAction",
@@ -339,7 +352,7 @@ mod tests {
             strs(&[
                 "Remove-NetRoute",
                 "-DestinationPrefix",
-                "2001:db8::10/128",
+                "'2001:db8::10/128'",
                 "-PolicyStore",
                 "ActiveStore",
                 "-ErrorAction",
@@ -356,7 +369,7 @@ mod tests {
             strs(&[
                 "Get-NetRoute",
                 "-DestinationPrefix",
-                "203.0.113.77/32",
+                "'203.0.113.77/32'",
                 "-ErrorAction",
                 "SilentlyContinue",
             ])
@@ -366,7 +379,7 @@ mod tests {
             strs(&[
                 "Get-NetRoute",
                 "-DestinationPrefix",
-                "2001:db8::10/128",
+                "'2001:db8::10/128'",
                 "-ErrorAction",
                 "SilentlyContinue",
             ])
@@ -385,15 +398,69 @@ mod tests {
             strs(&[
                 "Get-NetRoute",
                 "-DestinationPrefix",
-                "203.0.113.77/32",
+                "'203.0.113.77/32'",
                 "-NextHop",
-                "192.168.1.1",
+                "'192.168.1.1'",
                 "-InterfaceAlias",
-                "Ethernet",
+                "'Ethernet'",
                 "-ErrorAction",
                 "SilentlyContinue",
             ])
         );
+    }
+
+    /// Пин безопасности: метасимволы PowerShell внутри значений
+    /// (враждебное имя интерфейса) обязаны оказаться полностью внутри
+    /// PS-одинарных кавычек — вне кавычек `|`/`;`/backtick/`$` в
+    /// векторе аргументов недопустимы.
+    #[test]
+    fn adversarial_alias_is_fully_quoted_literal() {
+        let hostile = "Ethernet|calc; rm -rf C:\\ 'oops'`n$(whoami)";
+        let args = route_ps_args(
+            RouteCmd::Add,
+            ip("203.0.113.77"),
+            Some(ip("192.168.1.1")),
+            Some(hostile),
+        );
+        // Точное значение-литерал: одинарные кавычки внутри удвоены,
+        // всё остальное — как есть, внутри одной пары кавычек.
+        let expected_alias = "'Ethernet|calc; rm -rf C:\\ ''oops''`n$(whoami)'".to_string();
+        assert!(
+            args.contains(&expected_alias),
+            "алиас не заквочен: {args:?}"
+        );
+        // Токен сразу после флага значения обязан быть PS-литералом в
+        // кавычках (контролируемые enum-литералы ActiveStore/Stop/…
+        // идут в других позициях и голыми — это осознанно).
+        let value_flags = ["-DestinationPrefix", "-NextHop", "-InterfaceAlias"];
+        for (i, token) in args.iter().enumerate() {
+            if value_flags.contains(&token.as_str()) {
+                let value = &args[i + 1];
+                assert!(
+                    value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2,
+                    "значение {value:?} после {token} не заквочено"
+                );
+            }
+        }
+        // Голые метасимволы вне кавычек (в флагах/литералах их нет):
+        for token in &args {
+            if !(token.starts_with('\'') && token.ends_with('\'')) {
+                assert!(
+                    !token.contains('|') && !token.contains(';') && !token.contains('`'),
+                    "метасимвол вне кавычек: {token:?}"
+                );
+            }
+        }
+    }
+
+    /// Флаги остаются голыми: квотированный `-Confirm:$false` перестал бы
+    /// быть переключателем (первоначальный дефект раунда 1).
+    #[test]
+    fn flags_stay_unquoted() {
+        let args = route_ps_args(RouteCmd::Del, ip("203.0.113.77"), None, None);
+        assert_eq!(args.last().unwrap(), "-Confirm:$false");
+        assert!(args.iter().any(|a| a == "Stop"));
+        assert!(!args.iter().any(|a| a.contains("'Stop'")));
     }
 
     #[test]
