@@ -7,12 +7,16 @@
 
 mod render;
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use bottle_core::ipc::{CliReply, CliRequest};
-use clap::{Parser, Subcommand};
+use bottle_core::profile::{
+    BottleKind, BottleProfile, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig,
+};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -25,6 +29,10 @@ struct Cli {
     command: Command,
 }
 
+/// `Create` — самый крупный вариант (флаги создания профиля);
+/// command-перечисление обрабатывается один раз при старте,
+/// боксирование вариативного размера не даёт выгоды — допускаем.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Список бутылок в хранилище
@@ -48,11 +56,136 @@ enum Command {
     Status,
     /// Диагностика окружения (WSL, аплаенс, служба, порты)
     Doctor,
+    /// Создать бутылку из профиля
+    Create(CreateArgs),
+    /// Удалить бутылку (профиль и конфиг из хранилища)
+    Delete {
+        /// Идентификатор бутылки
+        id: String,
+    },
     /// Журналы диагностики
     Logs {
         #[command(subcommand)]
         command: LogsCommand,
     },
+}
+
+/// Аргументы `bottle create` (спека §5.1). Обязательность полей по
+/// типу бутылки (env — protocol/config, host — vpn/endpoints)
+/// валидирует демон — единый источник правил в `bottle_core::profile`.
+#[derive(Debug, clap::Args)]
+struct CreateArgs {
+    /// Идентификатор бутылки ([a-z0-9-])
+    id: String,
+    /// Человекочитаемое имя
+    #[arg(long)]
+    name: String,
+    /// Тип бутылки: env — изолирующее окружение WSL,
+    /// host — фирменный клиент на хосте
+    #[arg(long, value_enum)]
+    kind: KindArg,
+    /// Протокол туннеля (для kind=env)
+    #[arg(long, value_enum)]
+    protocol: Option<ProtocolArg>,
+    /// Путь к файлу конфигурации туннеля (для kind=env; копируется
+    /// в хранилище)
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Путь к фирменному VPN-клиенту (для kind=host)
+    #[arg(long)]
+    vpn: Option<String>,
+    /// Аргументы запуска клиента (для kind=host)
+    #[arg(long)]
+    vpn_args: Option<String>,
+    /// Endpoint VPN (для kind=host; повторяется для каждого адреса)
+    #[arg(long = "endpoint")]
+    endpoints: Vec<String>,
+    /// Имя интерфейса клиента (для kind=host; по умолчанию —
+    /// автоопределение)
+    #[arg(long = "vpn-interface")]
+    vpn_interface: Option<String>,
+    /// Порт SOCKS5 на 127.0.0.1 (0 — автоподбор)
+    #[arg(long, default_value_t = 0)]
+    socks5: u16,
+    /// TCP-проброс вида host:port (повторяется; порт слушателя —
+    /// автоподбор)
+    #[arg(long = "forward")]
+    forwards: Vec<String>,
+    /// DNS внутри бутылки
+    #[arg(long)]
+    dns: Option<IpAddr>,
+    /// Команда, запускаемая после подъёма бутылки
+    #[arg(long)]
+    launch: Option<String>,
+    /// Перезаписать существующую бутылку этого id
+    #[arg(long)]
+    force: bool,
+}
+
+/// Тип бутылки для флага `--kind` (локальное значение-enum для clap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum KindArg {
+    /// Изолирующее окружение (WSL).
+    Env,
+    /// Фирменный клиент на хосте.
+    Host,
+}
+
+/// Протокол туннеля для флага `--protocol`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ProtocolArg {
+    /// WireGuard (userspace wireguard-go).
+    Wireguard,
+    /// OpenVPN.
+    Openvpn,
+}
+
+impl Command {
+    /// Собирает профиль из флагов `create` (маппинг kind/protocol в
+    /// типы ядра; цели пробросов — как есть, валидация на демоне).
+    fn create_profile(args: &CreateArgs) -> BottleProfile {
+        let vpn = match args.kind {
+            KindArg::Env => VpnConfig::Env {
+                protocol: match args.protocol {
+                    Some(ProtocolArg::Openvpn) => TunnelProtocol::OpenVpn,
+                    Some(ProtocolArg::Wireguard) | None => TunnelProtocol::WireGuard,
+                },
+                config: args
+                    .config
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            },
+            KindArg::Host => VpnConfig::Host {
+                client: args.vpn.clone().unwrap_or_default(),
+                args: args.vpn_args.clone(),
+                endpoints: args.endpoints.clone(),
+                interface: args.vpn_interface.clone(),
+            },
+        };
+        BottleProfile {
+            id: args.id.clone(),
+            name: args.name.clone(),
+            kind: match args.kind {
+                KindArg::Env => BottleKind::Env,
+                KindArg::Host => BottleKind::Host,
+            },
+            vpn,
+            expose: ExposeConfig {
+                socks5: args.socks5,
+                forwards: args
+                    .forwards
+                    .iter()
+                    .map(|target| ForwardSpec {
+                        listen: 0,
+                        target: target.clone(),
+                    })
+                    .collect(),
+                dns: args.dns,
+                launch: args.launch.clone(),
+            },
+        }
+    }
 }
 
 /// Подкоманды `bottle logs`.
@@ -79,6 +212,11 @@ impl Command {
             Command::Stop { id } => CliRequest::Stop { id: id.clone() },
             Command::Status => CliRequest::Status,
             Command::Doctor => CliRequest::Doctor,
+            Command::Create(args) => CliRequest::Create {
+                profile: Self::create_profile(args),
+                force: args.force,
+            },
+            Command::Delete { id } => CliRequest::Delete { id: id.clone() },
             Command::Logs {
                 command: LogsCommand::Export { dest },
             } => CliRequest::LogsExport { dest: dest.clone() },
@@ -185,6 +323,17 @@ fn handle_reply(command: &Command, reply: CliReply) -> ExitCode {
         ) => {
             println!("Журналы выгружены: {path}");
             println!("{}", render::LOGS_EXPORT_WARNING);
+            ExitCode::SUCCESS
+        }
+        (Command::Create { .. }, CliReply::Created { id }) => {
+            println!("Бутылка {id} создана (профиль и конфиг записаны в хранилище)");
+            ExitCode::SUCCESS
+        }
+        (Command::Delete { .. }, CliReply::Deleted { id, warning }) => {
+            println!("Бутылка {id} удалена");
+            if let Some(warning) = warning {
+                eprintln!("Внимание: {warning}");
+            }
             ExitCode::SUCCESS
         }
         (Command::Doctor, CliReply::DoctorReport { items }) => {
@@ -342,6 +491,160 @@ mod tests {
             parse(&["bottle", "stop", "office-a"]),
             Command::Stop { id } if id == "office-a"
         ));
+    }
+
+    /// Полный набор флагов create для env-бутылки: parse → to_request
+    /// собирает корректный профиль.
+    #[test]
+    fn create_env_maps_flags_to_profile() {
+        let command = parse(&[
+            "bottle",
+            "create",
+            "office-a",
+            "--name",
+            "Офис А",
+            "--kind",
+            "env",
+            "--protocol",
+            "wireguard",
+            "--config",
+            r"C:\wg\office.conf",
+            "--socks5",
+            "1080",
+            "--forward",
+            "10.20.30.15:3389",
+            "--dns",
+            "10.20.30.1",
+            "--launch",
+            "mstsc",
+        ]);
+        assert_eq!(
+            command.to_request(),
+            CliRequest::Create {
+                profile: bottle_core::profile::BottleProfile {
+                    id: "office-a".to_string(),
+                    name: "Офис А".to_string(),
+                    kind: bottle_core::profile::BottleKind::Env,
+                    vpn: bottle_core::profile::VpnConfig::Env {
+                        protocol: bottle_core::profile::TunnelProtocol::WireGuard,
+                        config: r"C:\wg\office.conf".to_string(),
+                    },
+                    expose: bottle_core::profile::ExposeConfig {
+                        socks5: 1080,
+                        forwards: vec![bottle_core::profile::ForwardSpec {
+                            listen: 0,
+                            target: "10.20.30.15:3389".to_string(),
+                        }],
+                        dns: Some("10.20.30.1".parse().unwrap()),
+                        launch: Some("mstsc".to_string()),
+                    },
+                },
+                force: false,
+            }
+        );
+    }
+
+    /// host-бутылка: --vpn/--vpn-args/--endpoint/--vpn-interface.
+    #[test]
+    fn create_host_maps_flags_to_profile() {
+        let command = parse(&[
+            "bottle",
+            "create",
+            "corp",
+            "--name",
+            "Корп",
+            "--kind",
+            "host",
+            "--vpn",
+            r"C:\vpn.exe",
+            "--vpn-args",
+            "connect office",
+            "--endpoint",
+            "vpn1.example.com",
+            "--endpoint",
+            "vpn2.example.com",
+            "--vpn-interface",
+            "Vendor Adapter",
+        ]);
+        assert_eq!(
+            command.to_request(),
+            CliRequest::Create {
+                profile: bottle_core::profile::BottleProfile {
+                    id: "corp".to_string(),
+                    name: "Корп".to_string(),
+                    kind: bottle_core::profile::BottleKind::Host,
+                    vpn: bottle_core::profile::VpnConfig::Host {
+                        client: r"C:\vpn.exe".to_string(),
+                        args: Some("connect office".to_string()),
+                        endpoints: vec![
+                            "vpn1.example.com".to_string(),
+                            "vpn2.example.com".to_string(),
+                        ],
+                        interface: Some("Vendor Adapter".to_string()),
+                    },
+                    expose: bottle_core::profile::ExposeConfig {
+                        socks5: 0,
+                        forwards: vec![],
+                        dns: None,
+                        launch: None,
+                    },
+                },
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_create_force_and_delete() {
+        assert!(matches!(
+            parse(&[
+                "bottle", "create", "a", "--name", "N", "--kind", "host",
+                "--vpn", "v.exe", "--endpoint", "e.example", "--force"
+            ]),
+            Command::Create(args) if args.force
+        ));
+        assert_eq!(
+            parse(&["bottle", "delete", "office-a"]).to_request(),
+            CliRequest::Delete {
+                id: "office-a".to_string()
+            }
+        );
+    }
+
+    /// Ответы Created/Deleted: успех; warning демона доходит (код 0).
+    #[test]
+    fn created_deleted_replies_are_success() {
+        assert_eq!(
+            handle_reply(
+                &parse(&[
+                    "bottle",
+                    "create",
+                    "a",
+                    "--name",
+                    "N",
+                    "--kind",
+                    "host",
+                    "--vpn",
+                    "v.exe",
+                    "--endpoint",
+                    "e.example"
+                ]),
+                CliReply::Created {
+                    id: "a".to_string()
+                },
+            ),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            handle_reply(
+                &parse(&["bottle", "delete", "a"]),
+                CliReply::Deleted {
+                    id: "a".to_string(),
+                    warning: Some("файл конфигурации отсутствовал".to_string()),
+                },
+            ),
+            ExitCode::SUCCESS
+        );
     }
 
     /// Doctor: exit 0 без fail (warn допустим), fail — exit 1.

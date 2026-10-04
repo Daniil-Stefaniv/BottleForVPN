@@ -2486,6 +2486,38 @@ mod tests {
         );
     }
 
+    /// Удаление активной бутылки через диспетчер — отказ с подсказкой
+    /// остановить; файлы профиля остаются на месте.
+    #[tokio::test]
+    async fn dispatch_delete_of_active_bottle_is_refused() {
+        let (tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let (manager, store) = manager_with(store.data_root(), fake);
+        manager.start("office-a").await.expect("бутылка поднята");
+
+        let reply = crate::pipe::dispatch(
+            &store,
+            Some(&manager),
+            None,
+            bottle_core::ipc::CliRequest::Delete {
+                id: "office-a".to_string(),
+            },
+        )
+        .await;
+
+        let CliReply::Error { message } = reply else {
+            panic!("ожидали Error, получили {reply:?}");
+        };
+        assert!(
+            message.contains("остановите"),
+            "подсказка остановки: {message}"
+        );
+        assert!(
+            tmp.path().join("store/bottles/office-a.toml").exists(),
+            "профиль не тронут"
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_wires_start_stop_status_and_show_runtime_to_manager() {
         let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));

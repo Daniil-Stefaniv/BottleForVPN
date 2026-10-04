@@ -9,7 +9,7 @@
 //! экземпляров канала; долгий `start` одного клиента не блокирует
 //! ответы остальным (T13).
 
-use bottle_core::ipc::{BottleSummary, CliReply, CliRequest};
+use bottle_core::ipc::{BottleState, BottleSummary, CliReply, CliRequest};
 use bottle_core::profile::BottleProfile;
 
 use crate::appliance::WslRunner;
@@ -103,6 +103,37 @@ pub async fn dispatch(
                 message: MANAGER_NOT_WIRED.to_string(),
             },
         },
+        CliRequest::Create { profile, force } => create_bottle(store, &profile, force).await,
+        CliRequest::Delete { id } => {
+            // Активную бутылку удалять нельзя (start держит слушатели
+            // и сессию аплаенса); без менеджера активных нет.
+            let active = match manager {
+                Some(manager) => manager
+                    .status()
+                    .await
+                    .into_iter()
+                    .any(|state| state.id == id && state.state != BottleState::Stopped),
+                None => false,
+            };
+            if active {
+                return CliReply::Error {
+                    message: format!(
+                        "бутылка {id} активна — остановите её перед удалением (bottle stop {id})"
+                    ),
+                };
+            }
+            match store.delete(&id) {
+                Ok(conf_existed) => CliReply::Deleted {
+                    id,
+                    warning: (!conf_existed).then(|| {
+                        "файл конфигурации VPN отсутствовал (удалён только профиль)".to_string()
+                    }),
+                },
+                Err(error) => CliReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         CliRequest::Doctor => match (manager, wsl) {
             (Some(manager), Some(wsl)) => CliReply::DoctorReport {
                 items: crate::doctor::run(wsl, store, manager).await,
@@ -142,6 +173,46 @@ fn list_summaries(store: &Store) -> Vec<BottleSummary> {
         }
     }
     bottles
+}
+
+/// Создание бутылки: валидация профиля → отказ при занятом id без
+/// `force` → сохранение (копия конфига — семантика `Store::save`).
+/// Ошибки валидации переводятся в понятные русские тексты create.
+async fn create_bottle(store: &Store, profile: &BottleProfile, force: bool) -> CliReply {
+    use bottle_core::profile::{validate_profile, ProfileError};
+    if let Err(error) = validate_profile(profile) {
+        return CliReply::Error {
+            message: match error {
+                ProfileError::MissingField => concat!(
+                    "не заполнены обязательные поля: для env — protocol и config, ",
+                    "для host — vpn (клиент) и минимум один endpoint"
+                )
+                .to_string(),
+                ProfileError::InvalidId => format!(
+                    "некорректный id «{}»: строчные буквы, цифры и дефисы",
+                    profile.id
+                ),
+                other => format!("профиль не прошёл валидацию: {other}"),
+            },
+        };
+    }
+    if !force && store.load(&profile.id).is_ok() {
+        return CliReply::Error {
+            message: format!(
+                "бутылка {} уже существует; используйте --force для перезаписи \
+                 (профиль и конфиг будут заменены)",
+                profile.id
+            ),
+        };
+    }
+    match store.save(profile) {
+        Ok(()) => CliReply::Created {
+            id: profile.id.clone(),
+        },
+        Err(error) => CliReply::Error {
+            message: error.to_string(),
+        },
+    }
 }
 
 /// Профиль для ответа `Show`: `None` при любой ошибке чтения.
@@ -281,7 +352,9 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use bottle_core::profile::{BottleKind, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig};
+    use bottle_core::profile::{
+        validate_profile, BottleKind, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig,
+    };
 
     /// Env-профиль с исходным конфигом `config` (до нормализации save).
     fn env_profile(id: &str, config: &str) -> BottleProfile {
@@ -470,6 +543,171 @@ endpoints = ["e.example"]
                 "без менеджера команды управления отвечают переходной ошибкой"
             );
         }
+    }
+
+    /// Создание env-бутылки: конфиг скопирован, профиль записан.
+    #[tokio::test]
+    async fn create_env_copies_config_and_writes_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("wg-office.conf");
+        fs::write(&src, "wg-secret").unwrap();
+        let root = tmp.path().join("store");
+        let store = Store::open(&root).unwrap();
+
+        let reply = dispatch(
+            &store,
+            None,
+            None,
+            CliRequest::Create {
+                profile: env_profile("office-a", src.to_str().unwrap()),
+                force: false,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            reply,
+            CliReply::Created {
+                id: "office-a".into()
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("bottles").join("office-a.conf")).unwrap(),
+            "wg-secret"
+        );
+        assert!(root.join("bottles").join("office-a.toml").exists());
+    }
+
+    /// Занятый id — отказ без --force (Review Focus M3 #5): профиль и
+    /// конфиг пользователя не перезатираются.
+    #[tokio::test]
+    async fn create_taken_id_is_refused_without_force() {
+        let (_tmp, store) = store_with_broken_profile();
+        let src = store.data_root().join("bottles").join("office-a.conf");
+
+        let reply = dispatch(
+            &store,
+            None,
+            None,
+            CliRequest::Create {
+                profile: env_profile("office-a", src.to_str().unwrap()),
+                force: false,
+            },
+        )
+        .await;
+
+        let CliReply::Error { message } = reply else {
+            panic!("ожидали Error, получили {reply:?}");
+        };
+        assert!(message.contains("--force"), "подсказка --force: {message}");
+    }
+
+    /// Создание с --force перезаписывает существующий профиль.
+    #[tokio::test]
+    async fn create_with_force_overwrites() {
+        let (_tmp, store) = store_with_broken_profile();
+        let src = store.data_root().join("bottles").join("office-a.conf");
+
+        let reply = dispatch(
+            &store,
+            None,
+            None,
+            CliRequest::Create {
+                profile: env_profile("office-a", src.to_str().unwrap()),
+                force: true,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            reply,
+            CliReply::Created {
+                id: "office-a".into()
+            }
+        );
+    }
+
+    /// host без endpoint'ов — ошибка валидации при создании.
+    #[tokio::test]
+    async fn create_host_without_endpoints_is_rejected() {
+        let (_tmp, store) = empty_store();
+        let mut profile = host_profile("corp-vpn");
+        if let VpnConfig::Host { endpoints, .. } = &mut profile.vpn {
+            endpoints.clear();
+        }
+        assert!(validate_profile(&profile).is_err(), "профиль невалиден");
+
+        let reply = dispatch(
+            &store,
+            None,
+            None,
+            CliRequest::Create {
+                profile,
+                force: false,
+            },
+        )
+        .await;
+
+        let CliReply::Error { message } = reply else {
+            panic!("ожидали Error, получили {reply:?}");
+        };
+        assert!(
+            message.contains("endpoint") || message.contains("поле"),
+            "понятная ошибка: {message}"
+        );
+    }
+
+    /// Удаление остановленной бутылки: файлы снесены.
+    #[tokio::test]
+    async fn delete_stopped_removes_files() {
+        let (_tmp, store) = store_with_broken_profile();
+
+        let reply = dispatch(
+            &store,
+            None,
+            None,
+            CliRequest::Delete {
+                id: "office-a".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            reply,
+            CliReply::Deleted {
+                id: "office-a".into(),
+                warning: None
+            }
+        );
+        assert!(!store
+            .data_root()
+            .join("bottles")
+            .join("office-a.toml")
+            .exists());
+        assert!(!store
+            .data_root()
+            .join("bottles")
+            .join("office-a.conf")
+            .exists());
+    }
+
+    /// Удаление отсутствующего профиля — отказ, не Created-подобный
+    /// молчаливый успех.
+    #[tokio::test]
+    async fn delete_missing_profile_is_error() {
+        let (_tmp, store) = empty_store();
+
+        let reply = dispatch(
+            &store,
+            None,
+            None,
+            CliRequest::Delete {
+                id: "ghost".to_string(),
+            },
+        )
+        .await;
+
+        assert!(matches!(reply, CliReply::Error { .. }));
     }
 
     /// Имя тестового канала: уникально в пределах прогона (параллельные

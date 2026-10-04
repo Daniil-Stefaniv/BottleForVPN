@@ -108,6 +108,25 @@ impl Store {
     fn profile_path(&self, id: &str) -> PathBuf {
         self.root.join("bottles").join(format!("{id}.toml"))
     }
+
+    /// Удаляет профиль и копию конфига (`bottles/<id>.toml` и
+    /// `bottles/<id>.conf`); возвращает, существовал ли файл конфига
+    /// (отсутствующий конфиг — предупреждение, не ошибка). Профиль
+    /// обязан существовать — иначе [`DaemonError::NotFound`].
+    pub fn delete(&self, id: &str) -> Result<bool, DaemonError> {
+        validate_id(id)?;
+        let toml_path = self.profile_path(id);
+        if !toml_path.exists() {
+            return Err(DaemonError::NotFound { id: id.to_string() });
+        }
+        let conf_path = self.root.join("bottles").join(format!("{id}.conf"));
+        let conf_existed = conf_path.exists();
+        fs::remove_file(&toml_path)?;
+        if conf_existed {
+            fs::remove_file(&conf_path)?;
+        }
+        Ok(conf_existed)
+    }
 }
 
 /// Читает, разбирает и сверяет профиль в `path` с ожидаемым id файла.
@@ -450,6 +469,52 @@ endpoints = ["e.example"]
         }
         // Профиль не создан: сначала конфиг, потом запись TOML.
         assert!(!root.join("bottles").join("office.toml").exists());
+    }
+
+    /// Удаление env-профиля сносит и TOML, и копию конфига.
+    #[test]
+    fn delete_removes_toml_and_conf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("wg-a.conf");
+        fs::write(&src, "wg-secret").unwrap();
+        let root = tmp.path().join("store");
+        let store = Store::open(&root).unwrap();
+        store
+            .save(&env_profile("a", src.to_str().unwrap()))
+            .unwrap();
+
+        let conf_existed = store.delete("a").unwrap();
+
+        assert!(conf_existed, "конфиг существовал до удаления");
+        assert!(!root.join("bottles").join("a.toml").exists());
+        assert!(!root.join("bottles").join("a.conf").exists());
+        assert!(matches!(store.load("a"), Err(DaemonError::NotFound { .. })));
+    }
+
+    /// Удаление host-профиля (без конфига): TOML удалён, конфига не было.
+    #[test]
+    fn delete_without_conf_reports_missing_conf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("store");
+        let store = Store::open(&root).unwrap();
+        store.save(&host_profile("corp")).unwrap();
+
+        let conf_existed = store.delete("corp").unwrap();
+
+        assert!(!conf_existed, "конфига у host-профиля нет");
+        assert!(!root.join("bottles").join("corp.toml").exists());
+    }
+
+    /// Удаление отсутствующего профиля — NotFound.
+    #[test]
+    fn delete_missing_profile_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("store")).unwrap();
+
+        assert!(matches!(
+            store.delete("ghost"),
+            Err(DaemonError::NotFound { .. })
+        ));
     }
 
     #[cfg(unix)]

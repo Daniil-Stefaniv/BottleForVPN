@@ -15,6 +15,11 @@ use crate::protocol::ForwardPort;
 pub const DAEMON_PIPE: &str = r"\\.\pipe\bottled";
 
 /// Запрос CLI к демону.
+///
+/// `Create` крупнее остальных вариантов из-за встроенного профиля;
+/// это редкое сообщение control-канала, боксирование не выполняется
+/// (тот же прецедент, что у `CliReply::Show`).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CliRequest {
     /// Список бутылок из хранилища (с известным состоянием).
@@ -32,6 +37,17 @@ pub enum CliRequest {
     LogsExport { dest: Option<PathBuf> },
     /// Диагностика окружения (WSL, аплаенс, служба, профили, порты).
     Doctor,
+    /// Создать бутылку из профиля; `force` разрешает перезапись
+    /// существующего id (профиль и конфиг пользователя теряются).
+    Create {
+        /// Профиль (для env `vpn.config` — путь к исходному конфигу,
+        /// демон копирует его в хранилище).
+        profile: BottleProfile,
+        /// Перезаписать существующий профиль этого id.
+        force: bool,
+    },
+    /// Удалить бутылку (отказ, если она активна).
+    Delete { id: String },
 }
 
 /// Ответ демона CLI.
@@ -63,6 +79,11 @@ pub enum CliReply {
     Path(String),
     /// Ответ на `Doctor`: строки проверок.
     DoctorReport { items: Vec<CheckItem> },
+    /// Ответ на `Create`: бутылка создана (профиль и конфиг записаны).
+    Created { id: String },
+    /// Ответ на `Delete`: файлы профиля удалены; `warning` — например,
+    /// конфигурационного файла уже не было.
+    Deleted { id: String, warning: Option<String> },
     /// Ошибка выполнения команды.
     Error { message: String },
 }
@@ -235,6 +256,17 @@ mod tests {
                 dest: Some(PathBuf::from(r"C:\tmp\logs.zip")),
             },
             CliRequest::Doctor,
+            CliRequest::Create {
+                profile: sample_profile(),
+                force: false,
+            },
+            CliRequest::Create {
+                profile: sample_profile(),
+                force: true,
+            },
+            CliRequest::Delete {
+                id: "office-a".to_string(),
+            },
         ];
         for req in requests {
             assert_eq!(round_trip(req.clone()), req);
@@ -339,6 +371,17 @@ mod tests {
                         detail: "агент не отвечает".to_string(),
                     },
                 ],
+            },
+            CliReply::Created {
+                id: "office-a".to_string(),
+            },
+            CliReply::Deleted {
+                id: "office-a".to_string(),
+                warning: None,
+            },
+            CliReply::Deleted {
+                id: "office-a".to_string(),
+                warning: Some("файл конфигурации отсутствовал".to_string()),
             },
             CliReply::Error {
                 message: "bottle not found".to_string(),

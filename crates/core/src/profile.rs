@@ -187,6 +187,19 @@ pub fn render_profile(p: &BottleProfile) -> Result<String, ProfileError> {
     Ok(toml::to_string(p)?)
 }
 
+/// Валидирует готовый профиль (создание через `bottle create`): тот же
+/// набор проверок, что у [`parse_profile`] — id, форма `[vpn]` по kind,
+/// обязательные поля (env — config; host — client и endpoints), цели
+/// пробросов. Порты — уже `u16` по построению структуры.
+pub fn validate_profile(p: &BottleProfile) -> Result<(), ProfileError> {
+    validate_id(&p.id)?;
+    validate_vpn(p.kind, &p.vpn)?;
+    for forward in &p.expose.forwards {
+        validate_target(&forward.target)?;
+    }
+    Ok(())
+}
+
 /// Проверяет соответствие формы `[vpn]` значению `kind` и непустоту
 /// обязательных полей.
 fn validate_vpn(kind: BottleKind, vpn: &VpnConfig) -> Result<(), ProfileError> {
@@ -631,5 +644,102 @@ protocol = "pptp"
 config = "c.conf"
 "#;
         assert!(matches!(parse_profile(text), Err(ProfileError::Toml(_))));
+    }
+
+    // ---------------------------------------------------------------
+    // validate_profile (создание через `bottle create`).
+    // ---------------------------------------------------------------
+
+    fn valid_env_profile() -> BottleProfile {
+        BottleProfile {
+            id: "office-a".to_string(),
+            name: "Офис А".to_string(),
+            kind: BottleKind::Env,
+            vpn: VpnConfig::Env {
+                protocol: TunnelProtocol::WireGuard,
+                config: "wg-office-a.conf".to_string(),
+            },
+            expose: ExposeConfig {
+                socks5: 0,
+                forwards: vec![],
+                dns: None,
+                launch: None,
+            },
+        }
+    }
+
+    #[test]
+    fn validate_profile_accepts_valid_env_and_host() {
+        let mut env = valid_env_profile();
+        assert!(validate_profile(&env).is_ok());
+
+        env.kind = BottleKind::Host;
+        env.vpn = VpnConfig::Host {
+            client: r"C:\vpn.exe".to_string(),
+            args: None,
+            endpoints: vec!["vpn.example.com".to_string()],
+            interface: None,
+        };
+        assert!(validate_profile(&env).is_ok());
+    }
+
+    /// Обязательные поля host (Review Focus M3 #5): без endpoint'ов
+    /// или без клиента создание невозможно.
+    #[test]
+    fn validate_profile_rejects_host_without_endpoints_or_client() {
+        let mut p = valid_env_profile();
+        p.kind = BottleKind::Host;
+        p.vpn = VpnConfig::Host {
+            client: r"C:\vpn.exe".to_string(),
+            args: None,
+            endpoints: vec![],
+            interface: None,
+        };
+        assert!(matches!(
+            validate_profile(&p),
+            Err(ProfileError::MissingField)
+        ));
+
+        p.vpn = VpnConfig::Host {
+            client: String::new(),
+            args: None,
+            endpoints: vec!["vpn.example.com".to_string()],
+            interface: None,
+        };
+        assert!(matches!(
+            validate_profile(&p),
+            Err(ProfileError::MissingField)
+        ));
+    }
+
+    /// env без конфига (пустой путь) невозможен.
+    #[test]
+    fn validate_profile_rejects_env_without_config() {
+        let mut p = valid_env_profile();
+        p.vpn = VpnConfig::Env {
+            protocol: TunnelProtocol::WireGuard,
+            config: String::new(),
+        };
+        assert!(matches!(
+            validate_profile(&p),
+            Err(ProfileError::MissingField)
+        ));
+    }
+
+    #[test]
+    fn validate_profile_rejects_bad_id_and_target() {
+        let mut p = valid_env_profile();
+        p.id = "../evil".to_string();
+        assert!(matches!(validate_profile(&p), Err(ProfileError::InvalidId)));
+
+        let mut p = valid_env_profile();
+        p.expose.forwards = vec![ForwardSpec {
+            listen: 0,
+            target: "no-port".to_string(),
+        }];
+        assert!(matches!(
+            validate_profile(&p),
+            Err(ProfileError::InvalidTarget)
+        ));
     }
 }
