@@ -17,7 +17,9 @@ bottle-core = { path = "../core" }
 # graceful-остановка, run_ps: процесс PowerShell с таймаутом.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "net", "io-util", "sync"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+# Файловый JSONL-журнал службы: ежедневная ротация (M3).
+tracing-appender = "0.2"
 # Кадры LengthJsonCodec pipe-сервера (SVC_PIPE) + CancellationToken.
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
@@ -31,6 +33,8 @@ serde_json = "1"
 [dev-dependencies]
 # Тесты журнала работают во временном каталоге.
 tempfile = "3"
+# Тесты ретеншна журналов ставят файлам mtime «31 день назад».
+filetime = "0.2"
 
 # Обвязка Windows-службы: SCM dispatcher, install/uninstall, статусы;
 # DACL именованного канала (SDDL → SECURITY_ATTRIBUTES) и коды ошибок

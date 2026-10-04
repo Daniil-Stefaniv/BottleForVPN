@@ -111,7 +111,7 @@ fn dispatch(mode: Mode) -> ExitCode {
 /// Отладочный режим без SCM: полный цикл службы (журнал, сверка,
 /// pipe-сервер), остановка по Ctrl+C.
 fn run_console() -> ExitCode {
-    init_tracing();
+    init_logging();
     println!("bottle-svc: консольный режим отладки (без SCM)");
     println!(
         "bottle-svc: журнал маршрутов: {}",
@@ -174,8 +174,21 @@ async fn run_server(shutdown: CancellationToken) -> Result<(), String> {
         .map_err(|error| format!("pipe-сервер службы маршрутов: {error}"))
 }
 
-/// Инициализирует логирование: уровень из `RUST_LOG`, по умолчанию
-/// `info` (единый паттерн с `bottled`).
+/// Инициализирует логирование службы: файловый JSONL-журнал в
+/// `%PROGRAMDATA%\BottleForApps\logs` + stderr (виден только в
+/// `--console`). Сбой файла не фатален — служба работает со
+/// stderr-логами.
+fn init_logging() {
+    let dir = svc::logging::default_logs_dir();
+    if let Err(error) = svc::logging::init_file_logging(&dir, "bottle-svc") {
+        eprintln!("bottle-svc: файловый журнал недоступен ({error}); пишу только в stderr");
+        init_tracing();
+    }
+}
+
+/// Инициализирует логирование (fallback без файлового журнала):
+/// уровень из `RUST_LOG`, по умолчанию `info` (единый паттерн с
+/// `bottled`).
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -220,9 +233,9 @@ mod win_service {
     /// SCM и блокирует поток до остановки службы. Требует запуска
     /// от SCM (`sc start`/автозапуск); иначе — отказ с подсказкой.
     pub fn run_as_service() -> ExitCode {
-        // У процесса службы нет stdout/stderr — только трейсинг
-        // (журнал маршрутов добавит задача 5).
-        super::init_tracing();
+        // У процесса службы нет stdout/stderr — только файловый журнал
+        // (плюс журнал маршрутов отдельным JSONL).
+        super::init_logging();
         match service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

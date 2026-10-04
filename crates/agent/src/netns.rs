@@ -448,7 +448,7 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> Result<(), AgentError> {
 
 /// Выставляет точные права — no-op вне unix.
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> Result<(), AgentError> {
+pub(crate) fn set_mode(_path: &Path, _mode: u32) -> Result<(), AgentError> {
     Ok(())
 }
 

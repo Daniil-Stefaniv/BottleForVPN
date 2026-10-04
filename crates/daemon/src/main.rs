@@ -43,6 +43,7 @@ mod host_net;
 mod instance;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod launch;
+mod logging;
 #[allow(dead_code)]
 mod manager;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -56,8 +57,6 @@ mod svc_client;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    init_tracing();
-
     let args = match parse_cli_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(message) => {
@@ -66,6 +65,14 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Файловый JSONL-журнал в `<data>/logs` (ротация ежедневно,
+    // хранение 30 дней). Инициализация до всего, что логируется;
+    // сбой не фатален — демон работает с stdout-логами.
+    if let Err(error) = logging::init_file_logging(&args.data_dir.join("logs"), "bottled") {
+        eprintln!("bottled: файловый журнал недоступен ({error}); пишу только в консоль");
+        init_tracing();
+    }
 
     if !instance::acquire_single_instance() {
         eprintln!("Демон BottleForApps уже запущен");
@@ -201,7 +208,8 @@ fn shutdown_on_ctrl_c() -> CancellationToken {
     shutdown
 }
 
-/// Инициализирует логирование: уровень из `RUST_LOG`, по умолчанию `info`.
+/// Инициализирует логирование (fallback без файлового журнала):
+/// уровень из `RUST_LOG`, по умолчанию `info`.
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));

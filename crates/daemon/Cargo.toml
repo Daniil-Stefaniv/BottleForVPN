@@ -21,7 +21,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+# Файловый JSONL-журнал демона: ежедневная ротация (M3).
+tracing-appender = "0.2"
 bytes = "1"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
@@ -39,3 +41,5 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 # Тесты хранилища и диспетчера работают во временных каталогах.
 tempfile = "3"
+# Тесты ретеншна журналов ставят файлам mtime «31 день назад».
+filetime = "0.2"

@@ -115,7 +115,13 @@ impl ClientSpawner for RealClientSpawner {
             .stderr(Stdio::null())
             .spawn()
             .map(|child| {
-                tracing::info!(client, pid = child.id(), "VPN-клиент запущен");
+                // Аргументы клиентов маскируются целиком (спека §10).
+                tracing::info!(
+                    client,
+                    args = %crate::logging::mask_args(&args.join(" ")),
+                    pid = child.id(),
+                    "VPN-клиент запущен"
+                );
             })
     }
 }

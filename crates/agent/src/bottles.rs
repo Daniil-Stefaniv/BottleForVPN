@@ -41,8 +41,10 @@ const BOTTLE_SUBNET: &str = "10.77.0.0/16";
 /// Внешний интерфейс аплаенса для masquerade.
 const WAN_IFACE: &str = "eth0";
 /// Ожидание завершения осиротевшего процесса после SIGTERM.
+#[cfg(unix)]
 const TERM_WAIT: Duration = Duration::from_millis(500);
 /// Пауза между проверками завершения после SIGTERM.
+#[cfg(unix)]
 const TERM_POLL: Duration = Duration::from_millis(50);
 /// Предел ожидания готовности OpenVPN (появление tun0).
 const OPENVPN_WAIT: Duration = Duration::from_secs(60);
@@ -447,12 +449,6 @@ fn kill_orphan(pid: i32) {
 fn pid_alive(pid: i32) -> bool {
     // SAFETY: kill(2) с сигналом 0 не доставляет сигнал процессу.
     unsafe { libc::kill(pid, 0) == 0 }
-}
-
-/// Вне unix процессы недоступны — считаем умершими (ветка не работает).
-#[cfg(not(unix))]
-fn pid_alive(_pid: i32) -> bool {
-    false
 }
 
 /// Удаляет все namespaces `bottle-*` из `ip netns list`.

@@ -6,5 +6,6 @@
 //! напрямую без запуска службы.
 
 pub mod journal;
+pub mod logging;
 pub mod pipe;
 pub mod routes;
