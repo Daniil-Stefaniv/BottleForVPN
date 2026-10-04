@@ -30,6 +30,8 @@ pub enum CliRequest {
     /// Экспортировать журналы в ZIP; `dest` — путь пользователя,
     /// `None` — имя по умолчанию в каталоге данных.
     LogsExport { dest: Option<PathBuf> },
+    /// Диагностика окружения (WSL, аплаенс, служба, профили, порты).
+    Doctor,
 }
 
 /// Ответ демона CLI.
@@ -59,6 +61,8 @@ pub enum CliReply {
     Status { bottles: Vec<RuntimeState> },
     /// Ответ на `LogsExport`: путь к созданному ZIP-архиву.
     Path(String),
+    /// Ответ на `Doctor`: строки проверок.
+    DoctorReport { items: Vec<CheckItem> },
     /// Ошибка выполнения команды.
     Error { message: String },
 }
@@ -120,6 +124,30 @@ pub struct RuntimeState {
     pub socks5: Option<u16>,
     /// Активные TCP-пробросы с назначенными портами слушателя.
     pub forwards: Vec<ForwardPort>,
+}
+
+/// Статус проверки `doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckStatus {
+    /// Проверка прошла.
+    Ok,
+    /// Настораживающее, но допустимое состояние (portable без службы,
+    /// аплаенс ещё не импортирован…).
+    Warn,
+    /// Функциональность недоступна без действий пользователя.
+    Fail,
+}
+
+/// Одна строка отчёта `doctor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckItem {
+    /// Код проверки (`wsl`, `appliance`, `service`, `agent`,
+    /// `profiles`, `ports`).
+    pub code: String,
+    /// Итог проверки.
+    pub status: CheckStatus,
+    /// Русское пояснение (что не так и что делать).
+    pub detail: String,
 }
 
 #[cfg(test)]
@@ -206,6 +234,7 @@ mod tests {
             CliRequest::LogsExport {
                 dest: Some(PathBuf::from(r"C:\tmp\logs.zip")),
             },
+            CliRequest::Doctor,
         ];
         for req in requests {
             assert_eq!(round_trip(req.clone()), req);
@@ -292,6 +321,25 @@ mod tests {
             },
             CliReply::Status { bottles: vec![] },
             CliReply::Path(r"C:\tmp\bottleforapps-logs-20261004-1200.zip".to_string()),
+            CliReply::DoctorReport {
+                items: vec![
+                    CheckItem {
+                        code: "wsl".to_string(),
+                        status: CheckStatus::Ok,
+                        detail: "WSL включён, дистрибуций: 2".to_string(),
+                    },
+                    CheckItem {
+                        code: "service".to_string(),
+                        status: CheckStatus::Warn,
+                        detail: "Служба маршрутов не установлена".to_string(),
+                    },
+                    CheckItem {
+                        code: "agent".to_string(),
+                        status: CheckStatus::Fail,
+                        detail: "агент не отвечает".to_string(),
+                    },
+                ],
+            },
             CliReply::Error {
                 message: "bottle not found".to_string(),
             },

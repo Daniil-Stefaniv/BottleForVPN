@@ -18,13 +18,17 @@ use tokio_util::sync::CancellationToken;
 /// Целостное состояние демона, обслуживаемое каналом управления.
 ///
 /// `manager` — менеджер бутылок (реальные Start/Stop/Status); `None`
-/// остаётся тестам и dev-сборкам без аплаенса.
+/// остаётся тестам и dev-сборкам без аплаенса. `wsl` — исполнитель
+/// команд WSL (диагностика `doctor`); `None` — там же, где нет
+/// менеджера.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub struct Daemon {
     /// Хранилище профилей бутылок.
     pub store: store::Store,
     /// Менеджер жизненного цикла бутылок.
     pub manager: Option<Arc<manager::BottleManager>>,
+    /// Исполнитель команд WSL (`wsl.exe`).
+    pub wsl: Option<Arc<dyn appliance::WslRunner>>,
 }
 
 // На не-windows диспетчер вызывается только тестами (транспорт — named
@@ -33,6 +37,8 @@ pub struct Daemon {
 // по target x86_64-pc-windows-msvc и windows-джобой CI.
 #[allow(dead_code)]
 mod appliance;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod doctor;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod error;
 mod export;
@@ -106,8 +112,9 @@ pub async fn serve_daemon(
     #[cfg(windows)]
     {
         println!("Канал управления: {}", bottle_core::ipc::DAEMON_PIPE);
+        let wsl: Arc<dyn appliance::WslRunner> = Arc::new(appliance::RealWsl);
         let connect = Arc::new(manager::RealAgentConnect::new(
-            Arc::new(appliance::RealWsl),
+            Arc::clone(&wsl),
             data_dir,
             rootfs_tar,
             manager::AGENT_CONNECT_TIMEOUT,
@@ -124,6 +131,7 @@ pub async fn serve_daemon(
         let daemon = Arc::new(Daemon {
             store,
             manager: Some(manager),
+            wsl: Some(wsl),
         });
         pipe::serve(bottle_core::ipc::DAEMON_PIPE, daemon, shutdown).await
     }

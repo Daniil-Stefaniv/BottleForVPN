@@ -12,6 +12,7 @@
 use bottle_core::ipc::{BottleSummary, CliReply, CliRequest};
 use bottle_core::profile::BottleProfile;
 
+use crate::appliance::WslRunner;
 use crate::error::DaemonError;
 use crate::manager::BottleManager;
 use crate::store::Store;
@@ -55,7 +56,12 @@ const MANAGER_NOT_WIRED: &str = "менеджер бутылок не подкл
 /// показывает «не найден»); рантайм берётся из `manager.status`.
 // Вызывается windows-транспортом; на остальных платформах — только тестами.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub async fn dispatch(store: &Store, manager: Option<&BottleManager>, req: CliRequest) -> CliReply {
+pub async fn dispatch(
+    store: &Store,
+    manager: Option<&BottleManager>,
+    wsl: Option<&dyn WslRunner>,
+    req: CliRequest,
+) -> CliReply {
     match req {
         CliRequest::List => CliReply::List {
             bottles: list_summaries(store),
@@ -94,6 +100,14 @@ pub async fn dispatch(store: &Store, manager: Option<&BottleManager>, req: CliRe
                 bottles: manager.status().await,
             },
             None => CliReply::Error {
+                message: MANAGER_NOT_WIRED.to_string(),
+            },
+        },
+        CliRequest::Doctor => match (manager, wsl) {
+            (Some(manager), Some(wsl)) => CliReply::DoctorReport {
+                items: crate::doctor::run(wsl, store, manager).await,
+            },
+            _ => CliReply::Error {
                 message: MANAGER_NOT_WIRED.to_string(),
             },
         },
@@ -223,7 +237,12 @@ async fn handle_connection(
         // команд (start с handshake туннеля); незавершённые операции
         // менеджера разбираются штатными путями его контракта.
         let reply = tokio::select! {
-            reply = dispatch(&daemon.store, daemon.manager.as_deref(), req) => reply,
+            reply = dispatch(
+                &daemon.store,
+                daemon.manager.as_deref(),
+                daemon.wsl.as_deref(),
+                req,
+            ) => reply,
             () = shutdown.cancelled() => break,
         };
         if let Err(e) = send_reply(&mut write_half, &mut reply_codec, reply).await {
@@ -355,7 +374,7 @@ endpoints = ["e.example"]
     async fn list_returns_summaries_of_valid_profiles_only() {
         let (_tmp, store) = store_with_broken_profile();
 
-        let reply = dispatch(&store, None, CliRequest::List).await;
+        let reply = dispatch(&store, None, None, CliRequest::List).await;
 
         let CliReply::List { bottles } = reply else {
             panic!("ожидали List, получили {reply:?}");
@@ -373,7 +392,7 @@ endpoints = ["e.example"]
     async fn list_over_empty_store_is_empty() {
         let (_tmp, store) = empty_store();
 
-        let reply = dispatch(&store, None, CliRequest::List).await;
+        let reply = dispatch(&store, None, None, CliRequest::List).await;
 
         assert_eq!(
             reply,
@@ -388,6 +407,7 @@ endpoints = ["e.example"]
 
         let reply = dispatch(
             &store,
+            None,
             None,
             CliRequest::Show {
                 id: "corp-vpn".to_string(),
@@ -410,6 +430,7 @@ endpoints = ["e.example"]
 
         let reply = dispatch(
             &store,
+            None,
             None,
             CliRequest::Show {
                 id: "ghost".to_string(),
@@ -437,11 +458,12 @@ endpoints = ["e.example"]
                 id: "office-a".to_string(),
             },
             CliRequest::Status,
+            CliRequest::Doctor,
         ];
 
         for req in commands {
             assert_eq!(
-                dispatch(&store, None, req).await,
+                dispatch(&store, None, None, req).await,
                 CliReply::Error {
                     message: MANAGER_NOT_WIRED.to_string(),
                 },
@@ -523,6 +545,7 @@ endpoints = ["e.example"]
         let daemon = Arc::new(crate::Daemon {
             store,
             manager: None,
+            wsl: None,
         });
         let (server_pipe_name, server_shutdown) = (pipe_name.clone(), shutdown.clone());
         let server =
@@ -594,6 +617,7 @@ endpoints = ["e.example"]
         let daemon = Arc::new(crate::Daemon {
             store,
             manager: None,
+            wsl: None,
         });
         let (server_pipe_name, server_shutdown) = (pipe_name.clone(), shutdown.clone());
         let server =
@@ -675,6 +699,7 @@ endpoints = ["e.example"]
         let daemon = Arc::new(crate::Daemon {
             store,
             manager: Some(manager),
+            wsl: None,
         });
         let (server_pipe_name, server_shutdown) = (pipe_name.clone(), shutdown.clone());
         let server =

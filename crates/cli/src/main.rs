@@ -46,6 +46,8 @@ enum Command {
     },
     /// Состояние поднятых бутылок
     Status,
+    /// Диагностика окружения (WSL, аплаенс, служба, порты)
+    Doctor,
     /// Журналы диагностики
     Logs {
         #[command(subcommand)]
@@ -76,6 +78,7 @@ impl Command {
             Command::Start { id } => CliRequest::Start { id: id.clone() },
             Command::Stop { id } => CliRequest::Stop { id: id.clone() },
             Command::Status => CliRequest::Status,
+            Command::Doctor => CliRequest::Doctor,
             Command::Logs {
                 command: LogsCommand::Export { dest },
             } => CliRequest::LogsExport { dest: dest.clone() },
@@ -183,6 +186,19 @@ fn handle_reply(command: &Command, reply: CliReply) -> ExitCode {
             println!("Журналы выгружены: {path}");
             println!("{}", render::LOGS_EXPORT_WARNING);
             ExitCode::SUCCESS
+        }
+        (Command::Doctor, CliReply::DoctorReport { items }) => {
+            println!("{}", render::render_doctor(items));
+            // Отказ — только при fail; warn допустим (portable без
+            // службы, аплаенс до первого старта — не поломка).
+            if items
+                .iter()
+                .any(|item| item.status == bottle_core::ipc::CheckStatus::Fail)
+            {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         (_, CliReply::Error { message }) => {
             eprintln!("{message}");
@@ -313,6 +329,7 @@ mod tests {
     fn parses_every_subcommand() {
         assert!(matches!(parse(&["bottle", "list"]), Command::List));
         assert!(matches!(parse(&["bottle", "status"]), Command::Status));
+        assert!(matches!(parse(&["bottle", "doctor"]), Command::Doctor));
         assert!(matches!(
             parse(&["bottle", "show", "office-a"]),
             Command::Show { id } if id == "office-a"
@@ -325,6 +342,75 @@ mod tests {
             parse(&["bottle", "stop", "office-a"]),
             Command::Stop { id } if id == "office-a"
         ));
+    }
+
+    /// Doctor: exit 0 без fail (warn допустим), fail — exit 1.
+    #[test]
+    fn doctor_exit_code_follows_worst_status() {
+        use bottle_core::ipc::{CheckItem, CheckStatus};
+        let items = |status| {
+            vec![
+                CheckItem {
+                    code: "wsl".to_string(),
+                    status: CheckStatus::Ok,
+                    detail: "WSL включён".to_string(),
+                },
+                CheckItem {
+                    code: "service".to_string(),
+                    status,
+                    detail: "…".to_string(),
+                },
+            ]
+        };
+        assert_eq!(
+            handle_reply(
+                &Command::Doctor,
+                CliReply::DoctorReport {
+                    items: items(CheckStatus::Warn)
+                }
+            ),
+            ExitCode::SUCCESS,
+            "warn — не отказ"
+        );
+        assert_eq!(
+            handle_reply(
+                &Command::Doctor,
+                CliReply::DoctorReport {
+                    items: items(CheckStatus::Fail)
+                }
+            ),
+            ExitCode::FAILURE,
+            "fail — отказ"
+        );
+    }
+
+    /// Таблица doctor содержит эмодзи-статусы всех трёх видов.
+    #[test]
+    fn doctor_render_has_status_glyphs() {
+        use bottle_core::ipc::{CheckItem, CheckStatus};
+        let items = vec![
+            CheckItem {
+                code: "wsl".to_string(),
+                status: CheckStatus::Ok,
+                detail: "WSL включён".to_string(),
+            },
+            CheckItem {
+                code: "service".to_string(),
+                status: CheckStatus::Warn,
+                detail: "не установлена".to_string(),
+            },
+            CheckItem {
+                code: "agent".to_string(),
+                status: CheckStatus::Fail,
+                detail: "не отвечает".to_string(),
+            },
+        ];
+        let table = render::render_doctor(&items);
+        assert!(table.contains('✓'), "ok: {table}");
+        assert!(table.contains('⚠'), "warn: {table}");
+        assert!(table.contains('✗'), "fail: {table}");
+        assert!(table.contains("wsl"), "код проверки: {table}");
+        assert!(table.contains("не отвечает"), "пояснение: {table}");
     }
 
     #[test]

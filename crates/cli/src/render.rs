@@ -18,6 +18,37 @@ pub const LOGS_EXPORT_WARNING: &str = "Внимание: архив содерж
      (IP-адреса, имена интерфейсов, endpoint'ы VPN) — просмотрите содержимое \
      перед отправкой кому-либо";
 
+/// Рендерит отчёт `doctor`: строки «✓/⚠/✗  код  пояснение» колонками;
+/// код выровнен по самому длинному.
+pub fn render_doctor(items: &[bottle_core::ipc::CheckItem]) -> String {
+    use bottle_core::ipc::CheckStatus;
+
+    if items.is_empty() {
+        return "Проверок нет".to_string();
+    }
+    let glyph = |status: &CheckStatus| match status {
+        CheckStatus::Ok => "✓",
+        CheckStatus::Warn => "⚠",
+        CheckStatus::Fail => "✗",
+    };
+    let code_width = items
+        .iter()
+        .map(|item| item.code.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("код".len());
+    let mut out = String::new();
+    for item in items {
+        out.push_str(&format!(
+            "{} {:<code_width$}  {}\n",
+            glyph(&item.status),
+            item.code,
+            item.detail
+        ));
+    }
+    out
+}
+
 /// Рендерит ответ `List`: таблица «id  name  kind  state» колонками;
 /// id выровнен по самому длинному, неизвестное состояние — «-».
 pub fn render_list(items: &[BottleSummary]) -> String {

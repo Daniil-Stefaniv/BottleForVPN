@@ -814,6 +814,11 @@ impl BottleManager {
         self.appliance_version.lock().await.clone()
     }
 
+    /// Жив ли агент аплаенса (диагностика `doctor`).
+    pub async fn agent_alive(&self) -> bool {
+        self.connect.alive().await
+    }
+
     /// Запоминает версию аплаенса из свежего handshake (сводки
     /// `logs export`, диагностика `doctor`).
     async fn remember_appliance_version(&self, version: &str) {
@@ -2491,6 +2496,7 @@ mod tests {
         let reply = crate::pipe::dispatch(
             &store,
             Some(&manager),
+            None,
             bottle_core::ipc::CliRequest::Start {
                 id: "office-a".to_string(),
             },
@@ -2507,6 +2513,7 @@ mod tests {
         let reply = crate::pipe::dispatch(
             &store,
             Some(&manager),
+            None,
             bottle_core::ipc::CliRequest::Show {
                 id: "office-a".to_string(),
             },
@@ -2521,9 +2528,13 @@ mod tests {
         assert!(matches!(runtime.state, BottleState::Up));
 
         // Status показывает бутылку.
-        let reply =
-            crate::pipe::dispatch(&store, Some(&manager), bottle_core::ipc::CliRequest::Status)
-                .await;
+        let reply = crate::pipe::dispatch(
+            &store,
+            Some(&manager),
+            None,
+            bottle_core::ipc::CliRequest::Status,
+        )
+        .await;
         assert_eq!(
             reply,
             CliReply::Status {
@@ -2535,6 +2546,7 @@ mod tests {
         let reply = crate::pipe::dispatch(
             &store,
             Some(&manager),
+            None,
             bottle_core::ipc::CliRequest::Stop {
                 id: "office-a".to_string(),
             },
@@ -2547,9 +2559,13 @@ mod tests {
                 warning: None
             }
         );
-        let reply =
-            crate::pipe::dispatch(&store, Some(&manager), bottle_core::ipc::CliRequest::Status)
-                .await;
+        let reply = crate::pipe::dispatch(
+            &store,
+            Some(&manager),
+            None,
+            bottle_core::ipc::CliRequest::Status,
+        )
+        .await;
         assert_eq!(reply, CliReply::Status { bottles: vec![] });
     }
 
