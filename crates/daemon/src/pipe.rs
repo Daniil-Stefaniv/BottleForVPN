@@ -97,6 +97,17 @@ pub async fn dispatch(store: &Store, manager: Option<&BottleManager>, req: CliRe
                 message: MANAGER_NOT_WIRED.to_string(),
             },
         },
+        CliRequest::LogsExport { dest } => {
+            match crate::export::export_logs(store, manager, dest).await {
+                Ok(path) => CliReply::Path(path.to_string_lossy().into_owned()),
+                Err(error) => {
+                    tracing::warn!(%error, "экспорт журналов не удался");
+                    CliReply::Error {
+                        message: format!("не удалось выгрузить журналы: {error}"),
+                    }
+                }
+            }
+        }
     }
 }
 

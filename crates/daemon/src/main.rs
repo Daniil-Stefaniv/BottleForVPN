@@ -35,6 +35,7 @@ pub struct Daemon {
 mod appliance;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod error;
+mod export;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod host_manager;
 #[allow(dead_code)]

@@ -7,6 +7,7 @@
 
 mod render;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -45,6 +46,22 @@ enum Command {
     },
     /// Состояние поднятых бутылок
     Status,
+    /// Журналы диагностики
+    Logs {
+        #[command(subcommand)]
+        command: LogsCommand,
+    },
+}
+
+/// Подкоманды `bottle logs`.
+#[derive(Debug, Subcommand)]
+enum LogsCommand {
+    /// Выгрузить журналы демона и службы в ZIP-архив
+    Export {
+        /// Куда положить архив (по умолчанию — каталог данных демона)
+        #[arg(long)]
+        dest: Option<PathBuf>,
+    },
 }
 
 impl Command {
@@ -59,6 +76,9 @@ impl Command {
             Command::Start { id } => CliRequest::Start { id: id.clone() },
             Command::Stop { id } => CliRequest::Stop { id: id.clone() },
             Command::Status => CliRequest::Status,
+            Command::Logs {
+                command: LogsCommand::Export { dest },
+            } => CliRequest::LogsExport { dest: dest.clone() },
         }
     }
 }
@@ -152,6 +172,16 @@ fn handle_reply(command: &Command, reply: CliReply) -> ExitCode {
         }
         (Command::Status, CliReply::Status { bottles }) => {
             println!("{}", render::render_status(bottles));
+            ExitCode::SUCCESS
+        }
+        (
+            Command::Logs {
+                command: LogsCommand::Export { .. },
+            },
+            CliReply::Path(path),
+        ) => {
+            println!("Журналы выгружены: {path}");
+            println!("{}", render::LOGS_EXPORT_WARNING);
             ExitCode::SUCCESS
         }
         (_, CliReply::Error { message }) => {
@@ -295,6 +325,67 @@ mod tests {
             parse(&["bottle", "stop", "office-a"]),
             Command::Stop { id } if id == "office-a"
         ));
+    }
+
+    #[test]
+    fn parses_logs_export_with_optional_dest() {
+        assert!(matches!(
+            parse(&["bottle", "logs", "export"]),
+            Command::Logs {
+                command: LogsCommand::Export { dest: None }
+            }
+        ));
+        assert!(matches!(
+            parse(&["bottle", "logs", "export", "--dest", r"C:\tmp\logs.zip"]),
+            Command::Logs {
+                command: LogsCommand::Export {
+                    dest: Some(path)
+                }
+            } if path == std::path::Path::new(r"C:\tmp\logs.zip")
+        ));
+    }
+
+    #[test]
+    fn logs_export_maps_to_protocol_request() {
+        assert_eq!(
+            Command::Logs {
+                command: LogsCommand::Export {
+                    dest: Some(std::path::PathBuf::from("/tmp/logs.zip"))
+                }
+            }
+            .to_request(),
+            CliRequest::LogsExport {
+                dest: Some(std::path::PathBuf::from("/tmp/logs.zip"))
+            }
+        );
+        assert_eq!(
+            Command::Logs {
+                command: LogsCommand::Export { dest: None }
+            }
+            .to_request(),
+            CliRequest::LogsExport { dest: None }
+        );
+    }
+
+    /// Ответ Path печатается успехом; предупреждение о содержимом
+    /// (спека §10) упоминает «просмотрите».
+    #[test]
+    fn logs_export_reply_is_success_and_warns_before_sending() {
+        let command = Command::Logs {
+            command: LogsCommand::Export { dest: None },
+        };
+        assert_eq!(
+            handle_reply(
+                &command,
+                CliReply::Path(r"C:\tmp\bottleforapps-logs-20261004-1200.zip".to_string())
+            ),
+            ExitCode::SUCCESS
+        );
+        assert!(
+            render::LOGS_EXPORT_WARNING.contains("просмотрите"),
+            "предупреждение о содержимом: {}",
+            render::LOGS_EXPORT_WARNING
+        );
     }
 
     #[test]

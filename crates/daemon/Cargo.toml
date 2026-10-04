@@ -29,6 +29,8 @@ tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
 # Каталог данных по умолчанию (кроссплатформенный local data dir).
 dirs = "5"
+# Экспорт журналов в ZIP (bottle logs export, M3).
+zip = { version = "4", default-features = false, features = ["deflate"] }
 # Исходящие сокеты релеев host-бутылок: создание сокета и неблокирующий
 # connect с привязкой к адаптеру VPN ДО соединения (M2 T9, Review Focus #5).
 socket2 = "0.6"

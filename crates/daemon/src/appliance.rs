@@ -160,9 +160,13 @@ async fn ensure_appliance_with_port(
     let vm_ip = appliance_ip(wsl).await?;
     let stream = connect_with_retries(vm_ip, port, connect_timeout).await?;
     let mut conn = Framed::new(stream, AgentCodec);
-    handshake(&mut conn, &token, connect_timeout).await?;
+    let (_, appliance_version) = handshake(&mut conn, &token, connect_timeout).await?;
     tracing::info!(%vm_ip, port, "соединение с агентом аплаенса установлено");
-    Ok(ApplianceHandle { vm_ip, conn })
+    Ok(ApplianceHandle {
+        vm_ip,
+        appliance_version,
+        conn,
+    })
 }
 
 /// Возвращает токен аплаенса.
@@ -290,12 +294,13 @@ async fn connect_with_retries(
     }
 }
 
-/// Handshake: `Hello{version, token}` и разбор ответа.
+/// Handshake: `Hello{version, token}` и разбор ответа; возвращает
+/// (версия протокола агента, версия аплаенса) из `HelloAck`.
 async fn handshake(
     conn: &mut Framed<TcpStream, AgentCodec>,
     token: &str,
     timeout: Duration,
-) -> Result<(), DaemonError> {
+) -> Result<(u32, String), DaemonError> {
     write_request(
         conn,
         AgentRequest::Hello {
@@ -307,8 +312,9 @@ async fn handshake(
     match read_reply(conn, timeout).await? {
         AgentReply::HelloAck {
             version: PROTOCOL_VERSION,
+            appliance_version,
             ..
-        } => Ok(()),
+        } => Ok((PROTOCOL_VERSION, appliance_version)),
         AgentReply::HelloAck { .. } => Err(DaemonError::ApplianceIncompatible),
         AgentReply::Error { code, .. } if code == err::VERSION => {
             Err(DaemonError::ApplianceIncompatible)
@@ -364,6 +370,8 @@ async fn read_reply(
 pub struct ApplianceHandle {
     /// IP аплаенса в сети WSL NAT (из `hostname -I`).
     pub vm_ip: Ipv4Addr,
+    /// Версия аплаенса из `HelloAck` (для сводок и диагностики).
+    pub appliance_version: String,
     /// Соединение с агентом; кодек пишет запросы и читает ответы.
     conn: Framed<TcpStream, AgentCodec>,
 }
@@ -375,9 +383,20 @@ impl ApplianceHandle {
     /// `Hello`/`HelloAck` сами и оборачивают поток этим методом.
     #[cfg(test)]
     pub(crate) fn wrap(vm_ip: Ipv4Addr, stream: TcpStream) -> Self {
+        Self::wrap_with_version(vm_ip, stream, "0.1.0-test".to_string())
+    }
+
+    /// [`ApplianceHandle::wrap`] с явной версией аплаенса.
+    #[cfg(test)]
+    pub(crate) fn wrap_with_version(
+        vm_ip: Ipv4Addr,
+        stream: TcpStream,
+        appliance_version: String,
+    ) -> Self {
         let _ = stream.set_nodelay(true);
         Self {
             vm_ip,
+            appliance_version,
             conn: Framed::new(stream, AgentCodec),
         }
     }

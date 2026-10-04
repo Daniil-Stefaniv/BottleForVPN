@@ -336,6 +336,9 @@ pub struct BottleManager {
     resilience: ResilienceTiming,
     /// Состояние health-цикла.
     health: Mutex<HealthState>,
+    /// Версия аплаенса из последнего успешного handshake (для сводок
+    /// logs export и диагностики doctor); `None` — не подключались.
+    appliance_version: Mutex<Option<String>>,
     /// Сервер одного релея (инъекция для теста смерти задачи).
     relay_serve: RelayServe,
     /// Канал смертей relay-задач env-бутылок (дренируется health-циклом).
@@ -374,6 +377,7 @@ impl BottleManager {
             boot_seed,
             resilience: ResilienceTiming::default(),
             health: Mutex::new(HealthState::default()),
+            appliance_version: Mutex::new(None),
             relay_serve: real_relay_serve(),
             relay_tx,
             relay_rx: Mutex::new(relay_rx),
@@ -804,6 +808,18 @@ impl BottleManager {
         bottles
     }
 
+    /// Версия аплаенса из последнего успешного handshake;
+    /// `None` — в этой сессии аплаенс не подключался.
+    pub async fn appliance_version(&self) -> Option<String> {
+        self.appliance_version.lock().await.clone()
+    }
+
+    /// Запоминает версию аплаенса из свежего handshake (сводки
+    /// `logs export`, диагностика `doctor`).
+    async fn remember_appliance_version(&self, version: &str) {
+        *self.appliance_version.lock().await = Some(version.to_string());
+    }
+
     /// Фаза 2 `start`: резерв портов, чтение конфига, `Up` → `Ready`,
     /// задачи проброса. При ошибке всё сделанное освобождается
     /// (резерв-слушатели дропаются — порты свободны). `instance` —
@@ -828,6 +844,8 @@ impl BottleManager {
             .await
             .map_err(|error| format!("аплаенс недоступен: {error}"))?;
         let vm_ip = handle.vm_ip;
+        self.remember_appliance_version(&handle.appliance_version)
+            .await;
 
         // Up; PORT_BUSY → перевыбор динамических портов (фиксированные
         // бинды сохраняются — их порт изменить нельзя) и повтор ровно
@@ -910,6 +928,8 @@ impl BottleManager {
     /// случаях опускать нечего, защита живой бутылки сработала.
     async fn send_down(&self, id: &str, instance: u64) -> Result<(), DaemonError> {
         let mut handle = self.connect.connect().await?;
+        self.remember_appliance_version(&handle.appliance_version)
+            .await;
         let request = AgentRequest::Down {
             id: id.to_string(),
             instance,

@@ -4,6 +4,8 @@
 //! по именованному каналу [`DAEMON_PIPE`]. Перечисления сериализуются
 //! внешней пометкой serde по умолчанию (например, `{"Start":{"id":"a"}}`).
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::profile::{BottleKind, BottleProfile};
@@ -25,6 +27,9 @@ pub enum CliRequest {
     Stop { id: String },
     /// Рантайм-состояние всех поднятых бутылок.
     Status,
+    /// Экспортировать журналы в ZIP; `dest` — путь пользователя,
+    /// `None` — имя по умолчанию в каталоге данных.
+    LogsExport { dest: Option<PathBuf> },
 }
 
 /// Ответ демона CLI.
@@ -52,6 +57,8 @@ pub enum CliReply {
     Stopped { id: String, warning: Option<String> },
     /// Ответ на `Status`.
     Status { bottles: Vec<RuntimeState> },
+    /// Ответ на `LogsExport`: путь к созданному ZIP-архиву.
+    Path(String),
     /// Ошибка выполнения команды.
     Error { message: String },
 }
@@ -118,6 +125,7 @@ pub struct RuntimeState {
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
+    use std::path::PathBuf;
 
     use super::*;
     use crate::frame::LengthJsonCodec;
@@ -194,6 +202,10 @@ mod tests {
                 id: "office-a".to_string(),
             },
             CliRequest::Status,
+            CliRequest::LogsExport { dest: None },
+            CliRequest::LogsExport {
+                dest: Some(PathBuf::from(r"C:\tmp\logs.zip")),
+            },
         ];
         for req in requests {
             assert_eq!(round_trip(req.clone()), req);
@@ -279,6 +291,7 @@ mod tests {
                 ],
             },
             CliReply::Status { bottles: vec![] },
+            CliReply::Path(r"C:\tmp\bottleforapps-logs-20261004-1200.zip".to_string()),
             CliReply::Error {
                 message: "bottle not found".to_string(),
             },
