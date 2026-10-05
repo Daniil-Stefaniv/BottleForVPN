@@ -20,7 +20,7 @@ use bottle_core::svcrpc::{
 use tokio::sync::Mutex;
 
 use crate::journal::{RouteStore, SessionId};
-use crate::routes::{route_ps_args, run_ps, RouteCmd};
+use crate::routes::{run_ps, RouteCmd};
 
 /// Предельная длина псевдонима интерфейса (защита в глубину).
 /// Windows InterfaceAlias бывает длиннее 64 символов (составные имена
@@ -138,15 +138,7 @@ pub async fn dispatch(
                     };
                 }
             }
-            // Только route_ps_args: ручное построение аргументов
-            // запрещено (дисциплина инъекционной безопасности).
-            if let Err(error) = run_ps(&route_ps_args(
-                RouteCmd::Add,
-                dest,
-                Some(gateway),
-                Some(&iface_alias),
-            ))
-            .await
+            if let Err(error) = run_ps(RouteCmd::Add, dest, Some(gateway), Some(&iface_alias)).await
             {
                 return io_error(&error.to_string());
             }
@@ -174,7 +166,7 @@ pub async fn dispatch(
                 tracing::warn!(%dest, "del маршрута, которого нет в live-set");
                 return SvcReply::Ok;
             }
-            if let Err(error) = run_ps(&route_ps_args(RouteCmd::Del, dest, None, None)).await {
+            if let Err(error) = run_ps(RouteCmd::Del, dest, None, None).await {
                 return io_error(&error.to_string());
             }
             match store.lock().await.del(session_id, dest) {
@@ -271,7 +263,7 @@ async fn close_session_routes(store: &Mutex<RouteStore>, session: SessionId) {
 async fn remove_routes(store: &Mutex<RouteStore>, entries: Vec<RouteEntry>) -> Vec<String> {
     let mut failures = Vec::new();
     for entry in entries {
-        match run_ps(&route_ps_args(RouteCmd::Del, entry.dest, None, None)).await {
+        match run_ps(RouteCmd::Del, entry.dest, None, None).await {
             Ok(_) => match store.lock().await.del(entry.session, entry.dest) {
                 Ok(_) => tracing::info!(dest = %entry.dest, "маршрут удалён из ОС и журнала"),
                 Err(error) => {

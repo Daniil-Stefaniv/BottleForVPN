@@ -226,6 +226,14 @@ struct HealthState {
     attempts: u32,
     /// Когда разрешена следующая проба после неудач (бэкофф).
     next_attempt: Option<tokio::time::Instant>,
+    /// Id бутылок, чьё восстановление (stop → start) выполняется
+    /// прямо сейчас: no-op stop пользователя в этом окне — команда
+    /// «не поднимай обратно» (рулинг M3-бэклога).
+    restoring: std::collections::HashSet<String>,
+    /// Id, остановленные пользователем во время восстановления:
+    /// restore_after_recovery видит флаг между своим stop и start и
+    /// пропускает пере-подъём.
+    user_abort: std::collections::HashSet<String>,
 }
 
 impl Default for HealthState {
@@ -234,6 +242,8 @@ impl Default for HealthState {
             agent_up: true,
             attempts: 0,
             next_attempt: None,
+            restoring: std::collections::HashSet::default(),
+            user_abort: std::collections::HashSet::default(),
         }
     }
 }
@@ -464,6 +474,18 @@ impl BottleManager {
         self.host.collect_relay_deaths().await;
         self.host.check_iface_alive().await;
 
+        // Нет активных env-бутылок — проба агента не нужна: VM может
+        // спать, восстанавливать некого, а alive-проба — это запуск
+        // wsl.exe каждые HEALTH_CHECK_PERIOD вечно (T11-концерн,
+        // M3-бэклог). Первый start разбудит аплаенс сам.
+        let has_active_env = {
+            let runtime = self.runtime.lock().await;
+            runtime.values().any(|entry| is_active(&entry.state))
+        };
+        if !has_active_env {
+            return;
+        }
+
         let mut health = self.health.lock().await;
         // Бэкофф: пока аплаенс мёртв, пробы идут не чаще расписания.
         if !health.agent_up
@@ -538,8 +560,18 @@ impl BottleManager {
                 .collect()
         };
         for id in ids {
+            // Окно восстановления: пользовательский stop между нашим
+            // stop и start — команда «не поднимай обратно» (рулинг
+            // M3-бэклога): no-op stop смотрит в restoring и ставит
+            // user_abort.
+            self.health.lock().await.restoring.insert(id.clone());
             match self.stop(&id).await {
                 Ok(CliReply::Stopped { .. }) => {
+                    if self.health.lock().await.user_abort.remove(&id) {
+                        tracing::info!(id = %id, "восстановление отменено пользователем");
+                        self.health.lock().await.restoring.remove(&id);
+                        continue;
+                    }
                     if let Err(error) = self.start(&id).await {
                         // Профиль недоступен и т.п.: маркер failed с
                         // причиной, иначе бутылка исчезнет из status молча.
@@ -560,6 +592,7 @@ impl BottleManager {
                 }
                 _ => tracing::info!(id = %id, "восстановление пропущено: бутылка уже остановлена"),
             }
+            self.health.lock().await.restoring.remove(&id);
         }
     }
 
@@ -755,7 +788,17 @@ impl BottleManager {
         };
         let Some(mut runtime) = runtime else {
             // Повторный stop уже остановленной — no-op с
-            // предупреждением, не ошибка (спека §5.2).
+            // предупреждением, не ошибка (спека §5.2). Исключение —
+            // окно восстановления: health уже снял бутылку своим
+            // stop, start ещё не начался; пользовательский stop здесь
+            // означает «не поднимай обратно» (рулинг M3-бэклога).
+            {
+                let mut health = self.health.lock().await;
+                if health.restoring.contains(id) {
+                    health.user_abort.insert(id.to_string());
+                    tracing::info!(id, "пользовательский stop в окне восстановления");
+                }
+            }
             return Ok(CliReply::Stopped {
                 id: id.to_string(),
                 warning: Some("не была запущена".to_string()),
@@ -1372,11 +1415,27 @@ mod tests {
         /// Гейт сериализации `Up`-ов (модель последовательного агента
         /// для [`UpBehavior::DelayedFirstUpBarrier`]).
         up_gate: Arc<tokio::sync::Mutex<()>>,
+        /// Счётчик alive-проб демона (`Status` без id) — пин
+        /// «не будить WSL без активных бутылок» (M3-бэклог).
+        probes: Arc<std::sync::atomic::AtomicUsize>,
+        /// Гейт ответа на `Down`: тест держит лок — агент паркуется
+        /// ДО ответа (таймлайн «пользовательский stop между stop и
+        /// start восстановления», M3-бэклог).
+        down_gate: Arc<tokio::sync::Mutex<()>>,
     }
 
     impl AgentJournal {
         fn ups(&self) -> Vec<UpArgs> {
             self.ups.lock().unwrap().clone()
+        }
+
+        /// Число alive-проб (`Status` без id) с момента сброса.
+        fn probes(&self) -> usize {
+            self.probes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn reset_probes(&self) {
+            self.probes.store(0, std::sync::atomic::Ordering::SeqCst)
         }
 
         fn downs(&self) -> Vec<(String, u64)> {
@@ -1626,7 +1685,19 @@ mod tests {
         while let Some(Ok(request)) = reader.next().await {
             let reply = match request {
                 AgentRequest::Up(args) => up_reply(args, &behavior, &journal, vm_ip).await,
-                AgentRequest::Down { id, instance } => down_reply(id, instance, &journal),
+                AgentRequest::Down { id, instance } => {
+                    // Тестовый гейт (см. AgentJournal::down_gate).
+                    let _held = journal.down_gate.lock().await;
+                    down_reply(id, instance, &journal)
+                }
+                AgentRequest::Status { id: None } => {
+                    journal
+                        .probes
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    AgentReply::Status {
+                        bottles: Vec::new(),
+                    }
+                }
                 AgentRequest::Status { .. } => AgentReply::Status {
                     bottles: Vec::new(),
                 },
@@ -2893,6 +2964,101 @@ mod tests {
 
     /// (в-env) Смерть relay-задачи (не по остановке): бутылка получает
     /// `Degraded{причина}` — не `failed`, слушатели живут.
+    /// Окно восстановления vs пользовательский stop (рулинг
+    /// M3-бэклога): health уже снял бутылку (свой stop), start ещё не
+    /// начался. Пользовательский stop в этом окне — команда «не
+    /// поднимай обратно»: восстановление обязано пропустить start.
+    ///
+    /// Хореография: гейт Down задерживает ответ агенту → restore паркует
+    /// в send_down ПОСЛЕ вынимания записи из runtime → no-op stop
+    /// пользователя попадает точно между stop и start восстановления.
+    #[tokio::test]
+    async fn user_stop_during_recovery_window_prevents_repost() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        manager.start("office-a").await.expect("поднята");
+
+        // Смерть агента → деградация; воскрешение с зажатым Down-гейтом.
+        fake.kill();
+        manager.health_pass().await;
+        let gate = fake.journal.down_gate.clone();
+        let _held = gate.lock().await;
+        fake.resurrect();
+
+        // Восстановление в фоне: паркуется в Down (гейт).
+        let restoring = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.restore_after_recovery().await }
+        });
+        // Ждём вынимания бутылки из runtime (stop восстановления
+        // начался; entry ушёл из карты до send_down).
+        let mut removed = false;
+        for _ in 0..500 {
+            if manager.status().await.is_empty() {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(removed, "восстановление начало свой stop");
+
+        // Пользовательский stop в окне — no-op с предупреждением.
+        let reply = manager.stop("office-a").await.expect("ответ, не сбой");
+        assert_eq!(
+            reply,
+            CliReply::Stopped {
+                id: "office-a".into(),
+                warning: Some("не была запущена".to_string())
+            }
+        );
+
+        // Отпускаем Down: восстановление обязано увидеть флаг и НЕ
+        // поднимать бутылку обратно.
+        drop(_held);
+        restoring.await.expect("restore завершился");
+
+        assert!(
+            manager.status().await.is_empty(),
+            "бутылка не поднята обратно против воли пользователя"
+        );
+        assert_eq!(
+            fake.journal.ups().len(),
+            1,
+            "второго Up не было: {:?}",
+            fake.journal.ups().len()
+        );
+    }
+
+    /// Пин T11-концерна (M3-бэклог): без активных env-бутылок
+    /// health-проход не будит WSL — alive-пробы не уходят; с живой
+    /// бутылкой агент опрашивается.
+    #[tokio::test]
+    async fn health_pass_skips_agent_probe_without_active_env_bottles() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+
+        // Ни одной бутылки: три прохода — ноль проб агента.
+        for _ in 0..3 {
+            manager.health_pass().await;
+        }
+        assert_eq!(
+            fake.journal.probes(),
+            0,
+            "восстанавливать некого — VM пусть спит (никаких wsl.exe-проб)"
+        );
+
+        // Живая бутылка: проба обязательна.
+        manager.start("office-a").await.expect("поднята");
+        fake.journal.reset_probes();
+        manager.health_pass().await;
+        assert!(
+            fake.journal.probes() >= 1,
+            "живая бутылка — агент опрашивается"
+        );
+    }
+
     #[tokio::test]
     async fn relay_task_death_degrades_bottle_with_reason() {
         let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));

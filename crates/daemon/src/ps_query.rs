@@ -86,52 +86,85 @@ pub(crate) async fn run_ps_readonly(args: &[String]) -> io::Result<String> {
 
 /// Блокирующий исполнитель одного `-EncodedCommand`-запроса.
 ///
-/// Вывод читается после завершения процесса: читающие запросы
-/// (`Get-NetRoute`/`Get-NetAdapter`) умещаются в буфер пайпа, дедлока
-/// на заполненном stdout нет.
+/// Оба пайпа качаются потоками параллельно с процессом
+/// ([`run_with_piped_output`]): вывод больше ёмкости пайпа не
+/// дедлокует связку «процесс пишет — мы ждём wait».
 fn run_ps_sync(encoded: &str) -> io::Result<String> {
-    let mut child = Command::new("powershell")
+    let mut command = Command::new("powershell");
+    command
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-EncodedCommand")
-        .arg(encoded)
+        .arg(encoded);
+    let (status, stdout, stderr) = run_with_piped_output(command, PS_READ_TIMEOUT)?;
+    if status.success() {
+        Ok(stdout)
+    } else {
+        Err(io::Error::other(format!(
+            "PowerShell завершился с ошибкой: {}",
+            stderr.trim()
+        )))
+    }
+}
+
+/// Запускает процесс (stdin — null, stdout/stderr — пайпы) и собирает
+/// оба вывода ПОТОКАМИ, параллельными процессу, до его завершения:
+/// заполненный пайп (>64 КиБ) блокирует писателя только до
+/// опустошения нашего читателя — дедлока «wait до чтения» нет.
+///
+/// Таймаут убивает процесс и дожидается читателей (пайпы закрываются,
+/// потоки завершаются). Ненулевой код возврата НЕ ошибка этой функции
+/// — интерпретация за вызывающим.
+fn run_with_piped_output(
+    mut command: Command,
+    timeout: Duration,
+) -> io::Result<(std::process::ExitStatus, String, String)> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| io::Error::other(format!("не удалось запустить powershell: {e}")))?;
-    let mut stdout = child.stdout.take().expect("stdout piped выше");
-    let mut stderr = child.stderr.take().expect("stderr piped выше");
+        .map_err(|e| io::Error::other(format!("не удалось запустить процесс: {e}")))?;
+    let stdout = child.stdout.take().expect("stdout piped выше");
+    let stderr = child.stderr.take().expect("stderr piped выше");
 
-    let deadline = Instant::now() + PS_READ_TIMEOUT;
+    let pump = |mut reader: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = reader.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    };
+    let out_handle = pump(Box::new(stdout));
+    let err_handle = pump(Box::new(stderr));
+
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait()? {
             Some(status) => break status,
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
+                // Пайпы закрыты смертью процесса — читатели завершатся;
+                // join, чтобы не оставлять потоки за возвратом.
+                let _ = out_handle.join();
+                let _ = err_handle.join();
                 return Err(io::Error::other(format!(
-                    "PowerShell не завершился вовремя (таймаут {} с)",
-                    PS_READ_TIMEOUT.as_secs()
+                    "процесс не завершился вовремя (таймаут {} с)",
+                    timeout.as_secs()
                 )));
             }
             None => std::thread::sleep(WAIT_STEP),
         }
     };
 
-    let mut out_bytes = Vec::new();
-    stdout.read_to_end(&mut out_bytes)?;
-    let mut err_bytes = Vec::new();
-    stderr.read_to_end(&mut err_bytes)?;
-
-    if status.success() {
-        Ok(String::from_utf8_lossy(&out_bytes).into_owned())
-    } else {
-        Err(io::Error::other(format!(
-            "PowerShell завершился с ошибкой: {}",
-            String::from_utf8_lossy(&err_bytes).trim()
-        )))
-    }
+    let stdout = out_handle
+        .join()
+        .map_err(|_| io::Error::other("поток чтения stdout погиб"))?;
+    let stderr = err_handle
+        .join()
+        .map_err(|_| io::Error::other("поток чтения stderr погиб"))?;
+    Ok((status, stdout, stderr))
 }
 
 #[cfg(test)]
@@ -140,6 +173,43 @@ mod tests {
 
     fn strs(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Дедлок заполненного пайпа устранён: процесс, пишущий в stdout
+    /// БОЛЬШЕ ёмкости пайпа (64 КиБ) и лишь потом завершающийся,
+    /// прочитан до конца (оба потока качаются параллельно с wait).
+    /// Стаб вместо PowerShell: `/bin/sh -c` с генератором.
+    #[cfg(unix)]
+    #[test]
+    fn piped_output_drains_more_than_pipe_capacity() {
+        // ~1 МиБ строк: много больше 64 КиБ буфера пайпа.
+        let script = "i=0; while [ $i -lt 16384 ]; do echo 0123456789abcdef; i=$((i+1)); done";
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+
+        let (status, stdout, stderr) =
+            run_with_piped_output(command, std::time::Duration::from_secs(30))
+                .expect("процесс с большим stdout не дедлокуется");
+
+        assert!(status.success());
+        assert_eq!(stdout.lines().count(), 16384, "весь stdout собран");
+        assert!(stderr.is_empty());
+    }
+
+    /// Таймаут убивает зависший процесс даже при открытых пайпах.
+    #[cfg(unix)]
+    #[test]
+    fn piped_output_times_out_on_hung_process() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 60"]);
+
+        let error = run_with_piped_output(command, std::time::Duration::from_millis(300))
+            .expect_err("зависший процесс — таймаут");
+
+        assert!(
+            error.to_string().contains("таймаут"),
+            "ошибка про таймаут: {error}"
+        );
     }
 
     /// Пин инъекционной дисциплины: значения — только PS-литералы,

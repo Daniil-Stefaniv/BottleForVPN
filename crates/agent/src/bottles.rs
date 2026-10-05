@@ -216,22 +216,40 @@ impl Bottles {
 
         let mut handle = netns_up(&slot, &args.id, &args.forwards, args.socks5_port).await?;
         match launch_tunnel(&mut handle, args).await {
-            Ok(()) => {
-                lock(&self.inner).insert(
-                    args.id.clone(),
-                    LiveBottle {
-                        handle,
-                        instance: args.instance,
-                    },
-                );
-                Ok(())
-            }
+            Ok(()) => self.commit_to_registry(handle, &args.id, args.instance),
             Err(error) => {
                 tracing::warn!(id = %args.id, %error, "провижининг не удался, разбираю бутылку");
                 teardown(handle);
                 Err(error)
             }
         }
+    }
+
+    /// Финальная вставка бутылки в реестр ПОД ЛОКОМ с перепроверкой
+    /// (TOCTOU, рулинг M3-бэклога): между барьером `contains_key` в
+    /// [`Bottles::up`] и концом провижининга (десятки секунд туннеля)
+    /// параллельный `up` того же id мог выиграть. Победитель уже в
+    /// реестре — проигравший разбирает СВОЁ (teardown) и отвечает
+    /// [`AgentError::BadInstance`]; бутылка победителя не трогается.
+    fn commit_to_registry(
+        &self,
+        handle: NetnsHandle,
+        id: &str,
+        instance: u64,
+    ) -> Result<(), AgentError> {
+        let mut inner = lock(&self.inner);
+        if inner.contains_key(id) {
+            drop(inner);
+            tracing::warn!(
+                id,
+                instance,
+                "параллельный up выиграл гонку: разбираю проигравшего"
+            );
+            teardown(handle);
+            return Err(AgentError::BadInstance { id: id.to_string() });
+        }
+        inner.insert(id.to_string(), LiveBottle { handle, instance });
+        Ok(())
     }
 }
 
@@ -539,6 +557,9 @@ pub fn map_agent_error(error: AgentError) -> AgentReply {
         | AgentError::CommandFailed { .. }
         | AgentError::InvalidConfig(_) => err::BAD_REQUEST,
         AgentError::TunnelFailed(_) => err::TUNNEL_FAILED,
+        // Проигравший гонки up: бутылка-победитель ЖИВА — семантика
+        // «уже поднята» для демона честнее, чем «плохой запрос».
+        AgentError::BadInstance { .. } => err::ALREADY_UP,
         AgentError::Io(e) if e.kind() == io::ErrorKind::AddrInUse => err::PORT_BUSY,
         AgentError::Io(_) => err::BAD_REQUEST,
     };
@@ -714,6 +735,48 @@ mod tests {
         };
         let reply = bottles.up(args).await;
         assert_eq!(reply.code(), err::BAD_REQUEST);
+    }
+
+    /// TOCTOU реестра (рулинг M3-бэклога): провижининг длится десятки
+    /// секунд; параллельный `up` того же id может пройти барьер
+    /// `contains_key` и выиграть. Проигравший после своего туннеля
+    /// обязан УВИДЕТЬ чужую запись, разобрать своё и ответить
+    /// BadInstance — не перезаписать бутылку победителя.
+    #[test]
+    fn commit_to_registry_refuses_when_parallel_up_won() {
+        let bottles = Bottles::new();
+        // Победитель: успел вставить свою бутылку (instance 7).
+        lock(&bottles.inner).insert(
+            "office-a".to_string(),
+            LiveBottle {
+                handle: dummy_handle("office-a"),
+                instance: 7,
+            },
+        );
+
+        // Проигравший завершил провижининг своего экземпляра (instance 9).
+        let outcome = bottles.commit_to_registry(dummy_handle("office-a"), "office-a", 9);
+
+        assert!(
+            matches!(&outcome, Err(AgentError::BadInstance { id }) if id == "office-a"),
+            "проигравший — BadInstance, получено {outcome:?}"
+        );
+        // Реестр не тронут: бутылка победителя на месте, одна штука.
+        let inner = lock(&bottles.inner);
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner["office-a"].instance, 7, "победитель не перезаписан");
+    }
+
+    /// Мирный путь: реестр пуст — вставка проходит.
+    #[test]
+    fn commit_to_registry_inserts_when_free() {
+        let bottles = Bottles::new();
+
+        let outcome = bottles.commit_to_registry(dummy_handle("office-a"), "office-a", 3);
+
+        assert!(outcome.is_ok());
+        let inner = lock(&bottles.inner);
+        assert_eq!(inner["office-a"].instance, 3);
     }
 
     #[tokio::test]

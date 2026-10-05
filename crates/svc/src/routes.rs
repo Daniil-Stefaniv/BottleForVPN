@@ -169,7 +169,9 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Запускает PowerShell с собранными аргументами и возвращает stdout.
+/// Запускает PowerShell-командлет над таблицей маршрутов и возвращает
+/// stdout. Аргументы строятся ТОЛЬКО здесь, через [`route_ps_args`]:
+/// вызывающие не собирают PS-токены руками (рулинг M3-бэклога).
 ///
 /// `powershell -NoProfile -NonInteractive -EncodedCommand <encode>` —
 /// сценарий передаётся одним base64-токеном (UTF-16LE), поэтому
@@ -177,7 +179,20 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// PowerShell снимается по таймауту [`PS_TIMEOUT`] (`kill_on_drop`).
 /// Ненулевой код выхода → [`RouteOpError::PsFailed`] со stderr.
 #[cfg(windows)]
-pub async fn run_ps(args: &[String]) -> Result<String, RouteOpError> {
+pub async fn run_ps(
+    cmd: RouteCmd,
+    dest: IpAddr,
+    gateway: Option<IpAddr>,
+    iface_alias: Option<&str>,
+) -> Result<String, RouteOpError> {
+    run_ps_raw(&route_ps_args(cmd, dest, gateway, iface_alias)).await
+}
+
+/// Запуск произвольного PS-сценария: диагностический/тестовый путь
+/// (таймаут-тест с зависшим `Start-Sleep`); продакшн-код таблицы
+/// маршрутов проходит через [`run_ps`].
+#[cfg(windows)]
+pub async fn run_ps_raw(args: &[String]) -> Result<String, RouteOpError> {
     let child = tokio::process::Command::new("powershell")
         .arg("-NoProfile")
         .arg("-NonInteractive")
@@ -205,7 +220,19 @@ pub async fn run_ps(args: &[String]) -> Result<String, RouteOpError> {
 
 /// Не-Windows стаб: операции над маршрутами недоступны.
 #[cfg(not(windows))]
-pub async fn run_ps(_args: &[String]) -> Result<String, RouteOpError> {
+pub async fn run_ps(
+    _cmd: RouteCmd,
+    _dest: IpAddr,
+    _gateway: Option<IpAddr>,
+    _iface_alias: Option<&str>,
+) -> Result<String, RouteOpError> {
+    Err(RouteOpError::NotWindows)
+}
+
+/// Не-Windows стаб произвольного сценария (см. windows-версию).
+#[cfg(not(windows))]
+#[allow(dead_code)]
+pub async fn run_ps_raw(_args: &[String]) -> Result<String, RouteOpError> {
     Err(RouteOpError::NotWindows)
 }
 

@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bottle_core::svcrpc::RouteEntry;
 use serde::{Deserialize, Serialize};
 
-use crate::routes::{route_ps_args, run_ps, RouteCmd};
+use crate::routes::{run_ps, RouteCmd};
 
 /// Идентификатор сессии демона: монотонный счётчик службы.
 pub type SessionId = u64;
@@ -473,7 +473,7 @@ where
     let mut checked = BTreeMap::new();
     let mut os_has: BTreeMap<IpAddr, bool> = BTreeMap::new();
     for entry in entries {
-        match run_ps(&route_ps_args(RouteCmd::List, entry.dest, None, None)).await {
+        match run_ps(RouteCmd::List, entry.dest, None, None).await {
             Ok(listing) => {
                 os_has.insert(entry.dest, !listing.trim().is_empty());
                 checked.insert(entry.dest, entry);
@@ -495,7 +495,7 @@ where
         report.vanished += 1;
     }
     for entry in plan.stale {
-        match run_ps(&route_ps_args(RouteCmd::Del, entry.dest, None, None)).await {
+        match run_ps(RouteCmd::Del, entry.dest, None, None).await {
             Ok(_) => match store.del(entry.session, entry.dest) {
                 Ok(_) => {
                     tracing::info!(dest = %entry.dest, "сверка: маршрут-сирота удалён");
