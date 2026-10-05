@@ -44,3 +44,24 @@ wsl --unregister bottleforapps   # удалить по окончании
 ```
 
 Токен control-протокола лежит в дистрибутиве в `/etc/bottle-agent/token`.
+
+## Куда rootfs попадает в дистрибутивы (M3)
+
+- **MSI**: `ProgramFiles\BottleForApps\appliance\bottleforapps-rootfs.tar.gz` —
+  демон находит его через цепочку разрешения `<data>/appliance/` →
+  `<каталог exe>/appliance/` (`resolve_rootfs` в
+  `crates/daemon/src/main.rs`); копирование в каталог данных не нужно.
+- **Portable** (`scripts/build-portable.ps1`, Windows/CI): rootfs лежит
+  рядом с exe в `BottleForApps/appliance/` — тот же второй приоритет
+  цепочки; права администратора не нужны.
+
+## Portable-сборка
+
+```powershell
+powershell -File scripts/build-portable.ps1 -RootfsPath artifacts\bottleforapps-rootfs.tar.gz
+```
+
+Собирает release-бинарники (msvc), раскладывает `bottle.exe`/`bottled.exe`/
+`bottle-svc.exe` + `appliance/` + русский `INSTALL.txt` и упаковывает в
+`artifacts/BottleForApps-portable-<version>-win-x64.zip` (+ `.sha256`).
+Версия читается из `[workspace.package].version` (cargo metadata).

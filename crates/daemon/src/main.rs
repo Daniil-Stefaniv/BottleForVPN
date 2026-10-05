@@ -9,7 +9,7 @@
 //! single-instance мьютексом; остановка — Ctrl+C.
 
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -88,7 +88,11 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    if let Err(error) = serve_daemon(args.data_dir, args.rootfs, shutdown_on_ctrl_c()).await {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let rootfs = resolve_rootfs(args.rootfs, &args.data_dir, exe_dir.as_deref());
+    if let Err(error) = serve_daemon(args.data_dir, rootfs, shutdown_on_ctrl_c()).await {
         tracing::error!(%error, "bottled завершился с ошибкой");
         eprintln!("bottled: {error}");
         return ExitCode::FAILURE;
@@ -154,8 +158,9 @@ pub async fn serve_daemon(
 struct CliArgs {
     /// Каталог данных (хранилище профилей, токен аплаенса).
     data_dir: PathBuf,
-    /// Тарболл rootfs аплаенса для `wsl --import`.
-    rootfs: PathBuf,
+    /// Явный тарболл rootfs (`--rootfs`); `None` — разрешается
+    /// [`resolve_rootfs`] (данные → каталог exe).
+    rootfs: Option<PathBuf>,
 }
 
 /// Имя файла rootfs внутри `<data_dir>/appliance/` (кладётся установщиком).
@@ -198,13 +203,35 @@ where
     let data_dir = data_dir.or_else(default_data_dir).ok_or_else(|| {
         "не удалось определить локальный каталог данных; укажите --data-dir <PATH>".to_string()
     })?;
-    let rootfs = rootfs.unwrap_or_else(|| data_dir.join("appliance").join(ROOTFS_FILE_NAME));
     Ok(CliArgs { data_dir, rootfs })
 }
 
 /// Каталог данных по умолчанию: `<локальный каталог данных>/BottleForApps`.
 fn default_data_dir() -> Option<PathBuf> {
     dirs::data_local_dir().map(|base| base.join("BottleForApps"))
+}
+
+/// Разрешает путь rootfs-тарболла (рулинг M3): явный `--rootfs` →
+/// `<data>/appliance/<ROOTFS_FILE_NAME>` (если файл существует; MSI
+/// кладёт его туда) → `<exe_dir>/appliance/<ROOTFS_FILE_NAME>`
+/// (portable-сборка: rootfs рядом с exe) → `<data>/appliance/…` как
+/// до M3 — сообщения об отсутствии продолжают указывать на каталог
+/// данных. `exe_dir` — каталог исполняемого файла (`None`, если путь
+/// недоступен).
+fn resolve_rootfs(explicit: Option<PathBuf>, data_dir: &Path, exe_dir: Option<&Path>) -> PathBuf {
+    if let Some(explicit) = explicit {
+        return explicit;
+    }
+    let data_rootfs = data_dir.join("appliance").join(ROOTFS_FILE_NAME);
+    if data_rootfs.is_file() {
+        return data_rootfs;
+    }
+    if let Some(exe_rootfs) = exe_dir.map(|dir| dir.join("appliance").join(ROOTFS_FILE_NAME)) {
+        if exe_rootfs.is_file() {
+            return exe_rootfs;
+        }
+    }
+    data_rootfs
 }
 
 /// Токен остановки, отменяемый по Ctrl+C.
@@ -266,23 +293,22 @@ mod tests {
             ]))
             .unwrap()
             .rootfs,
-            PathBuf::from("/tmp/rootfs.tar.gz")
+            Some(PathBuf::from("/tmp/rootfs.tar.gz"))
         );
         assert_eq!(
             parse_cli_args(args(&["--data-dir", "/tmp/bfa", "--rootfs=/tmp/r.tar"]))
                 .unwrap()
                 .rootfs,
-            PathBuf::from("/tmp/r.tar")
+            Some(PathBuf::from("/tmp/r.tar"))
         );
     }
 
+    /// Без `--rootfs` парсер не выбирает место сам — резолвер
+    /// [`resolve_rootfs`] разбирается с данными/exe-каталогом.
     #[test]
-    fn rootfs_defaults_into_data_dir_appliance() {
+    fn rootfs_absent_is_none_after_parse() {
         let parsed = parse_cli_args(args(&["--data-dir", "/tmp/bfa"])).unwrap();
-        assert_eq!(
-            parsed.rootfs,
-            PathBuf::from("/tmp/bfa/appliance").join(ROOTFS_FILE_NAME)
-        );
+        assert_eq!(parsed.rootfs, None);
     }
 
     #[test]
@@ -297,6 +323,78 @@ mod tests {
     #[test]
     fn unknown_argument_is_error() {
         assert!(parse_cli_args(args(&["--verbose"])).is_err());
+    }
+
+    /// Резолвер rootfs (рулинг M3): явный `--rootfs` → `<data>/appliance`
+    /// (если файл есть) → `<exe_dir>/appliance` (portable-установка,
+    /// если файл есть) → `<data>/appliance` по умолчанию (текущее
+    /// поведение: сообщения об ошибках указывают на каталог данных).
+    #[test]
+    fn resolve_rootfs_prefers_explicit_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let exe = tmp.path().join("exe");
+        assert_eq!(
+            resolve_rootfs(
+                Some(PathBuf::from("/custom/rootfs.tar.gz")),
+                &data,
+                Some(&exe)
+            ),
+            PathBuf::from("/custom/rootfs.tar.gz"),
+            "явный флаг не переопределяется никогда"
+        );
+    }
+
+    #[test]
+    fn resolve_rootfs_prefers_data_over_exe_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let exe = tmp.path().join("exe");
+        std::fs::create_dir_all(data.join("appliance")).unwrap();
+        std::fs::create_dir_all(exe.join("appliance")).unwrap();
+        std::fs::write(data.join("appliance").join(ROOTFS_FILE_NAME), "data").unwrap();
+        std::fs::write(exe.join("appliance").join(ROOTFS_FILE_NAME), "exe").unwrap();
+
+        assert_eq!(
+            resolve_rootfs(None, &data, Some(&exe)),
+            data.join("appliance").join(ROOTFS_FILE_NAME),
+            "MSI кладёт rootfs в данные — приоритет"
+        );
+    }
+
+    /// Portable: rootfs рядом с exe, в данных его нет.
+    #[test]
+    fn resolve_rootfs_falls_back_to_exe_dir_for_portable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let exe = tmp.path().join("exe");
+        std::fs::create_dir_all(exe.join("appliance")).unwrap();
+        std::fs::write(exe.join("appliance").join(ROOTFS_FILE_NAME), "exe").unwrap();
+
+        assert_eq!(
+            resolve_rootfs(None, &data, Some(&exe)),
+            exe.join("appliance").join(ROOTFS_FILE_NAME),
+            "portable-сборка: rootfs у exe"
+        );
+    }
+
+    /// Нигде нет — каталог данных (единственное место, куда смотрит
+    /// установка/ошибки).
+    #[test]
+    fn resolve_rootfs_defaults_to_data_dir_when_nowhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let exe = tmp.path().join("exe");
+
+        assert_eq!(
+            resolve_rootfs(None, &data, Some(&exe)),
+            data.join("appliance").join(ROOTFS_FILE_NAME)
+        );
+        // Без exe_dir (current_exe недоступен) — то же самое.
+        assert_eq!(
+            resolve_rootfs(None, &data, None),
+            data.join("appliance").join(ROOTFS_FILE_NAME)
+        );
     }
 
     #[test]
