@@ -74,7 +74,10 @@ flowchart LR
 | Host-бутылки: фирменные GUI-клиенты (AnyConnect и др.) на хосте + служба маршрутов `bottle-svc` | ✅ работает (M2) |
 | Авто-восстановление env-бутылок после сна/`wsl --shutdown`, живучесть (health-цикл) | ✅ работает (M2) |
 | Параллельные CLI-команды во время длинного `start` | ✅ работает (M2) |
-| Установщик в один клик (MSI + portable) | 🔜 M3 |
+| Установка одним MSI (служба + WSL + PATH, один UAC) и portable-zip без админа | ✅ работает (M3) |
+| Управление профилями из CLI: `create` / `delete` | ✅ работает (M3) |
+| Диагностика: `bottle doctor`, файловые журналы, `bottle logs export` | ✅ работает (M3) |
+| Обновление аплаенса `bottle upgrade`; чистка маршрутов `bottle routes cleanup` | ✅ работает (M3) |
 | Графический интерфейс | 🔜 M4 |
 | Поддержка macOS | 🔜 M4 |
 
@@ -93,82 +96,37 @@ flowchart LR
 
 ## Установка на Windows
 
-> В milestone M3 появится установщик в один клик. Сейчас установка — из исходников, это занимает ~15 минут и не требует опыта разработки.
+Два способа, оба ведут к одному: [MSI](#вариант-1-msi-полная-установка) — рекомендуемый, portable-zip — без прав администратора. Сборка из исходников — [раздел для разработчиков](#сборка-из-исходников).
 
-### Шаг 1. Включите WSL2
+> Установщики не подписаны сертификатом (осознанно, до покупки подписи): SmartScreen покажет предупреждение — «Подробнее → Выполнить в любом случае». Контрольные суммы релизов — в `SHA256SUMS.txt` рядом с файлами.
 
-Откройте **PowerShell от имени администратора** и выполните:
+### Вариант 1: MSI (полная установка)
 
-```powershell
-wsl --install --no-distribution
-```
+Один запрос UAC ставит всё: файлы в `Program Files\BottleForApps`, PATH, службу маршрутов `bottle-svc` (для host-бутылок) и включает компоненты WSL (без дистрибутива).
 
-Если система попросит перезагрузку — перезагрузитесь и вернитесь сюда. Проверка:
+1. Скачайте `BottleForApps-<версия>-win-x64.msi` со [страницы релизов](../../releases) и запустите.
+2. Если установщик включал WSL и система просит перезагрузку — перезагрузитесь.
+3. Запустите демон: откройте **новое** окно PowerShell (PATH обновился) и выполните `bottled` (при первом запуске демон сам импортирует Linux-аплаенс).
 
-```powershell
-wsl --status
-```
+Проверка окружения: `bottle doctor` — все строки зелёные или предупреждения с пояснениями.
 
-### Шаг 2. Установите инструменты сборки
+### Вариант 2: portable (без прав администратора)
 
-1. **Rust** — скачайте и установите [rustup](https://rustup.rs/) (официальный установщик, всё по умолчанию).
-2. **Git for Windows** — [git-scm.com](https://git-scm.com/download/win).
-3. **Docker Desktop** — [docker.com](https://www.docker.com/products/docker-desktop/) — нужен один раз, чтобы собрать Linux-образ аплаенса. После установки запустите Docker Desktop и дождитесь статуса «Running».
+1. Скачайте `BottleForApps-portable-<версия>-win-x64.zip`, распакуйте в любой каталог.
+2. WSL должен быть включён в системе **заранее** (`wsl --install --no-distribution` от администратора один раз; portable сам WSL не ставит).
+3. Запустите `bottled.exe` из каталога распаковки.
 
-Проверка в новом окне PowerShell:
+Ограничения portable: только env-бутылки (WireGuard/OpenVPN). Для host-бутылок запустите от администратора `bottle-svc.exe --install` из того же каталога. Подробности — в `INSTALL.txt` внутри архива.
 
-```powershell
-cargo --version ; git --version ; docker version
-```
+### Автозапуск демона (необязательно)
 
-### Шаг 3. Соберите проект
+Автозапуск по умолчанию выключен. Включается вручную: ярлык `bottled.exe` в `shell:startup` (Win+R → `shell:startup`) со свойством «Окно: свёрнутое». Демон не показывает интерфейса и не мешает работе.
 
-```powershell
-git clone <адрес-этого-репозитория> BottleForApps
-cd BottleForApps
-cargo build --release -p daemon -p cli -p svc
-```
+### Обновление и удаление (MSI)
 
-В `target\release` появятся `bottled.exe` (демон), `bottle.exe` (CLI) и `bottle-svc.exe` (служба маршрутов — нужна только для [host-бутылок](#host-бутылки-фирменные-vpn-клиенты)). Для удобства скопируйте их в отдельный каталог, например `C:\Tools\BottleForApps`:
-
-```powershell
-mkdir C:\Tools\BottleForApps
-copy target\release\bottled.exe, target\release\bottle.exe, target\release\bottle-svc.exe C:\Tools\BottleForApps\
-```
-
-### Шаг 4. Соберите Linux-апплайенс
-
-```powershell
-bash appliance\build-rootfs.sh
-```
-
-Скрипт соберёт внутри Docker лёгкий Linux-образ (~9 МБ) с wireguard-go, OpenVPN и агентом, проверит его и положит результат в `artifacts\bottleforapps-rootfs.tar.gz`. Каталог `artifacts` скрипт создаёт сам.
-
-### Шаг 5. Подготовьте каталог данных
-
-Демон хранит профили и служебные файлы в каталоге данных (по умолчанию — `%LOCALAPPDATA%\BottleForApps`, можно переопределить флагом `--data-dir`). Скопируйте туда образ аплаенса:
-
-```powershell
-mkdir $env:LOCALAPPDATA\BottleForApps\appliance -Force
-copy artifacts\bottleforapps-rootfs.tar.gz $env:LOCALAPPDATA\BottleForApps\appliance\
-```
-
-Если передаёте `--data-dir`, положите образ в `<ваш-каталог>\appliance\` — демон ищет его там по умолчанию (можно переопределить флагом `--rootfs`).
-
-### Шаг 6. Запустите демон
-
-```powershell
-C:\Tools\BottleForApps\bottled.exe
-```
-
-Оставьте окно открытым (автозапуск службы появится в M3). При первом запуске демон сам импортирует аплаенс в WSL. Готово — переходите к [быстрому старту](#быстрый-старт-за-5-минут).
-
-<details>
-<summary>Автозапуск демона при входе в систему (необязательно)</summary>
-
-Создайте ярлык `bottled.exe` в `shell:startup` (Win+R → `shell:startup`) со свойством «Окно: свёрнутое». Демон не показывает интерфейса и не мешает работе.
-
-</details>
+- **Обновление** — запустите MSI новой версии поверх старой (major upgrade: файлы и служба заменяются; профили в каталоге данных не трогаются). Даунгрейд отвергается — сначала удалите новую версию.
+- **Обновление Linux-аплаенса** — `bottle upgrade` (останавливает бутылки по требованию; профили сохраняются).
+- **Удаление** — «Панель управления → Приложения → BottleForApps»: файлы, PATH и служба убираются; ваш каталог данных с профилями остаётся.
 
 ---
 
@@ -192,11 +150,20 @@ bottle работает только на Windows (демон недоступе
 
 Демон запущен (см. установку). Предположим, у вас есть файл WireGuard `office-a.conf` для сети офиса, в которой стоит RDP-сервер `10.20.30.15`.
 
-### 1. Создайте профиль бутылки
+### 1. Создайте бутылку
 
-Профили лежат в `%LOCALAPPDATA%\BottleForApps\bottles\` (или `<--data-dir>\bottles\`). Создайте два файла:
+```powershell
+bottle create office-a --name "Офис А" --kind env --protocol wireguard ^
+    --config C:\путь\к\office-a.conf ^
+    --forward 10.20.30.15:3389 --dns 10.20.30.1
+```
 
-**`bottles\office-a.toml`** — профиль:
+Демон скопирует конфиг в хранилище (`%LOCALAPPDATA%\BottleForApps\bottles\`, секреты недоступны другим пользователям) и запишет профиль TOML. Всё можно проверить: `bottle show office-a`; занятый id перезаписывается только с `--force`.
+
+<details>
+<summary>Без CLI: профиль руками</summary>
+
+Профиль — файл `bottles\office-a.toml`; конфиг кладётся рядом как `office-a.conf`:
 
 ```toml
 id = "office-a"
@@ -210,16 +177,17 @@ config = "office-a.conf"
 [expose]
 socks5 = 0
 forwards = [{ listen = 0, target = "10.20.30.15:3389" }]
+dns = "10.20.30.1"
 ```
 
-**`bottles\office-a.conf`** — ваш конфиг WireGuard как есть (секретный ключ внутри).
-
 > `socks5 = 0` и `listen = 0` означают «выбрать порт автоматически». Порт узнаете в `bottle status` после запуска.
+
+</details>
 
 ### 2. Запустите бутылку
 
 ```powershell
-C:\Tools\BottleForApps\bottle.exe start office-a
+bottle start office-a
 ```
 
 Демон поднимет namespace с туннелем (первый запуск включает WSL-VM — до минуты; дальше — секунды), дождётся WireGuard-handshake и откроет слушатели. В случае успеха:
@@ -380,12 +348,16 @@ BottleForApps — управление бутылками
 Usage: bottle <COMMAND>
 
 Commands:
-  list    Список бутылок в хранилище
-  show    Показать профиль и состояние бутылки
-  start   Поднять бутылку (туннель + SOCKS5 + пробросы)
-  stop    Опустить бутылку
-  status  Состояние поднятых бутылок
-  help    Print help
+  list     Список бутылок в хранилище
+  show     Показать профиль и состояние бутылки
+  start    Поднять бутылку (туннель + SOCKS5 + пробросы)
+  stop     Опустить бутылку
+  status   Состояние поднятых бутылок
+  doctor   Диагностика окружения (WSL, аплаенс, служба, порты)
+  logs     Журналы диагностики
+  routes   Маршруты host-бутылок
+  upgrade  Пере-импорт аплаенса (снос дистрибуции WSL + импорт из rootfs)
+  help     Print help
 
 Options:
   -h, --help     Print help
@@ -447,6 +419,56 @@ office-b  up
   rdp 10.30.0.20:3389 → 127.0.0.1:55202
 ```
 
+### `bottle create` / `bottle delete` — управление профилями
+
+```powershell
+# env-бутылка из конфига WireGuard/OpenVPN
+bottle create office-a --name "Офис А" --kind env --protocol wireguard `
+    --config C:\conf\office-a.conf `
+    [--socks5 1080] [--forward 10.20.30.15:3389 …] [--dns 10.20.30.1] [--launch mstsc] [--force]
+
+# host-бутылка (фирменный клиент)
+bottle create corp --name "Корп" --kind host `
+    --vpn "C:\Program Files\Vendor\vpn.exe" [--vpn-args "connect office"] `
+    --endpoint vpn.example.com [--vpn-interface "Vendor Adapter"]
+
+bottle delete office-a    # отказ, если бутылка поднята
+```
+
+Создание проверяет профиль (env — `--protocol` и `--config`; host — `--vpn` и минимум один `--endpoint`) и отказывает на занятый id без `--force`. Удаление сносит профиль и копию конфига из хранилища (исходный файл у вас не трогается).
+
+### `bottle doctor` — диагностика окружения
+
+```text
+C:\> bottle doctor
+✓ wsl          WSL включён, дистрибуций: 2
+✓ wsl-networking  Режим сети — NAT
+⚠ appliance    Аплаенс не импортирован — импортируется при первом старте бутылки
+⚠ service      Служба маршрутов не установлена — только env-бутылки; для host-бутылок выполните от администратора: bottle-svc --install
+✓ agent        Агент аплаенса отвечает
+✓ profiles     Профили читаются: 2
+✓ ports        Фиксированных портов в профилях нет
+```
+
+`⚠` — допустимое состояние (portable без службы, аплаенс до первого старта), `✗` — требует действий (включить WSL, убрать `networkingMode=mirrored` из `.wslconfig`, обновить аплаенс). Код возврата: 0 без `✗`, 1 при любом.
+
+### `bottle logs export` — выгрузка журналов
+
+```powershell
+bottle logs export [--dest C:\tmp\logs.zip]
+```
+
+Демон собирает ZIP: свои журналы (`<каталог данных>\logs`), журналы службы (`%PROGRAMDATA%\BottleForApps\logs`) и сводку `system.txt` — версии, состояния бутылок, профили **без содержимого конфигов**. Журналы пишутся файлами (ротация ежедневно, хранение 30 дней). Архив содержит IP-адреса, имена интерфейсов и endpoint'ы — **просмотрите содержимое перед отправкой** кому-либо.
+
+### `bottle routes cleanup` / `bottle upgrade`
+
+```powershell
+bottle routes cleanup   # снять сиротские маршруты через службу (крах демона и т.п.)
+bottle upgrade          # пере-импорт Linux-аплаенса из rootfs
+```
+
+`upgrade` отказывает при поднятых бутылках, сносит только дистрибуцию WSL `bottleforapps` (профили в каталоге данных не трогаются, токен пересоздаётся) и пере-импортирует аплаенс — в ответе старая и новая версии.
+
 ### Демон `bottled`
 
 ```text
@@ -456,7 +478,7 @@ office-b  up
 | Флаг | По умолчанию | Смысл |
 |---|---|---|
 | `--data-dir` | `%LOCALAPPDATA%\BottleForApps` | профили, токен, образ аплаенса |
-| `--rootfs` | `<data-dir>\appliance\bottleforapps-rootfs.tar.gz` | Linux-образ для импорта в WSL |
+| `--rootfs` | `<data-dir>\appliance\…`, затем `<каталог exe>\appliance\…` | Linux-образ для импорта в WSL; цепочка покрывает MSI (Program Files) и portable (рядом с exe) |
 
 Второй экземпляр демона не запускается («Демон BottleForApps уже запущен»). Остановка — `Ctrl+C` в его окне; поднятые бутылки будут корректно разобраны.
 
@@ -516,7 +538,7 @@ forwards = [
 - **Перезагружали компьютер или выполняли `wsl --shutdown`** — env-бутылки восстановятся сами: демон замечает смерть аплаенса (health-цикл 10 с) и пере-поднимает их с бэкоффом, обычно до ~2 минут. Следить удобно `bottle status` (метка `Degraded` — идёт восстановление). Host-бутылка с живым VPN-адаптером не трогается вовсе.
 - **Подозрение на мусор в WSL** — `wsl -d bottleforapps -- ip netns list` покажет активные namespace'ы бутылок; после корректного `stop` список пуст. Полный сброс аплаенса: `wsl --unregister bottleforapps` (демон пересоздаст его при следующем старте; перед этим удалите файл `appliance-token` в каталоге данных, чтобы не осталось «потерянного» токена).
 
-Подробнее — [чеклист проверки M1](docs/checklists/m1-verification.md) и [чеклист приёмки M2](docs/checklists/m2-verification.md) (в т.ч. destructive-проверки: kill демона/службы, `wsl --shutdown`, параллельные CLI).
+Подробнее — [чеклист проверки M1](docs/checklists/m1-verification.md), [чеклист приёмки M2](docs/checklists/m2-verification.md) (в т.ч. destructive-проверки: kill демона/службы, `wsl --shutdown`, параллельные CLI) и [чеклист релизной приёмки M3](docs/checklists/m3-verification.md) (чистая машина: MSI → первая бутылка без ручных шаманств).
 
 ---
 
@@ -534,7 +556,7 @@ forwards = [
 | Порт из `status` не открывается | бутылка остановлена (`bottle status`); либо порт занят — укажите другой в профиле |
 | Хочу начать с чистого листа | `wsl --unregister bottleforapps` + удалить каталог данных + перезапуск демона |
 
-Журнал демона в текущей версии пишется в консоль его окна (файловые журналы и `bottle logs export` — в M3). Технические подробности архитектуры — в [спецификации](docs/superpowers/specs/2026-09-30-bottleforapps-v2-design.md).
+Журналы пишутся файлами (JSONL, ротация ежедневно, хранение 30 дней): демон — `<каталог данных>\logs`, служба — `%PROGRAMDATA%\BottleForApps\logs`. Выгрузка всего сразу: `bottle logs export`. Технические подробности архитектуры — в [спецификации](docs/superpowers/specs/2026-09-30-bottleforapps-v2-design.md).
 
 ---
 
@@ -549,13 +571,15 @@ forwards = [
 
 ## Ограничения текущей версии
 
-Честный список границ M2:
+Честный список границ M3:
 
 1. **Фирменные клиенты управляются ограниченно**: kill switch вендора может конфликтовать со вторым VPN, клиент не останавливается командой `stop`, один экземпляр клиента на host-бутылку (подробнее — [Host-бутылки → Ограничения](#ограничения-host-бутылок)).
 2. **UDP-приложения не ретранслируются** — SOCKS5 используется в режиме TCP (RDP-клиент Windows сам переходит на TCP; браузеры и большинство инструментов работают по TCP).
 3. **После сна/рестарта WSL env-бутылки восстанавливаются автоматически** — но не мгновенно: диагностика и повторные попытки занимают до ~2 минут (`Degraded` в `bottle status` — норма на это время).
-4. **Нет установщика и `doctor`** — сборка из исходников, диагностика по журналу в консоли (M3).
-5. **Только Windows.** macOS — M4.
+4. **Автозапуск демона не включается установщиком** (осознанно): ярлык в `shell:startup` ставится вручную (см. установку).
+5. **Установщики не подписаны** — SmartScreen предупреждает; подпись кода появится после покупки сертификата (шаг подписи в релизной джобе подготовлен).
+6. **MSI поверх ручной `bottle-svc --install`** откажет с текстом «служба уже установлена» — снимите службу (`bottle-svc --uninstall`) и повторите MSI.
+7. **Только Windows.** macOS — M4.
 
 ---
 
@@ -593,7 +617,8 @@ crates/
   svc/         # bottle-svc — служба маршрутов Windows (host-бутылки)
   cli/         # bottle — тонкий CLI
 appliance/     # сборка Linux-образа (Dockerfile + overlay + скрипт)
-scripts/       # CI-сценарии
+installer/     # WiX-проект MSI
+scripts/       # CI-сценарии и portable-сборка
 docs/          # спецификация, план, чеклист приёмки
 ```
 
@@ -607,7 +632,7 @@ docs/          # спецификация, план, чеклист приёмк
 |---|---|
 | **M1** ✅ | env-бутылки WireGuard/OpenVPN, SOCKS5 + пробросы, CLI, stateless-апплайенс |
 | **M2** ✅ | host-бутылки для фирменных клиентов (привилегированная служба маршрутов), авто-восстановление, живучесть, параллельный CLI |
-| **M3** | установщики MSI + portable, `bottle doctor`, файловые журналы и `logs export`, команда `create` |
+| **M3** ✅ | установщики MSI + portable, `create`/`delete`/`upgrade`/`doctor`/`logs export`/`routes cleanup`, файловые журналы |
 | **M4** | графический интерфейс (Tauri), поддержка macOS (встроенная виртуализация) |
 
 История версии 1 — ветка `v1`, тег `v1-mvp`.
