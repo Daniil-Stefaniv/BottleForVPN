@@ -4,6 +4,10 @@
 //! отправляет [`CliRequest`] по named pipe `\\.\pipe\bottled` и рендерит
 //! [`CliReply`] в русский вывод. Рендер вынесен в [`render`] и покрыт
 //! unit-тестами на любой платформе; транспорт — только на Windows.
+//!
+//! Флаг `--json` (M4, рулинг D1) переключает вывод в машинный режим:
+//! stdout несёт сериализованный `CliReply`, ошибки — `{"Error":…}`,
+//! коды выхода 0/1/2; этим режимом пользуется GUI как сайдкар-подпроцесс.
 
 mod render;
 
@@ -16,17 +20,25 @@ use bottle_core::ipc::{CliReply, CliRequest};
 use bottle_core::profile::{
     BottleKind, BottleProfile, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig,
 };
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "bottle",
     about = "BottleForApps — управление бутылками",
-    version
+    version,
+    disable_version_flag = true
 )]
 struct Cli {
+    /// Машинный режим для GUI: ответы печатаются как JSON (CliReply)
+    /// в stdout, коды выхода 0/1/2 (2 — ошибка разбора аргументов).
+    #[arg(long, global = true)]
+    json: bool,
+    /// Показать версию и выйти (`--version --json` → {"version":"…"}).
+    #[arg(long, global = true)]
+    version: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// `Create` — самый крупный вариант (флаги создания профиля);
@@ -268,25 +280,106 @@ fn reply_timeout(request: &CliRequest) -> Duration {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    // Свой флаг --version вместо clap: при сочетании с --json вывод
+    // машинный ({"version":"…"}), и работает он без подкоманды.
+    if cli.version {
+        println!("{}", version_output(cli.json));
+        return ExitCode::SUCCESS;
+    }
+
+    let Some(command) = cli.command else {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingSubcommand,
+                "укажите подкоманду (список — --help)",
+            )
+            .exit()
+    };
+
     // Транспорт демона существует только на Windows (named pipe, спека §4.4);
     // рендер и разбор аргументов при этом кроссплатформенны и тестируются.
     #[cfg(not(windows))]
     {
-        let _ = cli;
-        eprintln!("bottle работает только на Windows (демон недоступен на этой платформе)");
+        let _ = command;
+        if cli.json {
+            println!(
+                "{}",
+                render_json(&CliReply::Error {
+                    message:
+                        "bottle работает только на Windows (демон недоступен на этой платформе)"
+                            .to_string()
+                })
+            );
+        } else {
+            eprintln!("bottle работает только на Windows (демон недоступен на этой платформе)");
+        }
         ExitCode::FAILURE
     }
 
     #[cfg(windows)]
     {
-        let request = cli.command.to_request();
+        let request = command.to_request();
         match client::exchange(&request).await {
-            Ok(reply) => handle_reply(&cli.command, reply),
+            Ok(reply) => {
+                if cli.json {
+                    handle_reply_json(&reply)
+                } else {
+                    handle_reply(&command, reply)
+                }
+            }
             Err(error) => {
-                eprintln!("{error}");
+                if cli.json {
+                    println!(
+                        "{}",
+                        render_json(&CliReply::Error {
+                            message: error.to_string()
+                        })
+                    );
+                } else {
+                    eprintln!("{error}");
+                }
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+/// Строка `--version`: текст (`bottle 0.2.0`) или JSON для `--json`.
+fn version_output(json: bool) -> String {
+    if json {
+        format!("{{\"version\":\"{}\"}}", env!("CARGO_PKG_VERSION"))
+    } else {
+        format!("bottle {}", env!("CARGO_PKG_VERSION"))
+    }
+}
+
+/// Сериализует ответ демона для `--json`: контракт GUI — имена полей
+/// CliReply на проводе, без рендера (сериализация этих типов неотказна).
+fn render_json(reply: &CliReply) -> String {
+    serde_json::to_string(reply).expect("CliReply сериализуется в JSON без потерь")
+}
+
+/// Печатает ответ демона в json-режиме: stdout всегда валидный JSON,
+/// код выхода повторяет текстовый режим (Error / doctor с fail /
+/// show без профиля — 1, прочие успехи — 0).
+// Вызывается windows-транспортом; на остальных платформах — только тестами.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn handle_reply_json(reply: &CliReply) -> ExitCode {
+    println!("{}", render_json(reply));
+    match reply {
+        CliReply::Error { .. } => ExitCode::FAILURE,
+        CliReply::DoctorReport { items } => {
+            if items
+                .iter()
+                .any(|item| item.status == bottle_core::ipc::CheckStatus::Fail)
+            {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        CliReply::Show { profile: None, .. } => ExitCode::FAILURE,
+        _ => ExitCode::SUCCESS,
     }
 }
 
@@ -507,6 +600,7 @@ mod tests {
         Cli::try_parse_from(args)
             .expect("аргументы корректны")
             .command
+            .expect("подкоманда задана")
     }
 
     #[test]
@@ -859,6 +953,355 @@ mod tests {
                 Cli::try_parse_from(["bottle", command]).is_err(),
                 "«{command}» без id должен отказывать"
             );
+        }
+    }
+
+    // ---- `--json`-режим (M4 Task 1): контракт для GUI ----
+
+    /// Флаг `--json` глобальный: принимается до и после подкоманды.
+    #[test]
+    fn json_flag_parses_before_and_after_subcommand() {
+        for args in [
+            vec!["bottle", "--json", "list"],
+            vec!["bottle", "list", "--json"],
+            vec![
+                "bottle",
+                "create",
+                "a",
+                "--name",
+                "N",
+                "--kind",
+                "host",
+                "--vpn",
+                "v.exe",
+                "--endpoint",
+                "e.example",
+                "--json",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args.clone()).expect("--json в любой позиции");
+            assert!(cli.json, "{args:?}");
+        }
+    }
+
+    /// `--version` работает без подкоманды (свой флаг вместо clap).
+    #[test]
+    fn version_flag_parses_without_subcommand() {
+        let cli = Cli::try_parse_from(["bottle", "--version"]).expect("--version без подкоманды");
+        assert!(cli.version);
+        assert!(cli.command.is_none());
+        let cli = Cli::try_parse_from(["bottle", "--version", "--json"]).expect("с --json");
+        assert!(cli.version && cli.json);
+    }
+
+    /// `--version --json` → `{"version":"…"}`; текстовый формат не меняется.
+    #[test]
+    fn version_output_text_and_json_shapes() {
+        assert_eq!(
+            version_output(false),
+            format!("bottle {}", env!("CARGO_PKG_VERSION"))
+        );
+        let json = version_output(true);
+        assert_eq!(
+            json,
+            format!("{{\"version\":\"{}\"}}", env!("CARGO_PKG_VERSION"))
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).expect("корректный JSON");
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    fn json_list_reply() -> CliReply {
+        use bottle_core::ipc::BottleSummary;
+        CliReply::List {
+            bottles: vec![
+                BottleSummary {
+                    id: "office-a".to_string(),
+                    name: "Офис А".to_string(),
+                    kind: bottle_core::profile::BottleKind::Env,
+                    state: Some("up".to_string()),
+                },
+                BottleSummary {
+                    id: "corp".to_string(),
+                    name: "Корп VPN".to_string(),
+                    kind: bottle_core::profile::BottleKind::Host,
+                    state: None,
+                },
+            ],
+        }
+    }
+
+    /// Golden: list — стабильные имена полей CliReply.
+    #[test]
+    fn json_golden_list() {
+        assert_eq!(
+            render_json(&json_list_reply()),
+            r#"{"List":{"bottles":[{"id":"office-a","name":"Офис А","kind":"env","state":"up"},{"id":"corp","name":"Корп VPN","kind":"host","state":null}]}}"#
+        );
+    }
+
+    /// Golden: show с профилем и рантаймом.
+    #[test]
+    fn json_golden_show_full() {
+        let reply = CliReply::Show {
+            profile: Some(bottle_core::profile::BottleProfile {
+                id: "office-a".to_string(),
+                name: "Офис А".to_string(),
+                kind: bottle_core::profile::BottleKind::Env,
+                vpn: bottle_core::profile::VpnConfig::Env {
+                    protocol: bottle_core::profile::TunnelProtocol::WireGuard,
+                    config: "wg-office-a.conf".to_string(),
+                },
+                expose: bottle_core::profile::ExposeConfig {
+                    socks5: 1080,
+                    forwards: vec![bottle_core::profile::ForwardSpec {
+                        listen: 33389,
+                        target: "10.20.30.15:3389".to_string(),
+                    }],
+                    dns: Some("10.20.30.1".parse().unwrap()),
+                    launch: Some("mstsc".to_string()),
+                },
+            }),
+            runtime: Some(bottle_core::ipc::RuntimeState {
+                id: "office-a".to_string(),
+                state: bottle_core::ipc::BottleState::Up,
+                socks5: Some(1080),
+                forwards: vec![bottle_core::protocol::ForwardPort {
+                    port: 33389,
+                    target: "10.20.30.15:3389".to_string(),
+                }],
+            }),
+        };
+        assert_eq!(
+            render_json(&reply),
+            r#"{"Show":{"profile":{"id":"office-a","name":"Офис А","kind":"env","vpn":{"protocol":"wireguard","config":"wg-office-a.conf"},"expose":{"socks5":1080,"forwards":[{"listen":33389,"target":"10.20.30.15:3389"}],"dns":"10.20.30.1","launch":"mstsc"}},"runtime":{"id":"office-a","state":"Up","socks5":1080,"forwards":[{"port":33389,"target":"10.20.30.15:3389"}]}}}"#
+        );
+    }
+
+    /// Golden: show без профиля — null-половки, не ошибка формата.
+    #[test]
+    fn json_golden_show_missing_profile() {
+        let reply = CliReply::Show {
+            profile: None,
+            runtime: None,
+        };
+        assert_eq!(
+            render_json(&reply),
+            r#"{"Show":{"profile":null,"runtime":null}}"#
+        );
+    }
+
+    /// Golden: остальные варианты ответов одной строкой каждый.
+    #[test]
+    fn json_golden_single_variant_replies() {
+        assert_eq!(
+            render_json(&CliReply::Started {
+                id: "office-a".to_string()
+            }),
+            r#"{"Started":{"id":"office-a"}}"#
+        );
+        assert_eq!(
+            render_json(&CliReply::Stopped {
+                id: "office-a".to_string(),
+                warning: None
+            }),
+            r#"{"Stopped":{"id":"office-a","warning":null}}"#
+        );
+        assert_eq!(
+            render_json(&CliReply::Stopped {
+                id: "corp".to_string(),
+                warning: Some("VPN-клиент оставлен запущенным".to_string())
+            }),
+            r#"{"Stopped":{"id":"corp","warning":"VPN-клиент оставлен запущенным"}}"#
+        );
+        assert_eq!(
+            render_json(&CliReply::Path(
+                r"C:\tmp\bottleforapps-logs-20261004-1200.zip".to_string()
+            )),
+            r#"{"Path":"C:\\tmp\\bottleforapps-logs-20261004-1200.zip"}"#
+        );
+        assert_eq!(
+            render_json(&CliReply::Created {
+                id: "office-a".to_string()
+            }),
+            r#"{"Created":{"id":"office-a"}}"#
+        );
+        assert_eq!(
+            render_json(&CliReply::Deleted {
+                id: "office-a".to_string(),
+                warning: None
+            }),
+            r#"{"Deleted":{"id":"office-a","warning":null}}"#
+        );
+        assert_eq!(
+            render_json(&CliReply::Upgraded {
+                previous: Some("0.1.0".to_string()),
+                current: "0.2.0".to_string()
+            }),
+            r#"{"Upgraded":{"previous":"0.1.0","current":"0.2.0"}}"#
+        );
+        assert_eq!(
+            render_json(&CliReply::Done { warning: None }),
+            r#"{"Done":{"warning":null}}"#
+        );
+        assert_eq!(
+            render_json(&CliReply::Error {
+                message: "бутылка office-a не найдена".to_string()
+            }),
+            r#"{"Error":{"message":"бутылка office-a не найдена"}}"#
+        );
+    }
+
+    /// Golden: status с состояниями Up/Degraded (варианты BottleState —
+    /// внешний тег CamelCase, как на проводе протокола).
+    #[test]
+    fn json_golden_status() {
+        let reply = CliReply::Status {
+            bottles: vec![
+                bottle_core::ipc::RuntimeState {
+                    id: "office-a".to_string(),
+                    state: bottle_core::ipc::BottleState::Up,
+                    socks5: Some(1080),
+                    forwards: vec![],
+                },
+                bottle_core::ipc::RuntimeState {
+                    id: "office-b".to_string(),
+                    state: bottle_core::ipc::BottleState::Degraded {
+                        reason: "агент аплаенса не отвечает".to_string(),
+                    },
+                    socks5: None,
+                    forwards: vec![],
+                },
+            ],
+        };
+        assert_eq!(
+            render_json(&reply),
+            r#"{"Status":{"bottles":[{"id":"office-a","state":"Up","socks5":1080,"forwards":[]},{"id":"office-b","state":{"Degraded":{"reason":"агент аплаенса не отвечает"}},"socks5":null,"forwards":[]}]}}"#
+        );
+    }
+
+    /// Golden: doctor-отчёт со всеми тремя статусами проверок.
+    #[test]
+    fn json_golden_doctor_report() {
+        use bottle_core::ipc::{CheckItem, CheckStatus};
+        let reply = CliReply::DoctorReport {
+            items: vec![
+                CheckItem {
+                    code: "wsl".to_string(),
+                    status: CheckStatus::Ok,
+                    detail: "WSL включён, дистрибуций: 2".to_string(),
+                },
+                CheckItem {
+                    code: "service".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: "Служба маршрутов не установлена".to_string(),
+                },
+                CheckItem {
+                    code: "agent".to_string(),
+                    status: CheckStatus::Fail,
+                    detail: "агент не отвечает".to_string(),
+                },
+            ],
+        };
+        assert_eq!(
+            render_json(&reply),
+            r#"{"DoctorReport":{"items":[{"code":"wsl","status":"Ok","detail":"WSL включён, дистрибуций: 2"},{"code":"service","status":"Warn","detail":"Служба маршрутов не установлена"},{"code":"agent","status":"Fail","detail":"агент не отвечает"}]}}"#
+        );
+    }
+
+    /// Контракт секретов: профиль несёт ИМЯ конфига, не содержимое —
+    /// маркеры WG/OpenVPN-конфига не встречаются ни в одном json-выводе
+    /// (Review Focus #1).
+    #[test]
+    fn json_never_contains_config_contents() {
+        let profile = bottle_core::profile::BottleProfile {
+            id: "office-a".to_string(),
+            name: "Офис А".to_string(),
+            kind: bottle_core::profile::BottleKind::Env,
+            vpn: bottle_core::profile::VpnConfig::Env {
+                protocol: bottle_core::profile::TunnelProtocol::WireGuard,
+                config: "wg-office-a.conf".to_string(),
+            },
+            expose: bottle_core::profile::ExposeConfig {
+                socks5: 1080,
+                forwards: vec![],
+                dns: None,
+                launch: None,
+            },
+        };
+        let show = CliReply::Show {
+            profile: Some(profile),
+            runtime: None,
+        };
+        let json = render_json(&show);
+        // Поле config — точно имя файла, не содержимое.
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("show-ответ — корректный JSON");
+        assert_eq!(
+            value["Show"]["profile"]["vpn"]["config"],
+            "wg-office-a.conf"
+        );
+        // Маркеры содержимого WG/OpenVPN-конфига отсутствуют.
+        for marker in ["[Interface]", "[Peer]", "PrivateKey", "<ca>", "<tls-auth>"] {
+            assert!(!json.contains(marker), "секрет {marker:?} утёк в {json}");
+        }
+        // И в list-выводе их нет.
+        let list_json = render_json(&json_list_reply());
+        for marker in ["[Interface]", "PrivateKey"] {
+            assert!(!list_json.contains(marker));
+        }
+    }
+
+    /// Коды выхода json-режима повторяют текстовый: Error — 1, doctor
+    /// с fail — 1 (отчёт всё равно напечатан), show без профиля — 1,
+    /// остальные успехи — 0.
+    #[test]
+    fn json_exit_codes_mirror_text_mode() {
+        use bottle_core::ipc::{CheckItem, CheckStatus};
+        assert_eq!(
+            handle_reply_json(&CliReply::Error {
+                message: "x".to_string()
+            }),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            handle_reply_json(&CliReply::DoctorReport {
+                items: vec![CheckItem {
+                    code: "agent".to_string(),
+                    status: CheckStatus::Fail,
+                    detail: "…".to_string()
+                }]
+            }),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            handle_reply_json(&CliReply::DoctorReport {
+                items: vec![CheckItem {
+                    code: "service".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: "…".to_string()
+                }]
+            }),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            handle_reply_json(&CliReply::Show {
+                profile: None,
+                runtime: None
+            }),
+            ExitCode::FAILURE
+        );
+        for reply in [
+            CliReply::Started {
+                id: "a".to_string(),
+            },
+            CliReply::Created {
+                id: "a".to_string(),
+            },
+            CliReply::Done { warning: None },
+            CliReply::Path("p.zip".to_string()),
+            json_list_reply(),
+        ] {
+            assert_eq!(handle_reply_json(&reply), ExitCode::SUCCESS, "{reply:?}");
         }
     }
 
