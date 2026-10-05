@@ -236,12 +236,275 @@ pub async fn run_ps_raw(_args: &[String]) -> Result<String, RouteOpError> {
     Err(RouteOpError::NotWindows)
 }
 
+// ----------------------------------------------------------------------
+// Полная валидация шлюза (спека §4.2 дословно, M3).
+// ----------------------------------------------------------------------
+
+/// Строка таблицы default-маршрутов: псевдоним интерфейса и его
+/// текущий next-hop (шлюз по умолчанию).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultRouteRow {
+    /// `InterfaceAlias` интерфейса default-маршрута.
+    pub iface_alias: String,
+    /// `NextHop` default-маршрута интерфейса.
+    pub next_hop: IpAddr,
+}
+
+/// Разбирает вывод `Get-NetRoute -DestinationPrefix <default> |
+/// Select-Object InterfaceAlias,NextHop | ConvertTo -Csv`: заголовок
+/// «InterfaceAlias","NextHop», далее строки данных. Пустые NextHop
+/// (on-link default-маршруты без шлюза) пропускаются: они не могут
+/// быть шлюзом точечного маршрута.
+pub fn parse_default_routes(csv: &str) -> Vec<DefaultRouteRow> {
+    let mut rows = Vec::new();
+    for line in csv.lines().skip(1) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Формат ConvertTo-Csv: "alias","nexthop" — простое
+        // разрезание по «",\u{22}» (три символа: кавычка-запятая-
+        // кавычка) достаточно для двух полей.
+        let fields: Vec<&str> = line.split("\",\"").collect();
+        if fields.len() != 2 {
+            continue;
+        }
+        let alias = fields[0].trim_start_matches('"');
+        let hop = fields[1].trim_end_matches('"');
+        if let Ok(next_hop) = hop.parse::<IpAddr>() {
+            rows.push(DefaultRouteRow {
+                iface_alias: alias.to_string(),
+                next_hop,
+            });
+        }
+    }
+    rows
+}
+
+/// Проверка «шлюз == текущий шлюз интерфейса» (спека §4.2): сверка
+/// с таблицей default-маршрутов семейства запрошенного шлюза.
+/// Ошибки — русские, единый текст «шлюз не соответствует интерфейсу»
+/// для обоих случаев: шлюз чужой ИЛИ у интерфейса нет default-маршрута.
+pub fn check_gateway_matches(
+    gateway: IpAddr,
+    iface_alias: &str,
+    table: &[DefaultRouteRow],
+) -> Result<(), String> {
+    let matches_iface = table
+        .iter()
+        .find(|row| row.iface_alias == iface_alias && row.next_hop.is_ipv4() == gateway.is_ipv4())
+        .is_some_and(|row| row.next_hop == gateway);
+    if matches_iface {
+        Ok(())
+    } else {
+        Err(format!(
+            "шлюз {gateway} не соответствует интерфейсу {iface_alias}:              шлюз должен быть текущим шлюзом по умолчанию этого интерфейса"
+        ))
+    }
+}
+
+/// TTL кэша таблицы default-маршрутов (анти-шторм PowerShell при
+/// старте нескольких бутылок подряд, план M3).
+pub const GATEWAY_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// Источник таблицы default-маршрутов; инъекция для тестов диспетчера.
+#[async_trait::async_trait]
+pub trait DefaultRouteSource: Send + Sync {
+    /// Default-маршруты семейства: `v6` — `::/0`, иначе `0.0.0.0/0`.
+    async fn default_routes(&self, v6: bool) -> Result<Vec<DefaultRouteRow>, RouteOpError>;
+}
+
+/// Продакшн-источник: `Get-NetRoute -DestinationPrefix <default> |
+/// Select-Object InterfaceAlias,NextHop | ConvertTo-Csv` —
+/// детерминированный CSV вместо парсинга широкой таблицы.
+pub struct RealDefaultRoutes;
+
+#[async_trait::async_trait]
+impl DefaultRouteSource for RealDefaultRoutes {
+    async fn default_routes(&self, v6: bool) -> Result<Vec<DefaultRouteRow>, RouteOpError> {
+        #[cfg(windows)]
+        {
+            let prefix = if v6 { "::/0" } else { "0.0.0.0/0" };
+            let args = vec![
+                "Get-NetRoute".to_string(),
+                "-DestinationPrefix".to_string(),
+                ps_value(prefix),
+                "|".to_string(),
+                "Select-Object".to_string(),
+                "InterfaceAlias,NextHop".to_string(),
+                "|".to_string(),
+                "ConvertTo-Csv".to_string(),
+                "-NoTypeInformation".to_string(),
+            ];
+            let out = run_ps_raw(&args).await?;
+            Ok(parse_default_routes(&out))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = v6;
+            Err(RouteOpError::NotWindows)
+        }
+    }
+}
+
+/// Ошибка сверки шлюза: расхождение → VALIDATION-отказ; недоступность
+/// таблицы → IO-отказ (сбой сети — не ошибка валидации).
+#[derive(Debug)]
+pub enum GatewayVerifyError {
+    /// Шлюз не соответствует интерфейсу (или у интерфейса нет
+    /// default-маршрута).
+    Mismatch(String),
+    /// Не удалось получить таблицу default-маршрутов.
+    Source(RouteOpError),
+}
+
+/// Сверщик шлюзов с кэшем таблицы по семействам ([`GATEWAY_CACHE_TTL`]):
+/// старт N бутылок подряд бьёт в ОС одним Get-NetRoute на семейство.
+pub struct GatewayChecker {
+    /// Источник таблицы.
+    source: std::sync::Arc<dyn DefaultRouteSource>,
+    /// Время жизни кэша (тесты удлиняют).
+    ttl: Duration,
+    /// Кэш по семействам: (момент, таблица).
+    cache: tokio::sync::Mutex<GatewayTableCache>,
+}
+
+/// Слоты кэша таблиц по семействам.
+#[derive(Default)]
+struct GatewayTableCache {
+    /// Таблица default-маршрутов IPv4.
+    v4: Option<(std::time::Instant, Vec<DefaultRouteRow>)>,
+    /// Таблица default-маршрутов IPv6.
+    v6: Option<(std::time::Instant, Vec<DefaultRouteRow>)>,
+}
+
+impl GatewayChecker {
+    /// Продакшн-сверщик: [`RealDefaultRoutes`] + [`GATEWAY_CACHE_TTL`].
+    pub fn real() -> Self {
+        Self::new(std::sync::Arc::new(RealDefaultRoutes), GATEWAY_CACHE_TTL)
+    }
+
+    /// Сверщик с явным источником и TTL (тесты).
+    pub fn new(source: std::sync::Arc<dyn DefaultRouteSource>, ttl: Duration) -> Self {
+        Self {
+            source,
+            ttl,
+            cache: tokio::sync::Mutex::new(GatewayTableCache::default()),
+        }
+    }
+
+    /// Сверяет «шлюз == текущий default next-hop интерфейса» (спека
+    /// §4.2): таблица — из кэша или источника.
+    pub async fn verify(
+        &self,
+        gateway: IpAddr,
+        iface_alias: &str,
+    ) -> Result<(), GatewayVerifyError> {
+        let table = self
+            .table(gateway.is_ipv6())
+            .await
+            .map_err(GatewayVerifyError::Source)?;
+        check_gateway_matches(gateway, iface_alias, &table).map_err(GatewayVerifyError::Mismatch)
+    }
+
+    /// Таблица семейства с кэшированием на TTL.
+    async fn table(&self, v6: bool) -> Result<Vec<DefaultRouteRow>, RouteOpError> {
+        let mut cache = self.cache.lock().await;
+        let slot = if v6 { &mut cache.v6 } else { &mut cache.v4 };
+        if let Some((fetched_at, rows)) = slot {
+            if fetched_at.elapsed() < self.ttl {
+                return Ok(rows.clone());
+            }
+        }
+        let rows = self.source.default_routes(v6).await?;
+        *slot = Some((std::time::Instant::now(), rows.clone()));
+        Ok(rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ip(text: &str) -> IpAddr {
         text.parse().expect("тестовый адрес должен парситься")
+    }
+
+    // ---------------------------------------------------------------
+    // Полная валидация шлюза (спека §4.2).
+    // ---------------------------------------------------------------
+
+    fn table() -> Vec<DefaultRouteRow> {
+        vec![
+            DefaultRouteRow {
+                iface_alias: "Ethernet".to_string(),
+                next_hop: ip("192.168.1.1"),
+            },
+            DefaultRouteRow {
+                iface_alias: "Wi-Fi".to_string(),
+                next_hop: ip("10.0.0.138"),
+            },
+            DefaultRouteRow {
+                iface_alias: "Ethernet".to_string(),
+                next_hop: ip("2001:db8::1"),
+            },
+        ]
+    }
+
+    /// Разбор CSV от ConvertTo-Csv: заголовок, данные, пустые NextHop
+    /// (on-link default без шлюза) пропускаются.
+    #[test]
+    fn parse_default_routes_csv_fixture() {
+        let csv = "\"InterfaceAlias\",\"NextHop\"\r\n\"Ethernet\",\"192.168.1.1\"\r\n\"vEthernet (WSL)\",\"172.20.16.161\",\"\"\r\n\"vEthernet (WSL)\",\"172.20.16.1\"";
+        let rows = parse_default_routes(csv);
+        assert_eq!(
+            rows,
+            vec![
+                DefaultRouteRow {
+                    iface_alias: "Ethernet".to_string(),
+                    next_hop: ip("192.168.1.1"),
+                },
+                DefaultRouteRow {
+                    iface_alias: "vEthernet (WSL)".to_string(),
+                    next_hop: ip("172.20.16.1"),
+                },
+            ]
+        );
+    }
+
+    /// Шлюз совпадает с default next-hop интерфейса того же семейства.
+    #[test]
+    fn gateway_matches_iface_default_ok() {
+        assert_eq!(
+            check_gateway_matches(ip("192.168.1.1"), "Ethernet", &table()),
+            Ok(())
+        );
+        assert_eq!(
+            check_gateway_matches(ip("2001:db8::1"), "Ethernet", &table()),
+            Ok(())
+        );
+    }
+
+    /// Шлюз чужой (не default этого интерфейса) — отказ.
+    #[test]
+    fn gateway_of_other_iface_is_refused() {
+        let error = check_gateway_matches(ip("10.0.0.138"), "Ethernet", &table())
+            .expect_err("шлюз Wi-Fi не для Ethernet");
+        assert!(
+            error.contains("не соответствует интерфейсу"),
+            "текст спеки: {error}"
+        );
+    }
+
+    /// У интерфейса нет default-маршрута — тот же отказ.
+    #[test]
+    fn iface_without_default_route_is_refused() {
+        let error = check_gateway_matches(ip("192.168.1.1"), "Vpn", &table())
+            .expect_err("интерфейса нет в таблице");
+        assert!(
+            error.contains("не соответствует интерфейсу"),
+            "единый текст для отсутствующего default: {error}"
+        );
     }
 
     fn strs(list: &[&str]) -> Vec<String> {

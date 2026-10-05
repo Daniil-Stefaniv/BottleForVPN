@@ -114,3 +114,66 @@ async fn run_ps_times_out_on_hung_command() {
         "ожидался таймаут 30 с, получено: {result:?}"
     );
 }
+
+/// Полная валидация шлюза на реальной машине (спека §4.2, M3): Add с
+/// шлюзом = текущему default next-hop интерфейса проходит сверку
+/// GatewayChecker (живой Get-NetRoute) и добавляет маршрут; Add с
+/// чужим шлюзом отвергается VALIDATION до OS-вызова.
+#[tokio::test]
+#[ignore = "меняет реальную таблицу маршрутов; запускать под администратором"]
+async fn dispatch_add_validates_gateway_against_real_default() {
+    use svc::journal::JOURNAL_FILE_NAME;
+    use svc::pipe::dispatch;
+    use svc::routes::GatewayChecker;
+    use tokio::sync::Mutex;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = Mutex::new(
+        svc::journal::RouteStore::open(&tmp.path().join(JOURNAL_FILE_NAME))
+            .expect("журнал открылся"),
+    );
+    let mut session = Some(1);
+    let gateways = GatewayChecker::real();
+    let (gateway, alias) = default_route();
+
+    // Чужой шлюз (TEST-NET-1, не бывает default) — VALIDATION.
+    let foreign: IpAddr = "192.0.2.1".parse().unwrap();
+    let reply = dispatch(
+        &store,
+        &mut session,
+        &gateways,
+        bottle_core::svcrpc::SvcRequest::Add {
+            dest: TEST_DEST,
+            gateway: foreign,
+            iface_alias: alias.clone(),
+        },
+    )
+    .await;
+    match reply {
+        bottle_core::svcrpc::SvcReply::Error { code, message } => {
+            assert_eq!(code, "VALIDATION", "чужой шлюз: {message}");
+            assert!(message.contains("не соответствует интерфейсу"));
+        }
+        other => panic!("ожидали Error, получили {other:?}"),
+    }
+
+    // Легитимный шлюз — проходит сверку и OS-исполнение.
+    let reply = dispatch(
+        &store,
+        &mut session,
+        &gateways,
+        bottle_core::svcrpc::SvcRequest::Add {
+            dest: TEST_DEST,
+            gateway,
+            iface_alias: alias.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply, bottle_core::svcrpc::SvcReply::Ok),
+        "легитимный Add со шлюзом реального default: {reply:?}"
+    );
+
+    // Очистка.
+    let _ = run_ps(RouteCmd::Del, TEST_DEST, Some(gateway), Some(&alias)).await;
+}

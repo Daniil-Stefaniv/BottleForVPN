@@ -16,6 +16,8 @@ bottle-core = { path = "../core" }
 # Внутренний runtime службы: pipe-сервер (named pipe + FramedRead),
 # graceful-остановка, run_ps: процесс PowerShell с таймаутом.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "net", "io-util", "sync"] }
+# dyn-совместимый трейт DefaultRouteSource (async fn в трейте).
+async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 # Файловый JSONL-журнал службы: ежедневная ротация (M3).

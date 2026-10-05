@@ -20,7 +20,7 @@ use bottle_core::svcrpc::{
 use tokio::sync::Mutex;
 
 use crate::journal::{RouteStore, SessionId};
-use crate::routes::{run_ps, RouteCmd};
+use crate::routes::{run_ps, GatewayChecker, GatewayVerifyError, RouteCmd};
 
 /// Предельная длина псевдонима интерфейса (защита в глубину).
 /// Windows InterfaceAlias бывает длиннее 64 символов (составные имена
@@ -60,6 +60,7 @@ pub fn validate_iface_alias(alias: &str) -> Result<(), String> {
 pub async fn dispatch(
     store: &Mutex<RouteStore>,
     session: &mut Option<SessionId>,
+    gateways: &GatewayChecker,
     req: SvcRequest,
 ) -> SvcReply {
     match req {
@@ -98,6 +99,20 @@ pub async fn dispatch(
             }
             if let Err(message) = validate_iface_alias(&iface_alias) {
                 return validation_error(&message);
+            }
+            // Полная валидация шлюза (спека §4.2 дословно, M3): шлюз
+            // обязан быть ТЕКУЩИМ шлюзом по умолчанию названного
+            // интерфейса — сверка с живой таблицей default-маршрутов
+            // (кэш ~5 с). Ловит и дубликат Add с другими параметрами
+            // (M2-минор): расхождение = VALIDATION-отказ.
+            match gateways.verify(gateway, &iface_alias).await {
+                Ok(()) => {}
+                Err(GatewayVerifyError::Mismatch(message)) => {
+                    return validation_error(&message);
+                }
+                Err(GatewayVerifyError::Source(error)) => {
+                    return io_error(&format!("таблица шлюзов недоступна: {error}"));
+                }
             }
             // Finding 1 (ревью): идемпотентность add — зеркало Del.
             // Повторный add живого dest НЕ выходит в ОС: New-NetRoute
@@ -316,6 +331,7 @@ mod transport {
 
     use super::{close_session_routes, dispatch};
     use crate::journal::{RouteStore, SessionId};
+    use crate::routes::GatewayChecker;
 
     /// Обслуживает named pipe: по одному клиенту на соединение, свежий
     /// экземпляр канала на каждый цикл, до отмены `shutdown`.
@@ -336,6 +352,9 @@ mod transport {
         // вызовы create в цикле), указатель — на валидную структуру
         // SECURITY_ATTRIBUTES; CreateNamedPipe копирует дескриптор.
         let mut server = unsafe { create_pipe_instance(pipe_name, &mut security)? };
+        // Сверщик шлюзов живёт со службой: кэш таблицы переиспользуется
+        // соединениями (анти-шторм PS).
+        let gateways = GatewayChecker::real();
         tracing::info!(pipe = pipe_name, "pipe-сервер службы маршрутов запущен");
         loop {
             tokio::select! {
@@ -345,7 +364,7 @@ mod transport {
                     return Ok(());
                 }
             }
-            handle_connection(server, &store, &shutdown).await;
+            handle_connection(server, &store, &gateways, &shutdown).await;
             // SAFETY: как и выше — security ещё жив.
             server = unsafe { create_pipe_instance(pipe_name, &mut security)? };
         }
@@ -419,6 +438,7 @@ mod transport {
     async fn handle_connection(
         pipe: NamedPipeServer,
         store: &Arc<Mutex<RouteStore>>,
+        gateways: &GatewayChecker,
         shutdown: &CancellationToken,
     ) {
         let mut session: Option<SessionId> = None;
@@ -441,7 +461,7 @@ mod transport {
                 },
                 () = shutdown.cancelled() => break,
             };
-            let reply = dispatch(store, &mut session, req).await;
+            let reply = dispatch(store, &mut session, gateways, req).await;
             if let Err(error) = send_reply(&mut write_half, &mut reply_codec, reply).await {
                 tracing::warn!(%error, "не удалось отправить ответ демону");
                 break;
@@ -544,12 +564,169 @@ mod tests {
         );
     }
 
+    /// Фейковый источник таблицы default-маршрутов: фиксированная
+    /// таблица + счётчик запросов (пины кэша).
+    struct FakeDefaultRoutes {
+        table: Vec<crate::routes::DefaultRouteRow>,
+        queries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::routes::DefaultRouteSource for FakeDefaultRoutes {
+        async fn default_routes(
+            &self,
+            _v6: bool,
+        ) -> Result<Vec<crate::routes::DefaultRouteRow>, crate::routes::RouteOpError> {
+            self.queries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.table.clone())
+        }
+    }
+
+    fn fake_checker(
+        table: Vec<crate::routes::DefaultRouteRow>,
+        queries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> crate::routes::GatewayChecker {
+        crate::routes::GatewayChecker::new(
+            std::sync::Arc::new(FakeDefaultRoutes { table, queries }),
+            std::time::Duration::from_secs(3600),
+        )
+    }
+
+    /// Свежий сверщик с таблицей, где «Ethernet» имеет шлюз 192.168.1.1
+    /// (совпадает с add_req) — для тестов, не проверяющих сам шлюз.
+    fn ok_checker() -> crate::routes::GatewayChecker {
+        fake_checker(
+            checker_table(),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+    }
+
+    fn checker_table() -> Vec<crate::routes::DefaultRouteRow> {
+        vec![crate::routes::DefaultRouteRow {
+            iface_alias: "Ethernet".to_string(),
+            next_hop: ip("192.168.1.1"),
+        }]
+    }
+
+    /// Легитимный Add (шлюз == default интерфейса) проходит проверку
+    /// и доходит до OS-исполнения (на не-windows — NotWindows, не
+    /// VALIDATION).
+    #[tokio::test]
+    async fn add_with_matching_gateway_proceeds_past_gateway_check() {
+        let (_tmp, store) = test_store().await;
+        let mut session = Some(1);
+        let queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gateways = fake_checker(checker_table(), queries.clone());
+
+        let reply = dispatch(&store, &mut session, &gateways, add_req("203.0.113.10")).await;
+
+        let SvcReply::Error { code, message } = reply else {
+            panic!("ожидали Error (OS-исполнение), получили {reply:?}");
+        };
+        assert_ne!(
+            code,
+            svc_err::VALIDATION,
+            "прошли проверку шлюза: {message}"
+        );
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Спека §4.2: шлюз, не являющийся текущим шлюзом интерфейса, —
+    /// VALIDATION-отказ.
+    #[tokio::test]
+    async fn add_with_foreign_gateway_is_validation_refusal() {
+        let (_tmp, store) = test_store().await;
+        let mut session = Some(1);
+        let queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gateways = fake_checker(checker_table(), queries);
+
+        let reply = dispatch(
+            &store,
+            &mut session,
+            &gateways,
+            SvcRequest::Add {
+                dest: ip("203.0.113.10"),
+                gateway: ip("10.9.9.9"),
+                iface_alias: "Ethernet".to_string(),
+            },
+        )
+        .await;
+
+        let SvcReply::Error { code, message } = reply else {
+            panic!("ожидали Error, получили {reply:?}");
+        };
+        assert_eq!(code, svc_err::VALIDATION);
+        assert!(
+            message.contains("не соответствует интерфейсу"),
+            "текст спеки: {message}"
+        );
+    }
+
+    /// Дубликат Add с ДРУГИМ шлюзом (M2-минор): расхождение ловится
+    /// проверкой шлюза — VALIDATION, а не молчаливый Ok со старым
+    /// OS-маршрутом.
+    #[tokio::test]
+    async fn duplicate_add_with_other_gateway_is_validation_refusal() {
+        let (_tmp, store) = test_store().await;
+        let mut session = Some(1);
+        // Живой маршрут в журнале от прежнего add (старый шлюз).
+        store
+            .lock()
+            .await
+            .add(1, ip("203.0.113.10"), ip("192.168.1.1"), "Ethernet")
+            .expect("журнал принимает запись");
+        let queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gateways = fake_checker(checker_table(), queries);
+
+        let reply = dispatch(
+            &store,
+            &mut session,
+            &gateways,
+            SvcRequest::Add {
+                dest: ip("203.0.113.10"),
+                gateway: ip("10.9.9.9"),
+                iface_alias: "Ethernet".to_string(),
+            },
+        )
+        .await;
+
+        let SvcReply::Error { code, message } = reply else {
+            panic!("ожидали Error, получили {reply:?}");
+        };
+        assert_eq!(code, svc_err::VALIDATION);
+        assert!(
+            message.contains("не соответствует интерфейсу"),
+            "расхождение поймано: {message}"
+        );
+    }
+
+    /// Кэш ~5 с (анти-шторм PS): несколько Add за TTL — один запрос
+    /// таблицы.
+    #[tokio::test]
+    async fn gateway_table_is_cached_within_ttl() {
+        let (_tmp, store) = test_store().await;
+        let mut session = Some(1);
+        let queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gateways = fake_checker(checker_table(), queries.clone());
+
+        for dest in ["203.0.113.10", "203.0.113.11", "203.0.113.12"] {
+            let _ = dispatch(&store, &mut session, &gateways, add_req(dest)).await;
+        }
+
+        assert_eq!(
+            queries.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "таблица запрошена один раз за TTL"
+        );
+    }
+
     #[tokio::test]
     async fn requests_without_hello_are_rejected() {
         let (_tmp, store) = test_store().await;
         let mut session = None;
 
-        let reply = dispatch(&store, &mut session, add_req("203.0.113.10")).await;
+        let reply = dispatch(&store, &mut session, &ok_checker(), add_req("203.0.113.10")).await;
         let SvcReply::Error { code, message } = reply else {
             panic!("ожидали Error, получили {reply:?}");
         };
@@ -568,7 +745,7 @@ mod tests {
 
         // Loopback: валидация рулит ДО вызова PowerShell — на хосте
         // разработки run_ps вернул бы NotWindows, а не VALIDATION.
-        let reply = dispatch(&store, &mut session, add_req("127.0.0.1")).await;
+        let reply = dispatch(&store, &mut session, &ok_checker(), add_req("127.0.0.1")).await;
         let SvcReply::Error { code, message } = reply else {
             panic!("ожидали Error, получили {reply:?}");
         };
@@ -592,6 +769,7 @@ mod tests {
             let reply = dispatch(
                 &store,
                 &mut session,
+                &ok_checker(),
                 SvcRequest::Add {
                     dest: ip("203.0.113.10"),
                     gateway: ip("192.168.1.1"),
@@ -614,7 +792,7 @@ mod tests {
 
         // Валидный запрос дошёл до run_ps, но вне Windows операции над
         // маршрутами недоступны — Error IO с русским текстом.
-        let reply = dispatch(&store, &mut session, add_req("203.0.113.10")).await;
+        let reply = dispatch(&store, &mut session, &ok_checker(), add_req("203.0.113.10")).await;
         assert!(
             matches!(reply, SvcReply::Error { ref code, .. } if code == svc_err::IO),
             "ожидали Error IO, получили {reply:?}"
@@ -636,6 +814,7 @@ mod tests {
         let reply = dispatch(
             &store,
             &mut session,
+            &ok_checker(),
             SvcRequest::Add {
                 dest: ip("203.0.113.10"),
                 gateway: ip("0.0.0.0"),
@@ -672,7 +851,7 @@ mod tests {
         }
         let mut session = Some(1);
 
-        let reply = dispatch(&store, &mut session, add_req("203.0.113.10")).await;
+        let reply = dispatch(&store, &mut session, &ok_checker(), add_req("203.0.113.10")).await;
         assert_eq!(reply, SvcReply::Ok, "дубль add — Ok без OS-вызова");
 
         let journal = std::fs::read_to_string(tmp.path().join(JOURNAL_FILE_NAME)).unwrap();
@@ -702,7 +881,7 @@ mod tests {
         }
         let mut session = Some(2);
 
-        let reply = dispatch(&store, &mut session, add_req("203.0.113.10")).await;
+        let reply = dispatch(&store, &mut session, &ok_checker(), add_req("203.0.113.10")).await;
         assert_eq!(reply, SvcReply::Ok, "дубль чужой сессии — Ok без OS-вызова");
 
         {
@@ -736,6 +915,7 @@ mod tests {
         let reply = dispatch(
             &store,
             &mut session,
+            &ok_checker(),
             SvcRequest::Del {
                 dest: ip("203.0.113.99"),
             },
@@ -759,6 +939,7 @@ mod tests {
         let reply = dispatch(
             &store,
             &mut session,
+            &ok_checker(),
             SvcRequest::Del {
                 dest: ip("203.0.113.10"),
             },
@@ -781,7 +962,13 @@ mod tests {
         let mut session = None;
 
         // Первый Hello: прежних живых сессий нет, открывается новая.
-        let reply = dispatch(&store, &mut session, SvcRequest::Hello { daemon_pid: 4242 }).await;
+        let reply = dispatch(
+            &store,
+            &mut session,
+            &ok_checker(),
+            SvcRequest::Hello { daemon_pid: 4242 },
+        )
+        .await;
         assert_eq!(reply, SvcReply::Ok);
         let first = session.expect("сессия открыта");
 
@@ -793,7 +980,13 @@ mod tests {
             .await
             .add(first, ip("203.0.113.11"), ip("192.168.1.1"), "Ethernet")
             .unwrap();
-        let reply = dispatch(&store, &mut session, SvcRequest::Hello { daemon_pid: 4242 }).await;
+        let reply = dispatch(
+            &store,
+            &mut session,
+            &ok_checker(),
+            SvcRequest::Hello { daemon_pid: 4242 },
+        )
+        .await;
         assert_eq!(reply, SvcReply::Ok);
         let second = session.expect("новая сессия открыта");
         assert_ne!(first, second, "сессии монотонно нумеруются");
@@ -858,7 +1051,7 @@ mod tests {
             .unwrap();
         let mut session = Some(1);
 
-        let reply = dispatch(&store, &mut session, SvcRequest::List).await;
+        let reply = dispatch(&store, &mut session, &ok_checker(), SvcRequest::List).await;
         let SvcReply::RouteList { routes } = reply else {
             panic!("ожидали RouteList, получили {reply:?}");
         };
@@ -872,7 +1065,7 @@ mod tests {
         let (_tmp, store) = test_store().await;
         let mut session = Some(1);
 
-        let reply = dispatch(&store, &mut session, SvcRequest::Cleanup).await;
+        let reply = dispatch(&store, &mut session, &ok_checker(), SvcRequest::Cleanup).await;
         assert_eq!(reply, SvcReply::Ok, "чистый live-set — немедленный успех");
     }
 
