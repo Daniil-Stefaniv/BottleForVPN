@@ -4,9 +4,10 @@
 
   Состав: ProgramFiles\BottleForApps\{bottle.exe, bottled.exe,
   bottle-svc.exe, appliance\bottleforapps-rootfs.tar.gz}; PATH (machine);
-  служба маршрутов — нашим `bottle-svc --install` (custom action после
-  InstallFiles, uninstall-зеркало перед RemoveFiles); компоненты WSL —
-  `wsl --install --no-distribution` (код 3010 «нужна перезагрузка»
+  служба маршрутов — нашим `bottle-svc` с аргументом install (custom
+  action после InstallFiles, uninstall-зеркало перед RemoveFiles);
+  компоненты WSL — `wsl` с аргументами install no-distribution
+  (код 3010 «нужна перезагрузка»
   переводится обёрткой в успех; перезагрузку НЕ назначаем принудительно —
   doctor и README объясняют). Major upgrade: UpgradeCode фиксирован,
   даунгрейд отвергается. Версия приходит переменной -d ProductVersion=
@@ -75,10 +76,11 @@
       </Component>
     </ComponentGroup>
 
-    <!-- Служба маршрутов: наш `--install` (русское описание, автозапуск,
-         SYSTEM). Ограничение (рулинг): поверх ручной --install установки
-         MSI откажет с внятным текстом ERROR_SERVICE_EXISTS — снимите
-         службу вручную (bottle-svc --uninstall) перед MSI. -->
+    <!-- Служба маршрутов: наш `install`-аргумент (русское описание,
+         автозапуск, SYSTEM). Ограничение (рулинг): поверх ручной
+         установки службы MSI откажет с внятным текстом
+         ERROR_SERVICE_EXISTS — снимите службу вручную (bottle-svc
+         с аргументом uninstall) перед MSI. -->
     <CustomAction Id="InstallSvc"
         FileRef="bottle-svc.exe"
         ExeCommand="--install"
