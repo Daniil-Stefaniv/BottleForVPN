@@ -45,7 +45,7 @@ pub async fn run(wsl: &dyn WslRunner, store: &Store, manager: &BottleManager) ->
     let mut items = check_wsl(&wsl_status, &wsl_list, &wslconfig);
     items.push(check_appliance(installed, &appliance_version));
     items.push(check_service(crate::svc_client::svc_pipe_exists()));
-    items.push(check_agent(manager.agent_alive().await, installed));
+    items.push(check_agent(installed, &appliance_version));
     items.push(check_profiles(&profiles));
 
     let probes = probe_fixed_ports(&profiles, &live_ports).await;
@@ -233,29 +233,32 @@ pub fn check_service(present: bool) -> CheckItem {
     }
 }
 
-/// Проверка агента аплаенса: отвечает → ok; не отвечает при
-/// неимпортированном аплаенсе → warn (норма); не отвечает при
-/// импортированном → fail с подсказкой upgrade (несовместимая версия
-/// проявляется именно так — handshake отвергается).
-pub fn check_agent(alive: bool, installed: bool) -> CheckItem {
-    match (alive, installed) {
-        (true, _) => CheckItem {
+/// Проверка агента аплаенса — пассивная (finding 2 финального
+/// ревью M3): doctor не будит WSL и не импортирует аплаенс.
+/// `installed && connected` (версия известна из handshake текущей
+/// сессии) → ok; импортирован, но сессия не подключалась → warn
+/// (проверка отложена к первому старту); не импортирован → warn.
+/// Несовместимая версия проявляется отказом handshake при старте —
+/// с понятной подсказкой `bottle upgrade` (спека §8).
+pub fn check_agent(installed: bool, version: &Option<String>) -> CheckItem {
+    match (installed, version) {
+        (true, Some(version)) => CheckItem {
             code: "agent".to_string(),
             status: CheckStatus::Ok,
-            detail: "Агент аплаенса отвечает".to_string(),
+            detail: format!("Агент аплаенса отвечает (версия {version})"),
         },
-        (false, false) => CheckItem {
+        (true, None) => CheckItem {
+            code: "agent".to_string(),
+            status: CheckStatus::Warn,
+            detail: "Аплаенс импортирован; агент проверится при первом старте бутылки \
+                     (doctor не будит WSL)"
+                .to_string(),
+        },
+        (false, _) => CheckItem {
             code: "agent".to_string(),
             status: CheckStatus::Warn,
             detail: "Агент аплаенса недоступен — аплаенс не импортирован (нормально \
                      до первого старта)"
-                .to_string(),
-        },
-        (false, true) => CheckItem {
-            code: "agent".to_string(),
-            status: CheckStatus::Fail,
-            detail: "Аплаенс импортирован, но агент не отвечает (сон VM или несовместимая \
-                     версия) — попробуйте wsl --shutdown, затем bottle upgrade"
                 .to_string(),
         },
     }
@@ -490,31 +493,34 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // agent: отвечает / не отвечает без аплаенса (норма) /
-    // не отвечает при импортированном аплаенсе (сломан).
+    // agent: пассивная оценка (finding 2 финального ревью M3) —
+    // doctor НЕ будит WSL: живая проба = ensure_appliance (импорт,
+    // boot VM, 30 с бюджета) — побочный эффект и таймаут CLI на
+    // чистой машине. Оценка по версии из handshake текущей сессии.
     // ---------------------------------------------------------------
 
     #[test]
-    fn agent_alive_is_ok() {
-        let item = check_agent(true, true);
+    fn agent_connected_session_is_ok() {
+        let item = check_agent(true, &Some("0.2.0".to_string()));
         assert_eq!(item.status, CheckStatus::Ok);
+        assert!(item.detail.contains("0.2.0"));
     }
 
     #[test]
-    fn agent_dead_without_appliance_is_warn() {
-        let item = check_agent(false, false);
+    fn agent_imported_but_not_connected_is_warn() {
+        let item = check_agent(true, &None);
         assert_eq!(item.status, CheckStatus::Warn);
-    }
-
-    #[test]
-    fn agent_dead_with_appliance_is_fail_with_upgrade_hint() {
-        let item = check_agent(false, true);
-        assert_eq!(item.status, CheckStatus::Fail);
         assert!(
-            item.detail.contains("bottle upgrade"),
-            "подсказка обновления: {}",
+            item.detail.contains("первом старт"),
+            "проверка отложена к первому старту: {}",
             item.detail
         );
+    }
+
+    #[test]
+    fn agent_without_appliance_is_warn() {
+        let item = check_agent(false, &None);
+        assert_eq!(item.status, CheckStatus::Warn);
     }
 
     // ---------------------------------------------------------------

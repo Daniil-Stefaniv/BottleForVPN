@@ -96,17 +96,32 @@
     <!-- WSL: включение компонентов без дистрибутива. Обёртка переводит
          3010 («нужна перезагрузка») в 0 — принудительную перезагрузку
          не назначаем (см. шапку). -->
-    <Property Id="WslInstallCommand" Value="--install --no-distribution" />
     <CustomAction Id="EnableWsl"
         Script="PowerShell"
         ExeCommand="&amp; { $p = Start-Process wsl -ArgumentList '--install','--no-distribution' -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -eq 3010) { exit 0 } else { exit $p.ExitCode } }"
         Execute="deferred"
         Impersonate="no"
         Return="check" />
+    <!-- Rollback-зеркало InstallSvc (finding 3 финального ревью):
+         отказ ПОСЛЕ установки службы (например, EnableWsl на
+         залоченной политикой машине) не должен оставлять службу,
+         ссылающуюся на откатанные файлы. -->
+    <CustomAction Id="RollbackSvc"
+        FileRef="bottle-svc.exe"
+        ExeCommand="--uninstall"
+        Execute="rollback"
+        Impersonate="no"
+        Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="InstallSvc" After="InstallFiles" Condition="NOT REMOVE" />
-      <Custom Action="EnableWsl" After="InstallSvc" Condition="NOT REMOVE" />
+      <!-- Порядок: сначала WSL (может отказать — служба ещё не
+           поставлена, откатывать нечего), затем служба; rollback
+           службы заряжается перед её установкой. Условие NOT
+           Installed: repair НЕ дергает установку службы поверх
+           живой (файлы ремонта восстанавливаются, служба уже есть). -->
+      <Custom Action="EnableWsl" After="InstallFiles" Condition="NOT Installed" />
+      <Custom Action="RollbackSvc" Before="InstallSvc" />
+      <Custom Action="InstallSvc" After="EnableWsl" Condition="NOT Installed" />
       <Custom Action="UninstallSvc" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
     </InstallExecuteSequence>
   </Package>

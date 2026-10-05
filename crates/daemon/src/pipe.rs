@@ -108,12 +108,17 @@ pub async fn dispatch(
         CliRequest::Delete { id } => {
             // Активную бутылку удалять нельзя (start держит слушатели
             // и сессию аплаенса); без менеджера активных нет.
+            // Активна = держит слушатели/сессию (Starting/Up/Degraded/
+            // Stopping). Failed — не активная: namespace разобран при
+            // неудаче старта, а stop на Failed — no-op; требовать
+            // остановки означало бы неудаляемую бутылку (finding 1
+            // финального ревью M3).
             let active = match manager {
                 Some(manager) => manager
                     .status()
                     .await
                     .into_iter()
-                    .any(|state| state.id == id && state.state != BottleState::Stopped),
+                    .any(|state| state.id == id && is_active_state(&state.state)),
                 None => false,
             };
             if active {
@@ -240,6 +245,18 @@ fn list_summaries(store: &Store) -> Vec<BottleSummary> {
         }
     }
     bottles
+}
+
+/// Активное состояние бутылки (держит слушатели/сессию аплаенса);
+/// Failed и Stopped — нет.
+fn is_active_state(state: &BottleState) -> bool {
+    matches!(
+        state,
+        BottleState::Starting
+            | BottleState::Up
+            | BottleState::Degraded { .. }
+            | BottleState::Stopping
+    )
 }
 
 /// Создание бутылки: валидация профиля → отказ при занятом id без

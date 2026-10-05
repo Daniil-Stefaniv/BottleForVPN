@@ -860,11 +860,6 @@ impl BottleManager {
         self.appliance_version.lock().await.clone()
     }
 
-    /// Жив ли агент аплаенса (диагностика `doctor`).
-    pub async fn agent_alive(&self) -> bool {
-        self.connect.alive().await
-    }
-
     /// Запоминает версию аплаенса из свежего handshake (сводки
     /// `logs export`, диагностика `doctor`, ответ `upgrade`).
     pub async fn remember_appliance_version(&self, version: &str) {
@@ -2591,6 +2586,47 @@ mod tests {
         assert!(
             tmp.path().join("store/bottles/office-a.toml").exists(),
             "профиль не тронут"
+        );
+    }
+
+    /// Провалившаяся бутылка (Failed) удаляется без остановки:
+    /// Failed-запись — не активная сессия (namespace разобран при
+    /// неудаче старта), «остановите бутылку» для неё — дед-энд
+    /// (finding 1 финального ревью: stop на Failed — no-op).
+    #[tokio::test]
+    async fn dispatch_delete_of_failed_bottle_succeeds() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::TunnelFailed(
+            "туннель не поднялся: handshake timeout".to_string(),
+        ))
+        .await;
+        let (manager, store) = manager_with(store.data_root(), fake);
+        let reply = manager.start("office-a").await.expect("ответ, не сбой");
+        assert!(matches!(reply, CliReply::Error { .. }), "start провалился");
+        assert!(manager
+            .status()
+            .await
+            .iter()
+            .any(|state| matches!(state.state, BottleState::Failed { .. })));
+
+        let reply = crate::pipe::dispatch(
+            &store,
+            Some(&manager),
+            None,
+            None,
+            bottle_core::ipc::CliRequest::Delete {
+                id: "office-a".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            reply,
+            CliReply::Deleted {
+                id: "office-a".into(),
+                warning: None
+            },
+            "Failed-бутылка удаляема без stop"
         );
     }
 

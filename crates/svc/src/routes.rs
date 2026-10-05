@@ -290,10 +290,14 @@ pub fn check_gateway_matches(
     iface_alias: &str,
     table: &[DefaultRouteRow],
 ) -> Result<(), String> {
-    let matches_iface = table
-        .iter()
-        .find(|row| row.iface_alias == iface_alias && row.next_hop.is_ipv4() == gateway.is_ipv4())
-        .is_some_and(|row| row.next_hop == gateway);
+    // ЛЮБАЯ строка интерфейса: мульти-шлюзовые NIC держат несколько
+    // default-маршрутов, демон выбирает шлюз по метрике — первый row
+    // таблицы может быть не тем (finding 4 финального ревью).
+    let matches_iface = table.iter().any(|row| {
+        row.iface_alias == iface_alias
+            && row.next_hop.is_ipv4() == gateway.is_ipv4()
+            && row.next_hop == gateway
+    });
     if matches_iface {
         Ok(())
     } else {
@@ -482,6 +486,28 @@ mod tests {
         assert_eq!(
             check_gateway_matches(ip("2001:db8::1"), "Ethernet", &table()),
             Ok(())
+        );
+    }
+
+    /// Мульти-шлюзовый интерфейс (резервный канал, два default):
+    /// совпадение ЛЮБОЙ строки интерфейса достаточно — первый row
+    /// может быть другим шлюзом (finding 4 финального ревью).
+    #[test]
+    fn gateway_matching_any_default_row_of_iface() {
+        let table = vec![
+            DefaultRouteRow {
+                iface_alias: "Ethernet".to_string(),
+                next_hop: ip("192.168.1.2"), // основной
+            },
+            DefaultRouteRow {
+                iface_alias: "Ethernet".to_string(),
+                next_hop: ip("192.168.1.1"), // резервный
+            },
+        ];
+        assert_eq!(
+            check_gateway_matches(ip("192.168.1.1"), "Ethernet", &table),
+            Ok(()),
+            "второй default-маршрут интерфейса — легитимный шлюз"
         );
     }
 
