@@ -88,3 +88,133 @@ jobs:
           -Bottled "%GITHUB_WORKSPACE%\target\release\bottled.exe"
           -Bottle "%GITHUB_WORKSPACE%\target\release\bottle.exe"
           -DataDir "%RUNNER_TEMP%\bfa-ci-data"
+
+  # Релизная сборка (по тегу v*): rootfs из appliance-build, portable-
+  # zip и MSI, SHA256SUMS; публикация GitHub Release с русским текстом.
+  release-build:
+    runs-on: windows-latest
+    needs: appliance-build
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Скачать rootfs аплаенса
+        uses: actions/download-artifact@v4
+        with:
+          name: bottleforapps-rootfs
+      - name: Тег обязан совпадать с версией workspace
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object { $_.name -eq 'daemon' }).version
+          if ($tag -ne $version) {
+            throw "тег v$tag не совпадает с версией workspace $version — поправьте [workspace.package].version или тег"
+          }
+      - name: Собрать release-бинарники
+        run: cargo build --release -p daemon -p cli -p svc
+      - name: Portable-сборка
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1 -RootfsPath bottleforapps-rootfs.tar.gz
+      - name: MSI-сборка
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/msi/build-msi.ps1 -RootfsPath bottleforapps-rootfs.tar.gz
+      - name: SHA256SUMS
+        shell: pwsh
+        run: |
+          Get-Content artifacts/*.sha256 | Set-Content -Encoding ascii artifacts/SHA256SUMS.txt
+          Get-Content artifacts/SHA256SUMS.txt
+      - name: Загрузить релизные файлы
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: |
+            artifacts/*.msi
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt
+      # Подпись кода отсутствует осознанно (спека «Что НЕ входит»):
+      # SmartScreen предупреждает о неподписанном MSI — README релиза
+      # это объясняет. Шаг подписи появится здесь после покупки
+      # сертификата (заккомментированный каркас).
+      # - name: Подпись
+      #   run: signtool sign /fd SHA256 /tr <timestamper> /td SHA256 artifacts/*.msi
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: |
+            BottleForApps ${{ github.ref_name }}
+
+            - MSI (полная установка: служба маршрутов, WSL, PATH; один UAC)
+            - Portable ZIP (без прав администратора; только env-бутылки)
+
+            Внимание: установщики не подписаны — SmartScreen покажет
+            предупреждение («Все равно выполнить»). Контрольные суммы —
+            в SHA256SUMS.txt.
+
+            Первые шаги после установки MSI: запустите bottled.exe (или
+            ярлык), затем `bottle doctor` и `bottle create ...`.
+            Portable: распакуйте и читайте INSTALL.txt.
+          files: |
+            artifacts/*.msi
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt
+
+  # Поведенческий smoke установки (по тегу): MSI тихо ставится и
+  # сносится (файлы, служба, CLI); portable-распаковка отвечает.
+  install-smoke:
+    runs-on: windows-latest
+    needs: release-build
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Скачать релизные файлы
+        uses: actions/download-artifact@v4
+        with:
+          name: release-files
+      - name: msiexec install
+        shell: cmd
+        run: |
+          for %%f in (*.msi) do msiexec /i "%%f" /qn /l*v install.log
+          if %ERRORLEVEL% NEQ 0 ( type install.log & exit /b 1 )
+      - name: Проверки установленного
+        shell: pwsh
+        run: |
+          $dir = 'C:\Program Files\BottleForApps'
+          foreach ($f in 'bottle.exe','bottled.exe','bottle-svc.exe','appliance\bottleforapps-rootfs.tar.gz') {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "нет файла: $f" }
+          }
+          sc.exe query BottleForAppsRouteHelper
+          if ($LASTEXITCODE -ne 0) { throw 'служба BottleForAppsRouteHelper не установлена' }
+          & "$dir\bottle.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'bottle --version не работает' }
+      - name: msiexec uninstall и чистота
+        shell: cmd
+        run: |
+          for %%f in (*.msi) do msiexec /x "%%f" /qn /l*v uninstall.log
+          if %ERRORLEVEL% NEQ 0 ( type uninstall.log & exit /b 1 )
+      - name: Проверка удаления
+        shell: pwsh
+        run: |
+          if (Test-Path 'C:\Program Files\BottleForApps') { throw 'каталог Program Files\BottleForApps пережил uninstall' }
+          sc.exe query BottleForAppsRouteHelper
+          if ($LASTEXITCODE -eq 0) { throw 'служба пережила uninstall' }
+      - name: Portable — распаковка и отклик
+        shell: pwsh
+        run: |
+          $zip = (Get-ChildItem *.zip).FullName
+          Expand-Archive $zip -DestinationPath portable
+          $bottle = (Get-ChildItem portable -Recurse -Filter bottle.exe | Select-Object -First 1).FullName
+          & $bottle --version
+          if ($LASTEXITCODE -ne 0) { throw 'portable bottle --version не работает' }
+          # doctor portable-ветки: демон в фоне, служба НЕ ставилась —
+          # только проверяем, что CLI отвечает отчётом, не крашится.
+          $bottled = $bottle -replace 'bottle\.exe$','bottled.exe'
+          $proc = Start-Process $bottled -PassThru -WindowStyle Hidden
+          try {
+            Start-Sleep -Seconds 5
+            & $bottle doctor
+            if ($LASTEXITCODE -eq -1) { throw 'bottle doctor аварийно завершился' }
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
