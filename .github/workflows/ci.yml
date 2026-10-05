@@ -55,6 +55,51 @@ jobs:
           name: bottleforapps-rootfs
           path: artifacts/bottleforapps-rootfs.tar.gz
 
+  # GUI (Tauri, M4 Task 2): ESLint, тесты Rust-моста и сборка bottle-gui
+  # на обеих ОС. Артефакт — бинарь release; бандлы (.app/MSI-встраивание)
+  # собирают релизные джобы (Task 6/11), здесь достаточно --no-bundle.
+  gui-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            binary: bottle-gui.exe
+          - os: macos-14
+            binary: bottle-gui
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gui/src-tauri
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: npm install
+        working-directory: gui
+        run: npm install
+      - name: ESLint (TS)
+        working-directory: gui
+        run: npm run lint
+      - name: fmt + clippy (Rust-мост)
+        working-directory: gui/src-tauri
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+      - name: Тесты Rust-моста run_bottle
+        working-directory: gui/src-tauri
+        run: cargo test
+      - name: Сборка bottle-gui (release, без бандла)
+        working-directory: gui
+        run: npx tauri build --no-bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bottle-gui-${{ matrix.os }}
+          path: gui/src-tauri/target/release/${{ matrix.binary }}
+
+
   # Полный вертикальный срез env-бутылки на Windows: bottled + bottle CLI
   # + импорт аплаенса + WG-туннель (стенд-сервер в той же WSL-VM) + SOCKS5.
   # Спека §15: WSL2 на CI-раннерах ограничен, поэтому до приёмки M2 фейл
