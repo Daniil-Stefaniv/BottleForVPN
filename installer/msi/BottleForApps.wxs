@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  BottleForApps — MSI (WiX v4/v5, спека §11: полная установка, один UAC).
+
+  Состав: ProgramFiles\BottleForApps\{bottle.exe, bottled.exe,
+  bottle-svc.exe, appliance\bottleforapps-rootfs.tar.gz}; PATH (machine);
+  служба маршрутов — нашим `bottle-svc --install` (custom action после
+  InstallFiles, uninstall-зеркало перед RemoveFiles); компоненты WSL —
+  `wsl --install --no-distribution` (код 3010 «нужна перезагрузка»
+  переводится обёрткой в успех; перезагрузку НЕ назначаем принудительно —
+  doctor и README объясняют). Major upgrade: UpgradeCode фиксирован,
+  даунгрейд отвергается. Версия приходит переменной -d ProductVersion=
+  (единственный источник — [workspace.package].version, рулинг M3).
+
+  Сборка: installer/msi/build-msi.ps1 (переменные BuildDir/RootfsPath/
+  ProductVersion передаются ключами -d).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="BottleForApps"
+      Language="1049"
+      Codepage="1251"
+      Version="$(ProductVersion)"
+      Manufacturer="BottleForApps"
+      UpgradeCode="8F0A3B62-4C1D-4E9A-9B7D-2E5F1A6C0D83"
+      Scope="perMachine"
+      InstallerVersion="500">
+
+    <SummaryInformation Description="BottleForApps — одновременные изолированные VPN-окружения" />
+
+    <!-- Major upgrade: даунгрейд отвергается (Review Focus M3 #3);
+         старая версия сносится до установки новой (служба успевает
+         сняться её же uninstall-действием). -->
+    <MajorUpgrade DowngradeErrorMessage="Более новая версия BottleForApps уже установлена: сначала удалите её (Панель управления → Приложения)." />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Launch Condition="Installed OR VersionNT64" Message="BottleForApps требует 64-разрядную Windows." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="BottleForApps">
+        <Directory Id="ApplianceDir" Name="appliance" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Level="1" Title="BottleForApps" AllowAbsent="no">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLDIR">
+      <Component Id="bottle_exe" Guid="A1C53D2E-7F40-4B8A-9C21-5D6E8F0B1A34">
+        <File Id="bottle.exe" Source="$(BuildDir)bottle.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="bottled_exe" Guid="B2D64E3F-8A51-4C9B-AD32-6E7FA01C2B45">
+        <File Id="bottled.exe" Source="$(BuildDir)bottled.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="bottle_svc_exe" Guid="C3E75F4A-9B62-4DAC-BE43-7F80B12D3C56">
+        <File Id="bottle-svc.exe" Source="$(BuildDir)bottle-svc.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="rootfs_tar" Directory="ApplianceDir" Guid="D4F86A5B-0C73-4EBD-AF54-8A91C23E4D67">
+        <File Id="rootfs.tar.gz" Source="$(RootfsPath)" Name="bottleforapps-rootfs.tar.gz" KeyPath="yes" />
+      </Component>
+      <!-- PATH (machine): bottle/bottled доступны из любого терминала.
+           Ключ реестра — KeyPath компонента (Environment нельзя). -->
+      <Component Id="PathEnv" Guid="E5A97B6C-1D84-4FCE-B065-9BA2D34F5E78">
+        <Environment Id="BottlePath"
+            Name="PATH"
+            Value="[INSTALLDIR]"
+            Permanent="no"
+            Part="last"
+            Action="set"
+            System="yes" />
+        <RegistryValue Root="HKLM" Key="Software\BottleForApps"
+            Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Служба маршрутов: наш `--install` (русское описание, автозапуск,
+         SYSTEM). Ограничение (рулинг): поверх ручной --install установки
+         MSI откажет с внятным текстом ERROR_SERVICE_EXISTS — снимите
+         службу вручную (bottle-svc --uninstall) перед MSI. -->
+    <CustomAction Id="InstallSvc"
+        FileRef="bottle-svc.exe"
+        ExeCommand="--install"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check" />
+    <CustomAction Id="UninstallSvc"
+        FileRef="bottle-svc.exe"
+        ExeCommand="--uninstall"
+        Execute="deferred"
+        Impersonate="no"
+        Return="ignore" />
+    <!-- WSL: включение компонентов без дистрибутива. Обёртка переводит
+         3010 («нужна перезагрузка») в 0 — принудительную перезагрузку
+         не назначаем (см. шапку). -->
+    <Property Id="WslInstallCommand" Value="--install --no-distribution" />
+    <CustomAction Id="EnableWsl"
+        Script="PowerShell"
+        ExeCommand="&amp; { $p = Start-Process wsl -ArgumentList '--install','--no-distribution' -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -eq 3010) { exit 0 } else { exit $p.ExitCode } }"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="InstallSvc" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="EnableWsl" After="InstallSvc" Condition="NOT REMOVE" />
+      <Custom Action="UninstallSvc" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>
