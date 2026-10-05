@@ -29,6 +29,8 @@ pub struct Daemon {
     pub manager: Option<Arc<manager::BottleManager>>,
     /// Исполнитель команд WSL (`wsl.exe`).
     pub wsl: Option<Arc<dyn appliance::WslRunner>>,
+    /// Тарболл rootfs для пере-импорта аплаенса (`bottle upgrade`).
+    pub rootfs: Option<PathBuf>,
 }
 
 // На не-windows диспетчер вызывается только тестами (транспорт — named
@@ -116,7 +118,7 @@ pub async fn serve_daemon(
         let connect = Arc::new(manager::RealAgentConnect::new(
             Arc::clone(&wsl),
             data_dir,
-            rootfs_tar,
+            rootfs_tar.clone(),
             manager::AGENT_CONNECT_TIMEOUT,
         ));
         // Менеджер владеет своим экземпляром хранилища того же корня.
@@ -132,6 +134,7 @@ pub async fn serve_daemon(
             store,
             manager: Some(manager),
             wsl: Some(wsl),
+            rootfs: Some(rootfs_tar),
         });
         pipe::serve(bottle_core::ipc::DAEMON_PIPE, daemon, shutdown).await
     }

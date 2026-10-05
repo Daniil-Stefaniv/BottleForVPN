@@ -145,6 +145,45 @@ pub async fn ensure_appliance(
     ensure_appliance_with_port(wsl, store, rootfs_tar, connect_timeout, AGENT_PORT).await
 }
 
+/// `bottle upgrade` (спека §11): снос дистрибуции аплаенса и
+/// пере-импорт из `rootfs_tar`. Профили и настройки живут в `<data>`
+/// и не трогаются; локальный токен удаляется ДО пере-импорта —
+/// иначе ensure увидит «дистрибуция установлена» без токена и
+/// ответит «токен утерян». Возвращает версию нового аплаенса (из
+/// `HelloAck`; несовместимая версия отвергается handshake).
+///
+/// Ошибка `--unregister` (дистрибуции нет) не фатальна: upgrade на
+/// чистой машине — просто свежий импорт.
+pub async fn upgrade_appliance(
+    wsl: &dyn WslRunner,
+    store: &Store,
+    rootfs_tar: &Path,
+    connect_timeout: Duration,
+) -> Result<String, DaemonError> {
+    upgrade_appliance_with_port(wsl, store, rootfs_tar, connect_timeout, AGENT_PORT).await
+}
+
+/// Реализация [`upgrade_appliance`] с настраиваемым портом агента
+/// (тестовый шов — как у [`ensure_appliance_with_port`]).
+async fn upgrade_appliance_with_port(
+    wsl: &dyn WslRunner,
+    store: &Store,
+    rootfs_tar: &Path,
+    connect_timeout: Duration,
+    port: u16,
+) -> Result<String, DaemonError> {
+    if let Err(error) = wsl.run(&["--unregister", DISTRIBUTION], None).await {
+        tracing::warn!(%error, "wsl --unregister не удался (дистрибуции нет?) — продолжаю");
+    }
+    match fs::remove_file(store.appliance_token_path()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let handle = ensure_appliance_with_port(wsl, store, rootfs_tar, connect_timeout, port).await?;
+    Ok(handle.appliance_version)
+}
+
 /// Реализация [`ensure_appliance`] с настраиваемым портом агента:
 /// порт 7777 фиксирован протоколом, тесты подменяют его портом
 /// локального listener'а.
@@ -527,8 +566,9 @@ mod tests {
 
     /// Фейковый WslRunner: ведёт журнал вызовов, отвечает фиксированно.
     struct FakeWsl {
-        /// Дистрибуция уже импортирован (что вернёт `wsl -l -q`).
-        installed: bool,
+        /// Дистрибуция уже импортирован (что вернёт `wsl -l -q`);
+        /// `--unregister` сбрасывает флаг.
+        installed: std::sync::atomic::AtomicBool,
         calls: Mutex<Vec<Call>>,
         token: SharedToken,
     }
@@ -536,7 +576,7 @@ mod tests {
     impl FakeWsl {
         fn new(installed: bool) -> Self {
             Self {
-                installed,
+                installed: std::sync::atomic::AtomicBool::new(installed),
                 calls: Mutex::new(Vec::new()),
                 token: SharedToken::default(),
             }
@@ -558,11 +598,18 @@ mod tests {
 
             let args = call.args();
             if args == ["-l", "-q"] {
-                return Ok(if self.installed {
-                    format!("  \u{feff}{DISTRIBUTION}\r\nUbuntu\r\n")
-                } else {
-                    "Ubuntu\r\n".to_string()
-                });
+                return Ok(
+                    if self.installed.load(std::sync::atomic::Ordering::SeqCst) {
+                        format!("  \u{feff}{DISTRIBUTION}\r\nUbuntu\r\n")
+                    } else {
+                        "Ubuntu\r\n".to_string()
+                    },
+                );
+            }
+            if args.first() == Some(&"--unregister") {
+                self.installed
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                return Ok(String::new());
             }
             if args.first() == Some(&"--import") {
                 return Ok(String::new());
@@ -835,6 +882,76 @@ mod tests {
         // Фейк-агент сверил токен Hello с записанным в VM (assert внутри
         // сценария); локальная копия совпадает с записанным в VM.
         assert_eq!(wsl.token.get().as_deref(), Some(token.as_str()));
+    }
+
+    /// `bottle upgrade` (Review Focus #2): unregister дистрибуции →
+    /// удаление токена → пере-импорт + handshake; версия нового
+    /// аплаенса возвращается; токен регенерирован (не старый).
+    #[tokio::test]
+    async fn upgrade_unregisters_deletes_token_and_reimports() {
+        let (_tmp, store, rootfs) = test_store();
+        std::fs::write(store.appliance_token_path(), "old-token\n").unwrap();
+        let wsl = FakeWsl::new(true);
+        wsl.token.set("old-token".to_string());
+        let addr = spawn_fake_agent(
+            AgentScenario::Happy {
+                answer_requests: usize::MAX,
+            },
+            wsl.token.clone(),
+        )
+        .await;
+
+        let new_version =
+            upgrade_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
+                .await
+                .expect("upgrade доходит до handshake");
+
+        assert_eq!(
+            new_version, "0.1.0-test",
+            "версия из HelloAck нового аплаенса"
+        );
+        let calls = wsl.calls();
+        let unregister = position(&calls, "--unregister");
+        assert_eq!(
+            calls[unregister].args(),
+            ["--unregister", DISTRIBUTION],
+            "сносится только дистрибуция аплаенса"
+        );
+        let import = position(&calls, "--import");
+        assert!(unregister < import, "unregister до пере-импорта: {calls:?}");
+
+        // Токен регенерирован: старый недействителен, новый совпадает
+        // с копией в VM (token-regen путь).
+        let local_token = std::fs::read_to_string(store.appliance_token_path())
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_ne!(local_token, "old-token", "токен перегенерирован");
+        assert_eq!(wsl.token.get().as_deref(), Some(local_token.as_str()));
+    }
+
+    /// Upgrade на машине без дистрибуции: unregister молча пропускается,
+    /// выполняется свежий импорт.
+    #[tokio::test]
+    async fn upgrade_without_existing_distribution_still_imports() {
+        let (_tmp, store, rootfs) = test_store();
+        let wsl = FakeWsl::new(false);
+        let addr = spawn_fake_agent(
+            AgentScenario::Happy {
+                answer_requests: usize::MAX,
+            },
+            wsl.token.clone(),
+        )
+        .await;
+
+        let result =
+            upgrade_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
+                .await;
+
+        assert!(
+            result.is_ok(),
+            "без дистрибуции upgrade = свежий импорт: {result:?}"
+        );
     }
 
     #[tokio::test]

@@ -48,6 +48,10 @@ pub enum CliRequest {
     },
     /// Удалить бутылку (отказ, если она активна).
     Delete { id: String },
+    /// Пере-импорт аплаенса из rootfs (отказ при живых бутылках).
+    Upgrade,
+    /// Снять сиротские маршруты через службу (bottle routes cleanup).
+    RoutesCleanup,
 }
 
 /// Ответ демона CLI.
@@ -84,6 +88,15 @@ pub enum CliReply {
     /// Ответ на `Delete`: файлы профиля удалены; `warning` — например,
     /// конфигурационного файла уже не было.
     Deleted { id: String, warning: Option<String> },
+    /// Ответ на `Upgrade`: версия аплаенса до (`None` — не подключались
+    /// в этой сессии) и после пере-импорта.
+    Upgraded {
+        previous: Option<String>,
+        current: String,
+    },
+    /// Успех без данных (`routes cleanup`); `warning` — например,
+    /// служба маршрутов не установлена.
+    Done { warning: Option<String> },
     /// Ошибка выполнения команды.
     Error { message: String },
 }
@@ -267,6 +280,8 @@ mod tests {
             CliRequest::Delete {
                 id: "office-a".to_string(),
             },
+            CliRequest::Upgrade,
+            CliRequest::RoutesCleanup,
         ];
         for req in requests {
             assert_eq!(round_trip(req.clone()), req);
@@ -382,6 +397,18 @@ mod tests {
             CliReply::Deleted {
                 id: "office-a".to_string(),
                 warning: Some("файл конфигурации отсутствовал".to_string()),
+            },
+            CliReply::Upgraded {
+                previous: Some("0.1.0".to_string()),
+                current: "0.2.0".to_string(),
+            },
+            CliReply::Upgraded {
+                previous: None,
+                current: "0.2.0".to_string(),
+            },
+            CliReply::Done { warning: None },
+            CliReply::Done {
+                warning: Some("служба маршрутов не установлена".to_string()),
             },
             CliReply::Error {
                 message: "bottle not found".to_string(),

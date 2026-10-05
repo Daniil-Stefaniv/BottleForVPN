@@ -68,6 +68,20 @@ enum Command {
         #[command(subcommand)]
         command: LogsCommand,
     },
+    /// Маршруты host-бутылок
+    Routes {
+        #[command(subcommand)]
+        command: RoutesCommand,
+    },
+    /// Пере-импорт аплаенса (снос дистрибуции WSL + импорт из rootfs)
+    Upgrade,
+}
+
+/// Подкоманды `bottle routes`.
+#[derive(Debug, Subcommand)]
+enum RoutesCommand {
+    /// Снять сиротские маршруты через службу bottle-svc
+    Cleanup,
 }
 
 /// Аргументы `bottle create` (спека §5.1). Обязательность полей по
@@ -217,6 +231,10 @@ impl Command {
                 force: args.force,
             },
             Command::Delete { id } => CliRequest::Delete { id: id.clone() },
+            Command::Routes {
+                command: RoutesCommand::Cleanup,
+            } => CliRequest::RoutesCleanup,
+            Command::Upgrade => CliRequest::Upgrade,
             Command::Logs {
                 command: LogsCommand::Export { dest },
             } => CliRequest::LogsExport { dest: dest.clone() },
@@ -331,6 +349,23 @@ fn handle_reply(command: &Command, reply: CliReply) -> ExitCode {
         }
         (Command::Delete { .. }, CliReply::Deleted { id, warning }) => {
             println!("Бутылка {id} удалена");
+            if let Some(warning) = warning {
+                eprintln!("Внимание: {warning}");
+            }
+            ExitCode::SUCCESS
+        }
+        (Command::Upgrade, CliReply::Upgraded { previous, current }) => {
+            match previous {
+                Some(previous) => println!(
+                    "Аплаенс обновлён: версия {previous} → {current}; \
+                     профили бутылок сохранены"
+                ),
+                None => println!("Аплаенс обновлён: версия {current}; профили бутылок сохранены"),
+            }
+            ExitCode::SUCCESS
+        }
+        (Command::Routes { .. }, CliReply::Done { warning }) => {
+            println!("Маршруты очищены");
             if let Some(warning) = warning {
                 eprintln!("Внимание: {warning}");
             }
@@ -608,6 +643,46 @@ mod tests {
             CliRequest::Delete {
                 id: "office-a".to_string()
             }
+        );
+    }
+
+    /// upgrade и routes cleanup разбираются и отображаются в запросы.
+    #[test]
+    fn parses_upgrade_and_routes_cleanup() {
+        assert!(matches!(parse(&["bottle", "upgrade"]), Command::Upgrade));
+        assert_eq!(
+            parse(&["bottle", "upgrade"]).to_request(),
+            CliRequest::Upgrade
+        );
+        assert_eq!(
+            parse(&["bottle", "routes", "cleanup"]).to_request(),
+            CliRequest::RoutesCleanup
+        );
+    }
+
+    /// Ответы Upgraded/Done: успех; предупреждение cleanup — на stderr.
+    #[test]
+    fn upgraded_done_replies_are_success() {
+        assert_eq!(
+            handle_reply(
+                &Command::Upgrade,
+                CliReply::Upgraded {
+                    previous: Some("0.1.0".to_string()),
+                    current: "0.2.0".to_string(),
+                },
+            ),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            handle_reply(
+                &Command::Routes {
+                    command: RoutesCommand::Cleanup
+                },
+                CliReply::Done {
+                    warning: Some("служба маршрутов не установлена".to_string()),
+                },
+            ),
+            ExitCode::SUCCESS
         );
     }
 

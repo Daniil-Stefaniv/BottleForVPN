@@ -57,6 +57,26 @@ pub fn svc_pipe_exists() -> bool {
     }
 }
 
+/// `bottle routes cleanup` (спека §9): одна сессия со службой и
+/// запрос `Cleanup` — снятие сиротских маршрутов после краха демона.
+/// Вызывающий проверяет [`svc_pipe_exists`] и формирует предупреждение
+/// при отсутствии службы (portable-режим).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub async fn cleanup_via_service() -> Result<(), DaemonError> {
+    #[cfg(windows)]
+    {
+        let transport = RealSvcPipe::connect().await?;
+        let client = SvcClient::connect(Arc::new(transport)).await?;
+        client.cleanup().await
+    }
+    #[cfg(not(windows))]
+    {
+        Err(DaemonError::Svc(
+            "служба маршрутов доступна только на Windows".to_string(),
+        ))
+    }
+}
+
 /// Клиент службы маршрутов: сессия демона поверх открытого соединения.
 ///
 /// Создаётся через [`SvcClient::connect`] (рукопожатие `Hello`);

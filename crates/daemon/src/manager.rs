@@ -54,7 +54,7 @@ use tokio::task::JoinSet;
 
 use crate::appliance::{ensure_appliance, ApplianceHandle, WslRunner};
 use crate::error::DaemonError;
-use crate::host_manager::{HostManager, HostParts, HostTiming, BOTTLE_NOT_RUNNING};
+use crate::host_manager::{HostManager, HostParts, HostTiming};
 use crate::store::{atomic_write, Store};
 
 /// Нижняя граница диапазона автоподбора портов (dynamic, RFC 6335).
@@ -754,8 +754,11 @@ impl BottleManager {
             }
         };
         let Some(mut runtime) = runtime else {
-            return Ok(CliReply::Error {
-                message: BOTTLE_NOT_RUNNING.to_string(),
+            // Повторный stop уже остановленной — no-op с
+            // предупреждением, не ошибка (спека §5.2).
+            return Ok(CliReply::Stopped {
+                id: id.to_string(),
+                warning: Some("не была запущена".to_string()),
             });
         };
         runtime.state = BottleState::Stopping;
@@ -820,8 +823,8 @@ impl BottleManager {
     }
 
     /// Запоминает версию аплаенса из свежего handshake (сводки
-    /// `logs export`, диагностика `doctor`).
-    async fn remember_appliance_version(&self, version: &str) {
+    /// `logs export`, диагностика `doctor`, ответ `upgrade`).
+    pub async fn remember_appliance_version(&self, version: &str) {
         *self.appliance_version.lock().await = Some(version.to_string());
     }
 
@@ -2142,12 +2145,13 @@ mod tests {
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
         let (manager, _store) = manager_with(store.data_root(), fake.clone());
 
-        // Stop незапущенной бутылки — понятная ошибка.
+        // Stop незапущенной бутылки — no-op с предупреждением (§5.2).
         let reply = manager.stop("office-a").await.expect("stop без паники");
         assert_eq!(
             reply,
-            CliReply::Error {
-                message: "бутылка не запущена".to_string()
+            CliReply::Stopped {
+                id: "office-a".into(),
+                warning: Some("не была запущена".to_string())
             }
         );
 
@@ -2499,6 +2503,7 @@ mod tests {
             &store,
             Some(&manager),
             None,
+            None,
             bottle_core::ipc::CliRequest::Delete {
                 id: "office-a".to_string(),
             },
@@ -2518,6 +2523,70 @@ mod tests {
         );
     }
 
+    /// Upgrade при живой бутылке — отказ (Review Focus M3 #2): сносить
+    /// дистрибуцию под работающими бутылками нельзя.
+    #[tokio::test]
+    async fn dispatch_upgrade_with_live_bottle_is_refused() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let (manager, store) = manager_with(store.data_root(), fake);
+        manager.start("office-a").await.expect("бутылка поднята");
+
+        let reply = crate::pipe::dispatch(
+            &store,
+            Some(&manager),
+            None,
+            None,
+            bottle_core::ipc::CliRequest::Upgrade,
+        )
+        .await;
+
+        let CliReply::Error { message } = reply else {
+            panic!("ожидали Error, получили {reply:?}");
+        };
+        assert!(
+            message.contains("остановите"),
+            "требование остановить бутылки: {message}"
+        );
+    }
+
+    /// Повторный stop уже остановленной — no-op с предупреждением,
+    /// не ошибка (спека §5.2).
+    #[tokio::test]
+    async fn dispatch_stop_of_stopped_bottle_is_noop_with_warning() {
+        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let (manager, store) = manager_with(store.data_root(), fake);
+        manager.start("office-a").await.expect("бутылка поднята");
+        let first = manager.stop("office-a").await.expect("первый stop");
+        assert_eq!(
+            first,
+            CliReply::Stopped {
+                id: "office-a".into(),
+                warning: None
+            }
+        );
+
+        let reply = crate::pipe::dispatch(
+            &store,
+            Some(&manager),
+            None,
+            None,
+            bottle_core::ipc::CliRequest::Stop {
+                id: "office-a".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            reply,
+            CliReply::Stopped {
+                id: "office-a".into(),
+                warning: Some("не была запущена".to_string())
+            }
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_wires_start_stop_status_and_show_runtime_to_manager() {
         let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
@@ -2528,6 +2597,7 @@ mod tests {
         let reply = crate::pipe::dispatch(
             &store,
             Some(&manager),
+            None,
             None,
             bottle_core::ipc::CliRequest::Start {
                 id: "office-a".to_string(),
@@ -2545,6 +2615,7 @@ mod tests {
         let reply = crate::pipe::dispatch(
             &store,
             Some(&manager),
+            None,
             None,
             bottle_core::ipc::CliRequest::Show {
                 id: "office-a".to_string(),
@@ -2564,6 +2635,7 @@ mod tests {
             &store,
             Some(&manager),
             None,
+            None,
             bottle_core::ipc::CliRequest::Status,
         )
         .await;
@@ -2578,6 +2650,7 @@ mod tests {
         let reply = crate::pipe::dispatch(
             &store,
             Some(&manager),
+            None,
             None,
             bottle_core::ipc::CliRequest::Stop {
                 id: "office-a".to_string(),
@@ -2594,6 +2667,7 @@ mod tests {
         let reply = crate::pipe::dispatch(
             &store,
             Some(&manager),
+            None,
             None,
             bottle_core::ipc::CliRequest::Status,
         )

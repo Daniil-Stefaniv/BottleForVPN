@@ -64,11 +64,6 @@ pub const DNS_RECHECK_STEP: Duration = Duration::from_secs(30);
 const HOST_STOP_CLIENT_WARNING: &str =
     "VPN-клиент оставлен запущенным (API завершения у вендорских клиентов нет); \
      остановите его вручную, если он больше не нужен";
-/// Сообщение `stop` на не запущенной бутылке. Общее для env- и
-/// host-менеджеров (finding 3 ревью T9/T10: одно определение здесь,
-/// [`crate::manager`] переиспользует).
-pub(crate) const BOTTLE_NOT_RUNNING: &str = "бутылка не запущена";
-
 // ----------------------------------------------------------------------
 // Инъекционные зависимости (тестируемость на фейках, macOS).
 // ----------------------------------------------------------------------
@@ -690,8 +685,11 @@ impl HostManager {
             }
         };
         let Some(mut session) = removed else {
-            return Ok(CliReply::Error {
-                message: BOTTLE_NOT_RUNNING.to_string(),
+            // Повторный stop уже остановленной — no-op с
+            // предупреждением, не ошибка (спека §5.2).
+            return Ok(CliReply::Stopped {
+                id: id.to_string(),
+                warning: Some("не была запущена".to_string()),
             });
         };
 
@@ -2379,10 +2377,14 @@ mod tests {
             "порт закрыт после stop"
         );
 
+        // Повторный stop — no-op с предупреждением (спека §5.2).
         let reply = setup.host.stop("corp").await.expect("ответ, не сбой");
-        assert!(
-            matches!(&reply, CliReply::Error { ref message } if message == "бутылка не запущена"),
-            "{reply:?}"
+        assert_eq!(
+            reply,
+            CliReply::Stopped {
+                id: "corp".into(),
+                warning: Some("не была запущена".to_string())
+            }
         );
     }
 
