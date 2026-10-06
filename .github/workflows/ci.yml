@@ -83,6 +83,9 @@ jobs:
       - name: ESLint (TS)
         working-directory: gui
         run: npm run lint
+      - name: Vitest (TS-логика экранов)
+        working-directory: gui
+        run: npm run test
       - name: fmt + clippy (Rust-мост)
         working-directory: gui/src-tauri
         run: |

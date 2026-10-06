@@ -13,7 +13,58 @@ body {
   margin: 0 0 0.75rem;
 }
 
-#self-check {
-  color: dimgray;
+#tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+#bottles {
+  width: 100%;
+  border-collapse: collapse;
   font-size: 0.9rem;
+}
+
+#bottles th,
+#bottles td {
+  text-align: left;
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid dimgray;
+}
+
+#bottles td.actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+#daemon-panel {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  border: 1px solid dimgray;
+  border-radius: 6px;
+}
+
+#daemon-log {
+  max-height: 8rem;
+  overflow: auto;
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+}
+
+#toast {
+  position: fixed;
+  bottom: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 80%;
+  padding: 0.6rem 1rem;
+  border-radius: 6px;
+  background: firebrick;
+  color: white;
+  font-size: 0.85rem;
+}
+
+button {
+  padding: 0.3rem 0.8rem;
+  border-radius: 4px;
 }

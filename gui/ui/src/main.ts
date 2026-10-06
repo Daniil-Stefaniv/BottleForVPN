@@ -1,34 +1,24 @@
-// Точка входа GUI (M4 Task 2): каркас проверяет доступность CLI
-// через команду-посредник run_bottle. Экраны списка/создания/doctor
-// подключаются в последующих задачах (Task 3–5).
+// Точка входа GUI (M4): подключает мосты к Rust-командам (run_bottle,
+// start_daemon/daemon_status) и монтирует каркас приложения.
 
 import { invoke } from "@tauri-apps/api/core";
+import { mountApp, setDaemonApi } from "./app";
+import { setBottleInvoker } from "./ipc";
+import type { BottleOutput } from "./ipc";
 
-/** Ответ команды-посредника: stdout подпроцесса `bottle` и его код. */
-export interface BottleOutput {
-  stdout: string;
-  code: number;
-}
-
-/**
- * Выполняет `bottle <args>` как сайдкар-подпроцесс (рулинг D1):
- * вся бизнес-логика — в CLI, GUI только рендерит.
- */
-export async function runBottle(args: string[]): Promise<BottleOutput> {
+setBottleInvoker(async (args) => {
   return await invoke<BottleOutput>("run_bottle", { args });
-}
+});
 
-async function init(): Promise<void> {
-  const element = document.querySelector<HTMLParagraphElement>("#bottle-version");
-  if (element === null) {
-    return;
-  }
-  try {
-    const output = await runBottle(["--version", "--json"]);
-    element.textContent = `CLI: ${output.stdout.trim()}`;
-  } catch (error) {
-    element.textContent = `CLI недоступен: ${error}`;
-  }
-}
+setDaemonApi({
+  start: async () => {
+    await invoke("start_daemon");
+  },
+  status: async () => {
+    return await invoke<{ running: boolean; log_tail: string }>(
+      "daemon_status",
+    );
+  },
+});
 
-void init();
+mountApp();

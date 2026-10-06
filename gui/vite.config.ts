@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 
 // Источники фронтенда — в ui/ (план M4), тулчейн — в gui/package.json;
 // strictPort, чтобы tauri dev всегда попадал на этот порт.
@@ -13,5 +13,9 @@ export default defineConfig({
   },
   build: {
     target: "es2022",
+  },
+  test: {
+    environment: "happy-dom",
+    include: ["src/**/*.test.ts"],
   },
 });

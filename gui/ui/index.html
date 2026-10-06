@@ -9,9 +9,25 @@
   <body>
     <main id="app">
       <h1>BottleForApps</h1>
-      <section id="self-check">
-        <p id="bottle-version">Проверка CLI…</p>
+
+      <nav id="tabs">
+        <button class="tab active" data-screen="list">Бутылки</button>
+        <button class="tab" data-screen="create" disabled>Создать</button>
+        <button class="tab" data-screen="doctor" disabled>Диагностика</button>
+      </nav>
+
+      <section id="screen-list" class="screen">
+        <table id="bottles"></table>
       </section>
+      <!-- Экраны create/doctor подключаются в Task 4. -->
+
+      <section id="daemon-panel" hidden>
+        <p id="daemon-hint"></p>
+        <button id="daemon-start">Запустить демона</button>
+        <pre id="daemon-log"></pre>
+      </section>
+
+      <div id="toast" hidden></div>
     </main>
     <script type="module" src="/src/main.ts"></script>
   </body>
