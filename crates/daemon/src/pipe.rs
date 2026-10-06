@@ -264,6 +264,18 @@ fn is_active_state(state: &BottleState) -> bool {
 /// Ошибки валидации переводятся в понятные русские тексты create.
 async fn create_bottle(store: &Store, profile: &BottleProfile, force: bool) -> CliReply {
     use bottle_core::profile::{validate_profile, ProfileError};
+    // D2 (M4): механика host-бутылок целиком про таблицу маршрутов
+    // Windows; на macOS/Unix — отказ на создании, а не заглушка в start.
+    #[cfg(not(windows))]
+    {
+        if matches!(profile.kind, bottle_core::profile::BottleKind::Host) {
+            return CliReply::Error {
+                message:
+                    "host-бутылки поддерживаются только на Windows (механика точечных маршрутов); на этой платформе доступны env-бутылки"
+                        .to_string(),
+            };
+        }
+    }
     if let Err(error) = validate_profile(profile) {
         return CliReply::Error {
             message: match error {
@@ -717,7 +729,10 @@ endpoints = ["e.example"]
         );
     }
 
-    /// host без endpoint'ов — ошибка валидации при создании.
+    /// host без endpoint'ов — ошибка валидации при создании
+    /// (проверка валидации достижима на Windows; на macOS любой host
+    /// раньше отклоняется правилом D2 — см. тест ниже).
+    #[cfg(windows)]
     #[tokio::test]
     async fn create_host_without_endpoints_is_rejected() {
         let (_tmp, store) = empty_store();
@@ -745,6 +760,35 @@ endpoints = ["e.example"]
         assert!(
             message.contains("endpoint") || message.contains("поле"),
             "понятная ошибка: {message}"
+        );
+    }
+
+    /// D2 (M4): host-бутылки — Windows-эксклюзив; на macOS создание
+    /// host-профиля отказывает с понятным текстом, а не заглушкой
+    /// где-то в глубине start.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn create_host_on_non_windows_is_refused_with_explanation() {
+        let (_tmp, store) = empty_store();
+
+        let reply = dispatch(
+            &store,
+            None,
+            None,
+            None,
+            CliRequest::Create {
+                profile: host_profile("corp-vpn"),
+                force: false,
+            },
+        )
+        .await;
+
+        let CliReply::Error { message } = reply else {
+            panic!("ожидали Error, получили {reply:?}");
+        };
+        assert!(
+            message.contains("host-бутылки поддерживаются только на Windows"),
+            "текст D2: {message}"
         );
     }
 

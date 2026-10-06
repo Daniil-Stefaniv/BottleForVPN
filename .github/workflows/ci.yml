@@ -33,6 +33,21 @@ jobs:
       # сверка журнала при повторном старте подбирает сироту → uninstall.
       - run: cargo test -p svc --test svc_win -- --ignored
 
+  # macOS-гейт (M4 Task 8, Review Focus #5): три таргета зелёные в
+  # каждом PR — ubuntu, windows, macos-14 (arm64). Юнит-тесты включая
+  # реальный UDS-круг сервер+клиент (Task 7) + явный check aarch64.
+  macos-checks:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build -p daemon -p cli --target aarch64-apple-darwin
+
   agent-integration:
     runs-on: ubuntu-latest
     steps:
