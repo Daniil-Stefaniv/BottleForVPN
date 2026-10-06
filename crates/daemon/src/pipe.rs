@@ -450,7 +450,7 @@ mod tests {
 
     use super::*;
     use bottle_core::profile::{
-        validate_profile, BottleKind, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig,
+        BottleKind, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig,
     };
 
     /// Env-профиль с исходным конфигом `config` (до нормализации save).
@@ -740,7 +740,10 @@ endpoints = ["e.example"]
         if let VpnConfig::Host { endpoints, .. } = &mut profile.vpn {
             endpoints.clear();
         }
-        assert!(validate_profile(&profile).is_err(), "профиль невалиден");
+        assert!(
+            bottle_core::profile::validate_profile(&profile).is_err(),
+            "профиль невалиден"
+        );
 
         let reply = dispatch(
             &store,
