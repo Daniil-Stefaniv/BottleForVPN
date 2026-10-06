@@ -1,7 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Права главного окна: выбор файла конфига (dialog) и открытие папки логов (opener)",
+  "description": "Права главного окна: выбор файла конфига (dialog), открытие папки логов (opener), скрытие/показ окна для close-to-tray, события tray",
   "windows": ["main"],
-  "permissions": ["dialog:default", "opener:default"]
+  "permissions": [
+    "dialog:default",
+    "opener:default",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:event:default"
+  ]
 }

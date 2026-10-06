@@ -84,6 +84,13 @@ async function updateDaemonLog(): Promise<void> {
   }
 }
 
+/** Подписчик на обновления строк таблицы (tray-меню — Task 5). */
+let rowsNotifier: ((rows: BottleRow[]) => void) | null = null;
+
+export function setRowsNotifier(fn: ((rows: BottleRow[]) => void) | null): void {
+  rowsNotifier = fn;
+}
+
 /**
  * Однократное обновление таблицы: `--json list` + `--json status` →
  * merge → рендер. Ошибка «демон не запущен» — панель с инструкцией;
@@ -126,6 +133,7 @@ export async function refreshBottles(): Promise<BottleRow[]> {
       });
     },
   );
+  rowsNotifier?.(rows);
   return rows;
 }
 
