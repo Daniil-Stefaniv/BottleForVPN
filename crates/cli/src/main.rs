@@ -264,6 +264,15 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(40);
 #[cfg_attr(not(windows), allow(dead_code))]
 const REPLY_TIMEOUT_START: Duration = Duration::from_secs(120);
 
+/// Окно повторных попыток подключения (named pipe и UDS одинаково):
+/// демон обслуживает клиентов параллельно, но между созданием
+/// очередного ожидающего экземпляра канала/сокета и освобождением
+/// предыдущего клиент видит «занят»/«нет файла» — это стык, а не
+/// отсутствие демона; 60 с покрывают его с запасом (включая холодный
+/// старт bottled).
+#[cfg_attr(not(windows), allow(dead_code))]
+const CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(60);
+
 /// Таймаут ответа демона зависит от команды: `start` — долгая операция,
 /// остальные укладываются в базовое ожидание.
 // Выбирается windows-транспортом; на остальных платформах — только
@@ -296,26 +305,9 @@ async fn main() -> ExitCode {
             .exit()
     };
 
-    // Транспорт демона существует только на Windows (named pipe, спека §4.4);
-    // рендер и разбор аргументов при этом кроссплатформенны и тестируются.
-    #[cfg(not(windows))]
-    {
-        let _ = command;
-        if cli.json {
-            println!(
-                "{}",
-                render_json(&CliReply::Error {
-                    message:
-                        "bottle работает только на Windows (демон недоступен на этой платформе)"
-                            .to_string()
-                })
-            );
-        } else {
-            eprintln!("bottle работает только на Windows (демон недоступен на этой платформе)");
-        }
-        ExitCode::FAILURE
-    }
-
+    // Windows — named pipe (спека §4.4); macOS/Unix — UDS
+    // `<data>/daemon.sock` (M4 Task 7). Рендер и разбор аргументов
+    // кроссплатформенны и тестируются на любой платформе.
     #[cfg(windows)]
     {
         let request = command.to_request();
@@ -341,6 +333,56 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+
+    #[cfg(unix)]
+    {
+        let request = command.to_request();
+        let socket = bottle_core::ipc::daemon_socket_path(
+            &bottle_core::ipc::default_data_dir()
+                .expect("каталог данных пользователя определимся на unix"),
+        );
+        match bottle_core::ipc::uds_exchange(
+            &socket,
+            &request,
+            reply_timeout(&request),
+            CONNECT_RETRY_WINDOW,
+        )
+        .await
+        {
+            Ok(reply) => {
+                if cli.json {
+                    handle_reply_json(&reply)
+                } else {
+                    handle_reply(&command, reply)
+                }
+            }
+            Err(message) => {
+                if cli.json {
+                    println!("{}", render_json(&CliReply::Error { message }));
+                } else {
+                    eprintln!("{message}");
+                }
+                ExitCode::FAILURE
+            }
+        }
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = command;
+        if cli.json {
+            println!(
+                "{}",
+                render_json(&CliReply::Error {
+                    message: "bottle не поддерживает эту платформу (транспорта демона нет)"
+                        .to_string()
+                })
+            );
+        } else {
+            eprintln!("bottle не поддерживает эту платформу (транспорта демона нет)");
+        }
+        ExitCode::FAILURE
     }
 }
 
@@ -506,13 +548,6 @@ mod client {
     use tokio_util::codec::{Encoder, FramedRead};
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
 
-    /// Окно повторных попыток подключения. Демон обслуживает клиентов
-    /// параллельно, но между созданием очередного ожидающего экземпляра
-    /// канала и освобождением предыдущего клиент видит «канал занят» или
-    /// «канал не существует» — это стык экземпляров, а не отсутствие
-    /// демона; 60 с покрывают его с запасом (включая холодный старт
-    /// bottled).
-    const CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(60);
     /// Пауза между попытками подключения.
     const CONNECT_RETRY_PAUSE: Duration = Duration::from_millis(50);
 
@@ -555,7 +590,7 @@ mod client {
     /// `ERROR_FILE_NOT_FOUND` в окне [`CONNECT_RETRY_WINDOW`] — стык
     /// между экземплярами канала сервера, а не отсутствие демона.
     async fn connect() -> Result<NamedPipeClient, ClientError> {
-        let deadline = tokio::time::Instant::now() + CONNECT_RETRY_WINDOW;
+        let deadline = tokio::time::Instant::now() + super::CONNECT_RETRY_WINDOW;
         loop {
             match ClientOptions::new().open(DAEMON_PIPE) {
                 Ok(pipe) => return Ok(pipe),

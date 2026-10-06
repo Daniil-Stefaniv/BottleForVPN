@@ -16,3 +16,11 @@ thiserror = "2"
 tracing = "0.1"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
+# UDS-клиент читает кадры через FramedRead (M4 Task 7).
+tokio-stream = "0.1"
+# Каталог данных по умолчанию (CLI и демон считают его одинаково).
+dirs = "5"
+
+[dev-dependencies]
+# Тесты UDS-клиента работают во временном каталоге.
+tempfile = "3"

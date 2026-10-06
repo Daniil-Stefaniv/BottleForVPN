@@ -63,6 +63,11 @@ mod ps_query;
 mod store;
 #[allow(dead_code)]
 mod svc_client;
+#[cfg(unix)]
+mod uds;
+#[cfg(all(test, unix))]
+#[path = "uds_tests.rs"]
+mod uds_tests;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -143,12 +148,27 @@ pub async fn serve_daemon(
         pipe::serve(bottle_core::ipc::DAEMON_PIPE, daemon, shutdown).await
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        // Named pipe — транспорт Windows. Dev-запуск на других платформах
-        // проверяет старт (хранилище, single-instance) и корректную
-        // остановку по Ctrl+C, канал не обслуживая.
-        println!("Канал управления доступен только на Windows; ожидаю Ctrl+C");
+        // macOS/Unix-транспорт — UDS `<data>/daemon.sock` (M4 Task 7);
+        // протокол и диспетчер те же, что у named pipe Windows. Менеджер
+        // бутылок на macOS подключается в Task 10 (VzRunner); до него
+        // диспетчер честно отвечает переходной ошибкой.
+        let socket = bottle_core::ipc::daemon_socket_path(store.data_root());
+        println!("Канал управления: {}", socket.display());
+        let daemon = Arc::new(Daemon {
+            store,
+            manager: None,
+            wsl: None,
+            rootfs: None,
+        });
+        uds::serve(&socket, daemon, shutdown).await
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        // Транспорта нет: dev-запуск проверяет старт и остановку.
+        println!("Канал управления недоступен на этой платформе; ожидаю Ctrl+C");
         shutdown.cancelled().await;
         Ok(())
     }
@@ -208,7 +228,7 @@ where
 
 /// Каталог данных по умолчанию: `<локальный каталог данных>/BottleForApps`.
 fn default_data_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|base| base.join("BottleForApps"))
+    bottle_core::ipc::default_data_dir()
 }
 
 /// Разрешает путь rootfs-тарболла (рулинг M3): явный `--rootfs` →

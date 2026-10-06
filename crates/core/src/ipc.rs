@@ -14,6 +14,80 @@ use crate::protocol::ForwardPort;
 /// Имя канала демона (Windows named pipe).
 pub const DAEMON_PIPE: &str = r"\\.\pipe\bottled";
 
+/// Имя UDS-сокета демона внутри каталога данных (macOS/Unix, M4 D3).
+pub const DAEMON_SOCK_FILE: &str = "daemon.sock";
+
+/// Путь UDS-сокета демона: `<data>/daemon.sock`. Каталог данных уже
+/// 0700 (Store), файл сокета — 0600 (прав достаточно, токен не нужен).
+pub fn daemon_socket_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join(DAEMON_SOCK_FILE)
+}
+
+/// Каталог данных по умолчанию (CLI и демон считают одинаково):
+/// локальный каталог данных пользователя + `BottleForApps`.
+pub fn default_data_dir() -> Option<std::path::PathBuf> {
+    dirs::data_local_dir().map(|base| base.join("BottleForApps"))
+}
+
+/// UDS-клиент CLI↔демона (macOS/Unix, M4 Task 7): подключение с
+/// retry-окном (демон поднимается — ENOENT/ECONNREFUSED пережидается),
+/// один запрос — один ответ кадрами LengthJsonCodec, таймаут ответа.
+///
+/// Ошибки — русские строки, совпадающие по смыслу с named-pipe
+/// транспортом Windows (ECONNREFUSED ≈ «демон не запущен»).
+#[cfg(unix)]
+pub async fn uds_exchange(
+    socket: &std::path::Path,
+    request: &CliRequest,
+    reply_timeout: std::time::Duration,
+    connect_window: std::time::Duration,
+) -> Result<CliReply, String> {
+    use tokio::io::{split, AsyncWriteExt};
+    use tokio_stream::StreamExt;
+    use tokio_util::codec::{Encoder, FramedRead};
+
+    use crate::frame::LengthJsonCodec;
+
+    let deadline = tokio::time::Instant::now() + connect_window;
+    let stream = loop {
+        match tokio::net::UnixStream::connect(socket).await {
+            Ok(stream) => break stream,
+            Err(error) => {
+                let stale = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                );
+                if !stale || tokio::time::Instant::now() >= deadline {
+                    return Err(
+                        "Не удалось подключиться к демону BottleForApps — запущен ли bottled?"
+                            .to_string(),
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    };
+
+    let (read_half, mut write_half) = split(stream);
+    let mut request_codec = LengthJsonCodec::<CliRequest>::new();
+    let mut buf = bytes::BytesMut::new();
+    request_codec
+        .encode(request.clone(), &mut buf)
+        .map_err(|error| format!("Ошибка обмена с демоном: {error}"))?;
+    write_half
+        .write_all(&buf)
+        .await
+        .map_err(|error| format!("Ошибка обмена с демоном: {error}"))?;
+
+    let mut reader = FramedRead::new(read_half, LengthJsonCodec::<CliReply>::new());
+    match tokio::time::timeout(reply_timeout, reader.next()).await {
+        Ok(Some(Ok(reply))) => Ok(reply),
+        Ok(Some(Err(error))) => Err(format!("Ошибка обмена с демоном: {error}")),
+        Ok(None) => Err("Демон закрыл соединение без ответа".to_string()),
+        Err(_) => Err(format!("Демон не ответил за {} с", reply_timeout.as_secs())),
+    }
+}
+
 /// Запрос CLI к демону.
 ///
 /// `Create` крупнее остальных вариантов из-за встроенного профиля;

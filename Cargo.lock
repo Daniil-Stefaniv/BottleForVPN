@@ -109,10 +109,13 @@ name = "bottle-core"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "dirs",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "toml",
  "tracing",
