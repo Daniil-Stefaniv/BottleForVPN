@@ -1,0 +1,45 @@
+[package]
+name = "vz-poc"
+version = "0.1.0"
+edition = "2021"
+description = "GO/NO-GO спайк этапа B (M4 Task 9): Linux-VM на Virtualization.framework с агентом BottleForApps"
+
+# Отдельный от корня workspace: спайк не входит в релизные сборки.
+[workspace]
+
+[dependencies]
+bottle-core = { path = "../../crates/core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+serde_json = "1"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+libc = "0.2"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSError", "NSRunLoop", "NSURL", "NSFileHandle"] }
+objc2-virtualization = { version = "0.3", features = [
+    "VZVirtualMachine",
+    "VZVirtualMachineConfiguration",
+    "VZBootLoader",
+    "VZLinuxBootLoader",
+    "VZPlatformConfiguration",
+    "VZGenericPlatformConfiguration",
+    "VZVirtioNetworkDeviceConfiguration",
+    "VZNetworkDeviceConfiguration",
+    "VZNATNetworkDeviceAttachment",
+    "VZNetworkDeviceAttachment",
+    "VZConsoleDeviceConfiguration",
+    "VZConsolePortConfiguration",
+    "VZSerialPortAttachment",
+    "VZFileHandleSerialPortAttachment",
+    "VZVirtioConsoleDeviceConfiguration",
+    "VZVirtioConsoleDeviceSerialPortConfiguration",
+    "VZVirtioConsolePortConfiguration",
+    "VZVirtioConsolePortConfigurationArray",
+] }
+
+[profile.release]
+strip = true

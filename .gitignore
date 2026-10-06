@@ -15,3 +15,7 @@ gui/node_modules/
 gui/ui/dist/
 gui/src-tauri/target/
 gui/src-tauri/gen/
+
+# vz-спайк: артефакты сборки образов (бинарники/kernel) и cargo
+spikes/vz-poc/image/
+spikes/vz-poc/target/
