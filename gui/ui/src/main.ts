@@ -1,8 +1,11 @@
 // Точка входа GUI (M4): подключает мосты к Rust-командам (run_bottle,
-// start_daemon/daemon_status) и монтирует каркас приложения.
+// start_daemon/daemon_status, диалог выбора файла, opener папки логов)
+// и монтирует каркас приложения.
 
 import { invoke } from "@tauri-apps/api/core";
-import { mountApp, setDaemonApi } from "./app";
+import { open } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { mountApp, setDaemonApi, setRevealInDir, setConfigFileDialog } from "./app";
 import { setBottleInvoker } from "./ipc";
 import type { BottleOutput } from "./ipc";
 
@@ -19,6 +22,19 @@ setDaemonApi({
       "daemon_status",
     );
   },
+});
+
+setConfigFileDialog(async () => {
+  const selected = await open({
+    multiple: false,
+    directory: false,
+    title: "Файл конфигурации туннеля",
+  });
+  return typeof selected === "string" ? selected : null;
+});
+
+setRevealInDir(async (path) => {
+  await revealItemInDir(path);
 });
 
 mountApp();

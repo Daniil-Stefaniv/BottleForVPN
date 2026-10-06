@@ -12,14 +12,58 @@
 
       <nav id="tabs">
         <button class="tab active" data-screen="list">Бутылки</button>
-        <button class="tab" data-screen="create" disabled>Создать</button>
-        <button class="tab" data-screen="doctor" disabled>Диагностика</button>
+        <button class="tab" data-screen="create">Создать</button>
+        <button class="tab" data-screen="doctor">Диагностика</button>
       </nav>
 
       <section id="screen-list" class="screen">
         <table id="bottles"></table>
       </section>
-      <!-- Экраны create/doctor подключаются в Task 4. -->
+
+      <section id="screen-create" class="screen" hidden>
+        <form id="create-form">
+          <label>Идентификатор <input id="f-id" placeholder="office-a" /></label>
+          <label>Имя <input id="f-name" placeholder="Офис А" /></label>
+          <label>Тип
+            <select id="f-kind">
+              <option value="env">env — изолирующее окружение</option>
+              <option value="host">host — фирменный клиент</option>
+            </select>
+          </label>
+          <!-- env -->
+          <label class="env-field">Протокол
+            <select id="f-protocol">
+              <option value="wireguard">WireGuard</option>
+              <option value="openvpn">OpenVPN</option>
+            </select>
+          </label>
+          <label class="env-field">Файл конфигурации
+            <input id="f-config" placeholder="/path/wg-office.conf" />
+            <button type="button" id="f-config-pick">Выбрать файл…</button>
+          </label>
+          <!-- host -->
+          <label class="host-field" hidden>VPN-клиент <input id="f-vpn" /></label>
+          <label class="host-field" hidden>Аргументы клиента <input id="f-vpn-args" /></label>
+          <label class="host-field" hidden>Endpoint'ы (через пробел) <input id="f-endpoints" /></label>
+          <label class="host-field" hidden>Интерфейс (необязательно) <input id="f-vpn-interface" /></label>
+          <!-- общее -->
+          <label>Порт SOCKS5 (0 — автоподбор) <input id="f-socks5" type="number" value="0" min="0" max="65535" /></label>
+          <label>TCP-пробросы host:port (через пробел) <input id="f-forwards" placeholder="10.20.30.15:3389" /></label>
+          <label>DNS внутри бутылки <input id="f-dns" placeholder="10.20.30.1" /></label>
+          <label>Команда после подъёма <input id="f-launch" placeholder="mstsc" /></label>
+          <button type="submit" id="create-submit">Создать</button>
+          <button type="button" id="create-reset">Новая бутылка</button>
+        </form>
+        <p id="create-error" hidden></p>
+      </section>
+
+      <section id="screen-doctor" class="screen" hidden>
+        <table id="doctor-table"></table>
+        <button id="doctor-refresh">Проверить снова</button>
+        <button id="logs-export">Собрать логи</button>
+        <p id="logs-path" hidden></p>
+        <button id="logs-open-dir" hidden>Открыть папку</button>
+      </section>
 
       <section id="daemon-panel" hidden>
         <p id="daemon-hint"></p>

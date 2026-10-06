@@ -194,4 +194,28 @@ describe("renderListTable", () => {
     start?.click();
     expect(calls).toEqual([{ id: "a", action: "start" }]);
   });
+
+  it("кнопка «Изменить» открывает форму edit с id бутылки", () => {
+    const edits: string[] = [];
+    renderListTable(
+      [
+        {
+          id: "a",
+          name: "A",
+          kind: "env",
+          state: "stopped",
+          socks5: null,
+          forwards: [],
+        },
+      ],
+      () => {},
+      (id) => edits.push(id),
+    );
+    const buttons = [
+      ...document.querySelectorAll<HTMLButtonElement>("#bottles tbody button"),
+    ];
+    const edit = buttons.find((button) => button.textContent === "Изменить");
+    edit?.click();
+    expect(edits).toEqual(["a"]);
+  });
 });

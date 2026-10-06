@@ -1,12 +1,9 @@
-// Каркас приложения (M4 Task 3): поллинг списка каждые 2 с, кнопки
-// старт/стоп (логика — в list.ts), состояние «демон не запущен» с
-// кнопкой запуска bottled (рулинг D1), тосты ошибок CLI дословно.
+// Каркас приложения (M4 Task 3–4): поллинг списка каждые 2 с, кнопки
+// старт/стоп/изменить, состояние «демон не запущен» с кнопкой запуска
+// bottled (рулинг D1), тосты ошибок CLI дословно, переключение экранов
+// список/создать/диагностика.
 
-import {
-  isDaemonUnavailable,
-  runBottleReply,
-  setBottleInvoker,
-} from "./ipc";
+import { isDaemonUnavailable, runBottleReply, setBottleInvoker } from "./ipc";
 import type { CliReply } from "./ipc";
 import {
   mergeListStatus,
@@ -14,6 +11,8 @@ import {
   type BottleAction,
   type BottleRow,
 } from "./list";
+import { loadProfileForEdit, resetForm, submitCreate } from "./create";
+import { collectLogs, loadDoctor } from "./doctor";
 
 /** API демона (Rust-команды start_daemon/daemon_status), подменяется в тестах. */
 export interface DaemonApi {
@@ -25,6 +24,16 @@ let daemonApi: DaemonApi | null = null;
 
 export function setDaemonApi(api: DaemonApi): void {
   daemonApi = api;
+}
+
+/** Путь к папке логов последнего экспорта (для «Открыть папку»). */
+let lastLogsPath: string | null = null;
+
+/** Адаптер «Открыть папку» (Tauri opener; подменяется в тестах). */
+let revealInDir: ((path: string) => Promise<void>) | null = null;
+
+export function setRevealInDir(fn: (path: string) => Promise<void>): void {
+  revealInDir = fn;
 }
 
 /** Интервал статус-поллинга (D1). */
@@ -103,9 +112,20 @@ export async function refreshBottles(): Promise<BottleRow[]> {
     return [];
   }
   const rows = mergeListStatus(list.List.bottles, status.Status.bottles);
-  renderListTable(rows, (id, action) => {
-    void performBottleAction(id, action);
-  });
+  renderListTable(
+    rows,
+    (id, action) => {
+      void performBottleAction(id, action);
+    },
+    (id) => {
+      switchScreen("create");
+      void loadProfileForEdit(id).then((loaded) => {
+        if (!loaded) {
+          showToast(`Профиль бутылки не найден: ${id}`);
+        }
+      });
+    },
+  );
   return rows;
 }
 
@@ -141,9 +161,58 @@ async function onStartDaemon(): Promise<void> {
     showToast(error instanceof Error ? error.message : String(error));
     return;
   }
-  // Демон поднимает каналы не мгновенно — первая попытка может уйти в
-  // retry-окно CLI; поллинг доведёт список сам.
+  // Демон поднимает каналы не мгновенно — поллинг доведёт список сам.
   await refreshBottles();
+}
+
+/** Переключение экранов: активный таб + видимость секций. */
+export function switchScreen(screen: string): void {
+  for (const tab of document.querySelectorAll<HTMLButtonElement>(".tab")) {
+    tab.classList.toggle("active", tab.dataset.screen === screen);
+  }
+  for (const section of document.querySelectorAll<HTMLElement>(".screen")) {
+    section.hidden = section.id !== `screen-${screen}`;
+  }
+  if (screen === "doctor") {
+    loadDoctor().catch((error: unknown) => {
+      showToast(error instanceof Error ? error.message : String(error));
+    });
+  }
+}
+
+/** Submit формы create: edit определяется по readonly id (заполнен из show). */
+async function onCreateSubmit(): Promise<void> {
+  const idField = document.querySelector<HTMLInputElement>("#f-id");
+  const isEdit = idField !== null && idField.readOnly;
+  const ok = await submitCreate(isEdit);
+  if (ok) {
+    switchScreen("list");
+    await refreshBottles();
+  }
+}
+
+/** «Собрать логи»: путь + кнопка «Открыть папку» (Tauri opener). */
+async function onCollectLogs(): Promise<void> {
+  try {
+    lastLogsPath = await collectLogs();
+    const openButton = document.querySelector<HTMLElement>("#logs-open-dir");
+    if (openButton !== null) {
+      openButton.hidden = false;
+    }
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** Показ/скрытие полей по типу бутылки (env ↔ host). */
+function syncKindFields(): void {
+  const kind = document.querySelector<HTMLSelectElement>("#f-kind")?.value;
+  for (const field of document.querySelectorAll<HTMLElement>(".env-field")) {
+    field.hidden = kind !== "env";
+  }
+  for (const field of document.querySelectorAll<HTMLElement>(".host-field")) {
+    field.hidden = kind !== "host";
+  }
 }
 
 /**
@@ -151,12 +220,56 @@ async function onStartDaemon(): Promise<void> {
  * только обработчики (тесты), без интервала.
  */
 export function mountApp(options?: { once?: boolean }): { noop: boolean } {
-  const startButton = document.querySelector<HTMLButtonElement>("#daemon-start");
-  if (startButton !== null) {
-    startButton.addEventListener("click", () => {
+  const daemonStart = document.querySelector<HTMLButtonElement>("#daemon-start");
+  if (daemonStart !== null) {
+    daemonStart.addEventListener("click", () => {
       void onStartDaemon();
     });
   }
+  for (const tab of document.querySelectorAll<HTMLButtonElement>(".tab")) {
+    tab.addEventListener("click", () => {
+      switchScreen(tab.dataset.screen ?? "list");
+    });
+  }
+  const form = document.querySelector<HTMLFormElement>("#create-form");
+  form?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void onCreateSubmit();
+  });
+  document
+    .querySelector<HTMLButtonElement>("#create-reset")
+    ?.addEventListener("click", () => {
+      resetForm();
+      syncKindFields();
+    });
+  document
+    .querySelector<HTMLSelectElement>("#f-kind")
+    ?.addEventListener("change", syncKindFields);
+  document
+    .querySelector<HTMLButtonElement>("#f-config-pick")
+    ?.addEventListener("click", () => {
+      void pickConfigFile();
+    });
+  document
+    .querySelector<HTMLButtonElement>("#doctor-refresh")
+    ?.addEventListener("click", () => {
+      loadDoctor().catch((error: unknown) => {
+        showToast(error instanceof Error ? error.message : String(error));
+      });
+    });
+  document
+    .querySelector<HTMLButtonElement>("#logs-export")
+    ?.addEventListener("click", () => {
+      void onCollectLogs();
+    });
+  document
+    .querySelector<HTMLButtonElement>("#logs-open-dir")
+    ?.addEventListener("click", () => {
+      if (lastLogsPath !== null && revealInDir !== null) {
+        void revealInDir(lastLogsPath);
+      }
+    });
+  syncKindFields();
   void refreshBottles();
   if (options?.once !== true) {
     window.setInterval(() => {
@@ -168,6 +281,26 @@ export function mountApp(options?: { once?: boolean }): { noop: boolean } {
     }, POLL_INTERVAL_MS);
   }
   return { noop: true };
+}
+
+/** Диалог выбора файла конфига (Tauri plugin-dialog; адаптер — в main.ts). */
+let openFileDialog: (() => Promise<string | null>) | null = null;
+
+export function setConfigFileDialog(fn: () => Promise<string | null>): void {
+  openFileDialog = fn;
+}
+
+async function pickConfigFile(): Promise<void> {
+  if (openFileDialog === null) {
+    return;
+  }
+  const path = await openFileDialog();
+  if (path !== null) {
+    const configField = document.querySelector<HTMLInputElement>("#f-config");
+    if (configField !== null) {
+      configField.value = path;
+    }
+  }
 }
 
 // Реэкспорт для main.ts: единая точка подключения мостов.

@@ -101,11 +101,13 @@ export type BottleAction = "start" | "stop";
 /**
  * Рисует таблицу бутылок в `#bottles` (создаёт thead/tbody): колонки
  * id, имя, тип, состояние, SOCKS5, пробросы; кнопки Старт/Стоп
- * заблокированы в переходных состояниях.
+ * заблокированы в переходных состояниях; «Изменить» открывает форму
+ * edit (create --force с тем же id — Task 4).
  */
 export function renderListTable(
   rows: BottleRow[],
   onAction: (id: string, action: BottleAction) => void,
+  onEdit?: (id: string) => void,
 ): void {
   const table = document.querySelector<HTMLTableElement>("#bottles");
   if (table === null) {
@@ -153,6 +155,12 @@ export function renderListTable(
     stopButton.disabled = locked;
     stopButton.addEventListener("click", () => onAction(row.id, "stop"));
     actionsCell.append(startButton, stopButton);
+    if (onEdit !== undefined) {
+      const editButton = document.createElement("button");
+      editButton.textContent = "Изменить";
+      editButton.addEventListener("click", () => onEdit(row.id));
+      actionsCell.append(editButton);
+    }
 
     tr.append(
       idCell,

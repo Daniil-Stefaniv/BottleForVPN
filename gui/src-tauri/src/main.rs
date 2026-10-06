@@ -33,6 +33,8 @@ fn daemon_status(state: tauri::State<'_, DaemonHandle>) -> daemon::DaemonStatus 
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(DaemonHandle::default())
         .invoke_handler(tauri::generate_handler![
             run_bottle,

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Права главного окна: выбор файла конфига (dialog) и открытие папки логов (opener)",
+  "windows": ["main"],
+  "permissions": ["dialog:default", "opener:default"]
+}
