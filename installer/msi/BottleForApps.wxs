@@ -44,6 +44,20 @@
       </Directory>
     </StandardDirectory>
 
+    <!-- Ярлык GUI в меню Пуск (M4): рядом с бинарниками INSTALLDIR —
+         GUI резолвит bottle/bottled относительно своего exe (D5). -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="GuiStartMenuShortcut" Guid="F6B08C7D-2E95-4A0D-8176-A93D45E6F089">
+        <Shortcut Id="BottleGuiShortcut"
+            Name="BottleForApps"
+            Description="BottleForApps — управление бутылками"
+            Target="[INSTALLDIR]bottle-gui.exe"
+            WorkingDirectory="INSTALLDIR" />
+        <RegistryValue Root="HKLM" Key="Software\BottleForApps"
+            Name="GuiShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
     <Feature Id="Main" Level="1" Title="BottleForApps" AllowAbsent="no">
       <ComponentGroupRef Id="ProductComponents" />
     </Feature>
@@ -57,6 +71,9 @@
       </Component>
       <Component Id="bottle_svc_exe" Guid="C3E75F4A-9B62-4DAC-BE43-7F80B12D3C56">
         <File Id="bottle-svc.exe" Source="$(BuildDir)bottle-svc.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="bottle_gui_exe" Guid="A7B19D8E-5F06-4C1B-9265-B04E67A81F90">
+        <File Id="bottle-gui.exe" Source="$(GuiExePath)" Name="bottle-gui.exe" KeyPath="yes" />
       </Component>
       <Component Id="rootfs_tar" Directory="ApplianceDir" Guid="D4F86A5B-0C73-4EBD-AF54-8A91C23E4D67">
         <File Id="rootfs.tar.gz" Source="$(RootfsPath)" Name="bottleforapps-rootfs.tar.gz" KeyPath="yes" />

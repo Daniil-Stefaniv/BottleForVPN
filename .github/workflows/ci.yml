@@ -137,11 +137,12 @@ jobs:
           -Bottle "%GITHUB_WORKSPACE%\target\release\bottle.exe"
           -DataDir "%RUNNER_TEMP%\bfa-ci-data"
 
-  # Релизная сборка (по тегу v*): rootfs из appliance-build, portable-
-  # zip и MSI, SHA256SUMS; публикация GitHub Release с русским текстом.
+  # Релизная сборка (по тегу v*): rootfs из appliance-build, GUI из
+  # gui-build (bottle-gui.exe — в MSI с ярлыком и в portable-zip),
+  # SHA256SUMS; публикация GitHub Release с русским текстом.
   release-build:
     runs-on: windows-latest
-    needs: appliance-build
+    needs: [appliance-build, gui-build]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
@@ -151,7 +152,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: bottleforapps-rootfs
-      - name: Тег обязан совпадать с версией workspace
+      - name: Скачать GUI (windows)
+        uses: actions/download-artifact@v4
+        with:
+          name: bottle-gui-windows-latest
+      - name: Тег обязан совпадать с версией workspace и GUI
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}".TrimStart('v')
@@ -160,14 +165,19 @@ jobs:
           if ($tag -ne $version) {
             throw "тег v$tag не совпадает с версией workspace $version — поправьте [workspace.package].version или тег"
           }
+          $guiConf = Get-Content gui/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if ($guiConf.version -ne $version) {
+            throw "версия GUI ($($guiConf.version)) не совпадает с workspace ($version) — синхронизируйте gui/src-tauri/tauri.conf.json и gui/package.json"
+          }
+          if (-not (Test-Path 'bottle-gui.exe')) { throw 'артефакт bottle-gui.exe не скачался' }
       - name: Собрать release-бинарники
         run: cargo build --release -p daemon -p cli -p svc
       - name: Portable-сборка
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1 -RootfsPath bottleforapps-rootfs.tar.gz
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1 -RootfsPath bottleforapps-rootfs.tar.gz -GuiExePath bottle-gui.exe
       - name: MSI-сборка
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/msi/build-msi.ps1 -RootfsPath bottleforapps-rootfs.tar.gz
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/msi/build-msi.ps1 -RootfsPath bottleforapps-rootfs.tar.gz -GuiExePath bottle-gui.exe
       - name: SHA256SUMS
         shell: pwsh
         run: |
@@ -193,15 +203,16 @@ jobs:
           body: |
             BottleForApps ${{ github.ref_name }}
 
-            - MSI (полная установка: служба маршрутов, WSL, PATH; один UAC)
-            - Portable ZIP (без прав администратора; только env-бутылки)
+            - MSI (полная установка: служба маршрутов, WSL, PATH, GUI с ярлыком в меню Пуск; один UAC)
+            - Portable ZIP (без прав администратора; только env-бутылки; bottle-gui.exe в комплекте)
 
             Внимание: установщики не подписаны — SmartScreen покажет
             предупреждение («Все равно выполнить»). Контрольные суммы —
             в SHA256SUMS.txt.
 
-            Первые шаги после установки MSI: запустите bottled.exe (или
-            ярлык), затем `bottle doctor` и `bottle create ...`.
+            Первые шаги после установки MSI: запустите BottleForApps из
+            меню Пуск (GUI сам предложит поднять демон) или bottled.exe,
+            затем «Диагностика» в GUI / `bottle doctor`.
             Portable: распакуйте и читайте INSTALL.txt.
           files: |
             artifacts/*.msi
@@ -229,8 +240,11 @@ jobs:
         shell: pwsh
         run: |
           $dir = 'C:\Program Files\BottleForApps'
-          foreach ($f in 'bottle.exe','bottled.exe','bottle-svc.exe','appliance\bottleforapps-rootfs.tar.gz') {
+          foreach ($f in 'bottle.exe','bottled.exe','bottle-svc.exe','bottle-gui.exe','appliance\bottleforapps-rootfs.tar.gz') {
             if (-not (Test-Path (Join-Path $dir $f))) { throw "нет файла: $f" }
+          }
+          if (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\BottleForApps.lnk")) {
+            throw 'нет ярлыка BottleForApps в меню Пуск'
           }
           sc.exe query BottleForAppsRouteHelper
           if ($LASTEXITCODE -ne 0) { throw 'служба BottleForAppsRouteHelper не установлена' }

@@ -17,6 +17,10 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$RootfsPath,
 
+    # GUI (M4): путь к bottle-gui.exe (артефакт джобы gui-build).
+    [Parameter(Mandatory = $true)]
+    [string]$GuiExePath,
+
     [string]$OutDir = "artifacts"
 )
 
@@ -24,6 +28,9 @@ $ErrorActionPreference = "Stop"
 
 if (-not (Test-Path $RootfsPath)) {
     throw "rootfs не найден: $RootfsPath (артефакт appliance-build обязателен)"
+}
+if (-not (Test-Path $GuiExePath)) {
+    throw "bottle-gui.exe не найден: $GuiExePath (артефакт gui-build обязателен)"
 }
 
 # Версия workspace из cargo metadata.
@@ -47,6 +54,7 @@ Copy-Item "target/release/bottle.exe"     $layout
 Copy-Item "target/release/bottled.exe"    $layout
 Copy-Item "target/release/bottle-svc.exe" $layout
 Copy-Item $RootfsPath "$layout/appliance/bottleforapps-rootfs.tar.gz"
+Copy-Item $GuiExePath "$layout/bottle-gui.exe"
 
 # INSTALL.txt: русский, portable = env-only (спека §11).
 @(
@@ -56,6 +64,7 @@ Copy-Item $RootfsPath "$layout/appliance/bottleforapps-rootfs.tar.gz"
     "  bottle.exe      — CLI (bottle create/list/start/stop/doctor/logs export/upgrade)"
     "  bottled.exe     — демон (запустите его в терминале; работает в вашей сессии)"
     "  bottle-svc.exe  — служба маршрутов для host-бутылок (НЕ обязательна)"
+    "  bottle-gui.exe  — графический интерфейс (список бутылок, старт/стоп, doctor)"
     "  appliance/      — rootfs аплаенса WSL (используется bottled отсюда)"
     ""
     "Требования:"

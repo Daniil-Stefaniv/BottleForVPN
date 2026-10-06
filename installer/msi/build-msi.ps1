@@ -12,6 +12,10 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$RootfsPath,
 
+    # GUI (M4): путь к bottle-gui.exe (артефакт джобы gui-build).
+    [Parameter(Mandatory = $true)]
+    [string]$GuiExePath,
+
     [string]$OutDir = "artifacts"
 )
 
@@ -19,6 +23,9 @@ $ErrorActionPreference = "Stop"
 
 if (-not (Test-Path $RootfsPath)) {
     throw "rootfs не найден: $RootfsPath (артефакт appliance-build обязателен)"
+}
+if (-not (Test-Path $GuiExePath)) {
+    throw "bottle-gui.exe не найден: $GuiExePath (артефакт gui-build обязателен)"
 }
 
 # WiX CLI: PATH → dotnet tool → choco.
@@ -46,6 +53,7 @@ if (-not (Test-Path "target/release/bottle.exe")) {
 
 $buildDir = (Resolve-Path "target/release/").Path + [System.IO.Path]::DirectorySeparatorChar
 $rootfs = (Resolve-Path $RootfsPath).Path
+$guiExe = (Resolve-Path $GuiExePath).Path
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $msi = "$OutDir/BottleForApps-$version-win-x64.msi"
@@ -57,6 +65,7 @@ wix build `
     -d "ProductVersion=$version" `
     -d "BuildDir=$buildDir" `
     -d "RootfsPath=$rootfs" `
+    -d "GuiExePath=$guiExe" `
     -o $msi `
     installer/msi/BottleForApps.wxs
 if ($LASTEXITCODE -ne 0) { throw "wix build не удался" }
