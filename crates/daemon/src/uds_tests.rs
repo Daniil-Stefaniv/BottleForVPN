@@ -147,6 +147,52 @@ async fn uds_serve_replaces_stale_socket_file() {
 /// Параллельные клиенты (T13): второй получает ответ, не дожидаясь
 /// закрытия соединения первого.
 #[tokio::test]
+async fn uds_second_serve_on_live_socket_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = daemon_socket_path(tmp.path());
+    let daemon = daemon_with_store(tmp.path());
+    let shutdown = CancellationToken::new();
+
+    let first = tokio::spawn({
+        let socket = socket.clone();
+        let shutdown = shutdown.clone();
+        async move { crate::uds::serve(&socket, daemon, shutdown).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Второй сервер на тот же путь: ЖИВОЙ первый должен защитить сокет.
+    let second_error = tokio::time::timeout(
+        Duration::from_secs(3),
+        crate::uds::serve(
+            &socket,
+            daemon_with_store(tmp.path()),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("живой демон защищает сокет (serve возвращается, а не слушает)")
+    .expect_err("живой демон защищает свой сокет");
+    assert!(
+        second_error.to_string().contains("уже запущен"),
+        "понятная ошибка: {second_error}"
+    );
+
+    // Первый демон продолжает отвечать (сокет не тронут).
+    let reply = uds_exchange(
+        &socket,
+        &CliRequest::List,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("живой демон отвечает после попытки перебинда");
+    assert!(matches!(reply, CliReply::List { .. }));
+
+    shutdown.cancel();
+    first.await.unwrap().expect("serve завершился без ошибки");
+}
+
+#[tokio::test]
 async fn uds_serves_parallel_clients() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = daemon_socket_path(tmp.path());
@@ -176,7 +222,7 @@ async fn uds_serves_parallel_clients() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Второй клиент получает ответ при живом первом соединении.
-    let second = tokio::time::timeout(
+    let second_reply = tokio::time::timeout(
         Duration::from_secs(3),
         uds_exchange(
             &socket,
@@ -188,7 +234,7 @@ async fn uds_serves_parallel_clients() {
     .await
     .expect("второй клиент обслужен параллельно с первым")
     .expect("обмен второго клиента");
-    assert!(matches!(second, CliReply::List { .. }));
+    assert!(matches!(second_reply, CliReply::List { .. }));
     assert!(first.await.is_ok());
 
     shutdown.cancel();

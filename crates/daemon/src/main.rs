@@ -88,7 +88,7 @@ async fn main() -> ExitCode {
         init_tracing();
     }
 
-    if !instance::acquire_single_instance() {
+    if !instance::acquire_single_instance(&args.data_dir) {
         eprintln!("Демон BottleForApps уже запущен");
         return ExitCode::FAILURE;
     }

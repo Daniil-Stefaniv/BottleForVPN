@@ -60,6 +60,10 @@
 
     <Feature Id="Main" Level="1" Title="BottleForApps" AllowAbsent="no">
       <ComponentGroupRef Id="ProductComponents" />
+      <!-- Ярлык меню Пуск — отдельный компонент вне ProductComponents
+           (живёт в ProgramMenuFolder): без ComponentRef он «orphaned»
+           и wix build падает (finding C1 финального ревью M4). -->
+      <ComponentRef Id="GuiStartMenuShortcut" />
     </Feature>
 
     <ComponentGroup Id="ProductComponents" Directory="INSTALLDIR">

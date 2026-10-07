@@ -22,9 +22,11 @@ use crate::Daemon;
 
 /// Обслуживает UDS-сокет `socket_path` до отмены `shutdown`.
 ///
-/// Мёртвый файл сокета от прошлого запуска сносится до bind. Права
-/// файла — 0600; ошибки отдельных соединений логируются и не
-/// останавливают сервер.
+/// Мёртвый файл сокета от прошлого запуска сносится до bind; живой
+/// демон (connect-проба отвечает) защищает свой сокет — второй serve
+/// отказывает, а не плодит два демона над одним хранилищем. При
+/// остановке файл убирается только если он по-прежнему наш (inode),
+/// чтобы не снести сокет демона, перебиндившего путь за наше время.
 pub async fn serve(
     socket_path: &std::path::Path,
     daemon: Arc<Daemon>,
@@ -32,10 +34,16 @@ pub async fn serve(
 ) -> io::Result<()> {
     // Хвост от упавшего демона: bind на занятый путь невозможен.
     if socket_path.exists() {
+        if socket_is_live(socket_path).await {
+            return Err(io::Error::other(
+                "демон уже запущен: сокет отвечает (см. каталог данных)",
+            ));
+        }
         std::fs::remove_file(socket_path)?;
     }
     let listener = UnixListener::bind(socket_path)?;
     set_owner_only(socket_path)?;
+    let owned_ino = file_inode(socket_path);
     tracing::info!(socket = %socket_path.display(), "uds-сервер запущен");
 
     let mut connections: JoinSet<()> = JoinSet::new();
@@ -53,13 +61,31 @@ pub async fn serve(
                 while connections.join_next().await.is_some() {
                     // Ждём фактического завершения задач.
                 }
-                // Файл сокета убираем сами: bind следующий запуск делает
-                // на чистый путь, а «висящий» файл выглядит как живой демон.
-                let _ = std::fs::remove_file(socket_path);
+                // Файл сокета убираем сами — но только наш (по inode):
+                // путь мог перехватить другой демон за время остановки.
+                if file_inode(socket_path) == owned_ino {
+                    let _ = std::fs::remove_file(socket_path);
+                }
                 return Ok(());
             }
         }
     }
+}
+
+/// Отвечает ли по этому пути живой слушатель (connect-проба).
+async fn socket_is_live(socket_path: &std::path::Path) -> bool {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::net::UnixStream::connect(socket_path),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+/// inode файла сокета (для защиты «удаляем только свой»), либо None.
+fn file_inode(socket_path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(socket_path).ok().map(|meta| meta.ino())
 }
 
 /// Права сокета: 0600 — владелец (создатель демона) читает/пишет.

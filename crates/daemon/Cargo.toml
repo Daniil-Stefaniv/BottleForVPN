@@ -45,3 +45,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 tempfile = "3"
 # Тесты ретеншна журналов ставят файлам mtime «31 день назад».
 filetime = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+# flock для single-instance демона (M4: UDS-транспорт на unix).
+libc = "0.2"

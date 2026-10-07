@@ -173,3 +173,11 @@ describe("кнопка «Запустить демона»", () => {
     await vi.waitFor(() => expect(daemonCalls).toEqual(["start"]));
   });
 });
+
+describe("nextPollDelayMs (I4: backoff при выключенном демоне)", () => {
+  it("демон недоступен — медленный зонд 10 с; жив — 2 с", async () => {
+    const { nextPollDelayMs } = await import("./app");
+    expect(nextPollDelayMs(true)).toBe(10000);
+    expect(nextPollDelayMs(false)).toBe(2000);
+  });
+});

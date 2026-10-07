@@ -52,7 +52,7 @@ impl DaemonHandle {
         args: Vec<String>,
     ) -> Result<(), String> {
         let program = program.into();
-        let child = Command::new(&program)
+        let mut child = Command::new(&program)
             .args(&args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -61,15 +61,26 @@ impl DaemonHandle {
             .map_err(|error| format!("не удалось запустить {}: {error}", program.display()))?;
 
         // Один процесс на окно: при живом демоне повторный старт — ошибка.
-        {
+        // Проверка «уже запущен» — в своём scope: гвард не живёт в await.
+        let already_running = {
             let mut inner = self.lock();
-            let already_running = match inner.child.as_mut() {
+            match inner.child.as_mut() {
                 Some(existing) => matches!(existing.try_wait(), Ok(None)),
                 None => false,
-            };
-            if already_running {
-                return Err("демон уже запущен этим окном".to_string());
             }
+        };
+        if already_running {
+            // Дубль не бросаем: без kill_on_drop дроп = detach,
+            // осиротевший второй bottled пережил бы отказ (I1).
+            // Короткая грация: дать дублю начать запись лога/файлов
+            // старта (старт bottled длинный, 150 мс роли не играют).
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err("демон уже запущен этим окном".to_string());
+        }
+        {
+            let mut inner = self.lock();
             inner.child = Some(child);
             inner.log.clear();
 
@@ -159,7 +170,12 @@ impl LogHandle {
         let mut inner = self.inner.lock().expect("мьютекс демона не отравлен");
         inner.log.push_str(chunk);
         if inner.log.len() > LOG_LIMIT {
-            let cut = inner.log.len() - LOG_LIMIT;
+            // Сдвигаем cut до границы UTF-8-символа (журнал — русский):
+            // drain по негранице паникует.
+            let mut cut = inner.log.len() - LOG_LIMIT;
+            while !inner.log.is_char_boundary(cut) {
+                cut += 1;
+            }
             inner.log.drain(..cut);
         }
     }
@@ -235,6 +251,57 @@ mod tests {
         daemon.stop().await.expect("тестовый стоп работает");
     }
 
+    /// I1 ревью: повторный старт при живом демоне обязан убить только
+    /// что заспавненный дубль (без kill_on_drop дроп = detach).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn second_start_kills_spawned_duplicate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let program = "/bin/sh".to_string();
+        let args_for = |name: &str| {
+            vec![
+                "-c".to_string(),
+                format!("echo $$ > {}; sleep 30", dir.path().join(name).display()),
+            ]
+        };
+
+        let daemon = DaemonHandle::default();
+        daemon
+            .start_custom(program.clone(), args_for("pid1"))
+            .await
+            .expect("первый старт");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // Дубль пишет СВОЙ pid (pid2) — его и проверяем.
+        let error = daemon
+            .start_custom(program, args_for("pid2"))
+            .await
+            .expect_err("повторный старт отказывает");
+        assert!(error.contains("уже запущен"), "{error}");
+
+        // Дубль обязан быть мёртв (kill в error-ветке, а не detach).
+        let pid_file2 = dir.path().join("pid2");
+        let mut pid: Option<i32> = None;
+        for _ in 0..30 {
+            if let Ok(text) = std::fs::read_to_string(&pid_file2) {
+                pid = text.trim().parse().ok();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let pid: i32 = pid.expect("pid дубля записан (грация старта)");
+        let mut dead = false;
+        for _ in 0..40 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        daemon.stop().await.expect("cleanup");
+        assert!(dead, "дубль (pid {pid}) пережил отказ «уже запущен»");
+    }
+
     #[tokio::test]
     async fn second_start_while_running_is_error() {
         let daemon = DaemonHandle::default();
@@ -276,6 +343,49 @@ mod tests {
     async fn stop_without_daemon_is_error() {
         let daemon = DaemonHandle::default();
         assert!(daemon.stop().await.is_err());
+    }
+
+    /// I3 ревью: обрезка кольцевого буфера обязана попадать в границу
+    /// UTF-8-символа (русский журнал демона) — drain(..cut) паникует иначе.
+    #[test]
+    fn log_tail_trim_respects_char_boundary() {
+        let daemon = DaemonHandle::default();
+        let log = LogProbe::capture(&daemon);
+        // Кириллица (2 байта/символ) вперемешку с одиночными байтами:
+        // cut обязан попадать внутрь многобайтного символа — drain
+        // без поправки границы паникует именно там.
+        let chunk = "проверка-журнала-".repeat(64);
+        for i in 0..700 {
+            log.append(&daemon, &chunk);
+            if i % 2 == 0 {
+                log.append(&daemon, "x");
+            }
+        }
+        let after = log.len(&daemon);
+        assert!(
+            after <= LOG_LIMIT + 64,
+            "буфер обрезан около лимита, а не растёт бесконечно: {after}"
+        );
+    }
+
+    /// Доступ к внутренностям журнала для теста обрезки.
+    struct LogProbe;
+
+    impl LogProbe {
+        fn capture(_daemon: &DaemonHandle) -> Self {
+            LogProbe
+        }
+
+        fn len(&self, daemon: &DaemonHandle) -> usize {
+            daemon.inner.lock().unwrap().log.len()
+        }
+
+        fn append(&self, daemon: &DaemonHandle, chunk: &str) {
+            let handle = LogHandle {
+                inner: Arc::clone(&daemon.inner),
+            };
+            handle.append(chunk);
+        }
     }
 
     #[tokio::test]

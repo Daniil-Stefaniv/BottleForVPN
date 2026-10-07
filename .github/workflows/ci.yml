@@ -32,6 +32,24 @@ jobs:
       # List) → обрыв соединения демона → маршруты сессии сняты ≤10 с →
       # сверка журнала при повторном старте подбирает сироту → uninstall.
       - run: cargo test -p svc --test svc_win -- --ignored
+      # Приёмка C1 (финальное ревью M4): MSI собирается на каждом PR с
+      # заглушками файлов — «orphaned component»-класс ошибок WiX
+      # ловится здесь, а не в день релизного тега.
+      - name: MSI-схема собирается (wix smoke)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
+            dotnet tool install --global wix
+            if ($LASTEXITCODE -ne 0) { throw 'не удалось установить WiX' }
+          }
+          New-Item -ItemType File -Force bottleforapps-rootfs.tar.gz, bottle-gui.exe | Out-Null
+          wix build -arch x64 `
+            -d ProductVersion=0.0.0-smoke `
+            -d BuildDir="$((Resolve-Path target/release/).Path)\" `
+            -d RootfsPath="$((Resolve-Path bottleforapps-rootfs.tar.gz).Path)" `
+            -d GuiExePath="$((Resolve-Path bottle-gui.exe).Path)" `
+            -o msi-smoke.msi installer/msi/BottleForApps.wxs
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path msi-smoke.msi)) { throw 'wix build не прошёл' }
 
   # macOS-гейт (M4 Task 8, Review Focus #5): три таргета зелёные в
   # каждом PR — ubuntu, windows, macos-14 (arm64). Юнит-тесты включая

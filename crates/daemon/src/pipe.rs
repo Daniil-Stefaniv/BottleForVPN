@@ -449,9 +449,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use bottle_core::profile::{
-        BottleKind, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig,
-    };
+    use bottle_core::profile::{BottleKind, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig};
 
     /// Env-профиль с исходным конфигом `config` (до нормализации save).
     fn env_profile(id: &str, config: &str) -> BottleProfile {

@@ -1,20 +1,28 @@
 //! Single-instance демона: повторный запуск `bottled` невозможен.
 
+use std::path::Path;
+
 /// Пытается стать единственным запущенным экземпляром демона.
 ///
 /// Windows — именованный мьютекс `Global\bottled-singleton`: создаётся
-/// и удерживается до конца процесса. `false` означает, что демона уже
-/// запустили (мьютекс существует) либо мьютекс не создаётся. Прочие
-/// платформы — всегда `true`: named-pipe транспорт существует только
-/// на Windows, поэтому мьютекс нужен лишь там, а dev-запуски на
-/// macOS/linux блокировать незачем.
-pub fn acquire_single_instance() -> bool {
+/// и удерживается до конца процесса. Unix (M4: UDS-транспорт) —
+/// эксклюзивный flock на `<data>/bottled.lock`: он закрывает гонку
+/// одновременного старта двух демонов до того, как кто-то из них
+/// займёт сокет (живой сокет дополнительно защищает [`crate::uds::serve`]).
+/// `false` означает, что демона уже запустили либо лок не ставится.
+pub fn acquire_single_instance(data_dir: &Path) -> bool {
     #[cfg(windows)]
     {
+        let _ = data_dir; // мьютекс глобальный, каталог не нужен
         single_instance_mutex::acquire()
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
+        single_instance_flock::acquire(data_dir)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = data_dir;
         true
     }
 }
@@ -47,5 +55,44 @@ mod single_instance_mutex {
         // ERROR_ALREADY_EXISTS: мьютекс создан раньше нас другим процессом.
         let last_error = unsafe { GetLastError() };
         last_error != ERROR_ALREADY_EXISTS
+    }
+}
+
+/// Реализация single-instance на flock (unix): lock-файл в каталоге
+/// данных удерживается до конца процесса.
+#[cfg(unix)]
+mod single_instance_flock {
+    use std::fs::File;
+    use std::path::Path;
+    use std::sync::OnceLock;
+
+    /// Имя lock-файла внутри каталога данных демона.
+    const LOCK_FILE: &str = "bottled.lock";
+
+    /// Удерживаемый lock (живёт до конца процесса).
+    static HELD: OnceLock<File> = OnceLock::new();
+
+    /// Ставит эксклюзивный неблокирующий flock на `<data>/bottled.lock`.
+    /// Файл (0600) остаётся на диске после выхода — это нормально:
+    /// flock принадлежит открытому дескриптору, не файлу.
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    pub fn acquire(data_dir: &Path) -> bool {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(data_dir.join(LOCK_FILE))
+        else {
+            tracing::warn!("не удалось открыть lock-файл single-instance");
+            return false;
+        };
+        // SAFETY: flock(2) на валидном fd.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return false;
+        }
+        HELD.set(file).is_ok()
     }
 }

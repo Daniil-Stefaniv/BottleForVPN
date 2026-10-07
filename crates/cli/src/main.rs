@@ -287,7 +287,20 @@ fn reply_timeout(request: &CliRequest) -> Duration {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // Разбор с json-осознанными ошибками: код 2 остаётся за clap,
+    // но в json-режиме сообщение уходит JSON-строкой в stdout.
+    let argv: Vec<String> = std::env::args().collect();
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if let Some(json) = format_parse_error(&argv_refs, &error) {
+                println!("{json}");
+                return ExitCode::from(2);
+            }
+            error.exit();
+        }
+    };
 
     // Свой флаг --version вместо clap: при сочетании с --json вывод
     // машинный ({"version":"…"}), и работает он без подкоманды.
@@ -384,6 +397,24 @@ async fn main() -> ExitCode {
         }
         ExitCode::FAILURE
     }
+}
+
+/// Ошибка разбора аргументов в json-режиме: `{"Error":…}` в stdout
+/// (код 2). `None` — обычный режим: clap печатает сам (I5 ревью).
+fn format_parse_error(argv: &[&str], error: &clap::Error) -> Option<String> {
+    if !argv.contains(&"--json") {
+        return None;
+    }
+    // Краткое сообщение (первая строка) — usage-обвязка машинному
+    // клиенту не нужна, она остаётся в текстовом режиме.
+    let brief = error
+        .to_string()
+        .lines()
+        .next()
+        .unwrap_or("ошибка разбора аргументов")
+        .trim_start_matches("error: ")
+        .to_string();
+    Some(render_json(&CliReply::Error { message: brief }))
 }
 
 /// Строка `--version`: текст (`bottle 0.2.0`) или JSON для `--json`.
@@ -1027,6 +1058,27 @@ mod tests {
         assert!(cli.command.is_none());
         let cli = Cli::try_parse_from(["bottle", "--version", "--json"]).expect("с --json");
         assert!(cli.version && cli.json);
+    }
+
+    /// I5 ревью: в json-режиме ошибки разбора аргументов (код 2) — тоже
+    /// JSON в stdout, а не пустой stdout с текстом в stderr.
+    #[test]
+    fn parse_error_in_json_mode_is_json_on_stdout() {
+        let error = Cli::command().error(
+            clap::error::ErrorKind::InvalidSubcommand,
+            "unrecognized subcommand 'badcmd'",
+        );
+        let json = format_parse_error(&["bottle", "--json", "badcmd"], &error)
+            .expect("json-режим — JSON-ошибка");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("корректный JSON");
+        assert_eq!(
+            value["Error"]["message"],
+            "unrecognized subcommand 'badcmd'"
+        );
+
+        // Без --json — None: clap печатает свой вывод сам (код 2).
+        let plain = format_parse_error(&["bottle", "badcmd"], &error);
+        assert!(plain.is_none());
     }
 
     /// `--version --json` → `{"version":"…"}`; текстовый формат не меняется.

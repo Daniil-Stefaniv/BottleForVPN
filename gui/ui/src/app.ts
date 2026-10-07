@@ -38,6 +38,15 @@ export function setRevealInDir(fn: (path: string) => Promise<void>): void {
 
 /** Интервал статус-поллинга (D1). */
 const POLL_INTERVAL_MS = 2000;
+/** Зонд при выключенном демоне: без него каждый тик спавнит CLI,
+ * который 60 с ретраит connect (~30 висящих процессов, I4 ревью). */
+const POLL_INTERVAL_DAEMON_DOWN_MS = 10000;
+
+/** Задержка до следующего refresh: живой демон — 2 с, недоступный —
+ * медленный зонд 10 с (демон мог быть запущен и вручную). */
+export function nextPollDelayMs(daemonDown: boolean): number {
+  return daemonDown ? POLL_INTERVAL_DAEMON_DOWN_MS : POLL_INTERVAL_MS;
+}
 
 /** Показывает ошибку тостом (дословное сообщение CLI/демона). */
 function showToast(message: string): void {
@@ -96,6 +105,8 @@ export function setRowsNotifier(fn: ((rows: BottleRow[]) => void) | null): void 
  * merge → рендер. Ошибка «демон не запущен» — панель с инструкцией;
  * прочие ошибки — тост. Возвращает строки (пусто при любой ошибке).
  */
+let daemonDown = false;
+
 export async function refreshBottles(): Promise<BottleRow[]> {
   let list: CliReply;
   let status: CliReply;
@@ -104,6 +115,7 @@ export async function refreshBottles(): Promise<BottleRow[]> {
     status = await runBottleReply(["--json", "status"]);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    daemonDown = isDaemonUnavailable(error);
     if (isDaemonUnavailable(error)) {
       setDaemonPanel(true);
     } else {
@@ -113,6 +125,7 @@ export async function refreshBottles(): Promise<BottleRow[]> {
     renderListTable([], () => {});
     return [];
   }
+  daemonDown = false;
   setDaemonPanel(false);
   if (!("List" in list) || !("Status" in status)) {
     showToast("Неожиданный ответ демона на list/status");
@@ -280,9 +293,14 @@ export function mountApp(options?: { once?: boolean }): { noop: boolean } {
   syncKindFields();
   void refreshBottles();
   if (options?.once !== true) {
-    window.setInterval(() => {
-      void refreshBottles();
-    }, POLL_INTERVAL_MS);
+    // Поллинг с backoff: при недоступном демоне — медленный зонд
+    // (I4), чтобы не плодить висящие CLI-процессы с 60-с ретраем.
+    const scheduleNext = (): void => {
+      window.setTimeout(() => {
+        void refreshBottles().finally(scheduleNext);
+      }, nextPollDelayMs(daemonDown));
+    };
+    scheduleNext();
     // Журнал демона в панели — тем же темпом.
     window.setInterval(() => {
       void updateDaemonLog();
