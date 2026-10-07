@@ -12,6 +12,7 @@ appliance/overlay/etc/bottle-appliance-version
 
 # GUI (Tauri): node_modules и сборки
 gui/node_modules/
+gui/ui/node_modules/
 gui/ui/dist/
 gui/src-tauri/target/
 gui/src-tauri/gen/

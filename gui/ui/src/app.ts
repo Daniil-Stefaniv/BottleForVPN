@@ -109,10 +109,9 @@ let daemonDown = false;
 
 export async function refreshBottles(): Promise<BottleRow[]> {
   let list: CliReply;
-  let status: CliReply;
+  let status: CliReply | null = null;
   try {
     list = await runBottleReply(["--json", "list"]);
-    status = await runBottleReply(["--json", "status"]);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     daemonDown = isDaemonUnavailable(error);
@@ -126,12 +125,21 @@ export async function refreshBottles(): Promise<BottleRow[]> {
     return [];
   }
   daemonDown = false;
+  // Status — вспомогательный: его отказ (например, dev-демон без
+  // менеджера на macOS) не прячет список — строки без рантайма (M7).
+  try {
+    status = await runBottleReply(["--json", "status"]);
+  } catch {
+    status = null;
+  }
+  daemonDown = false;
   setDaemonPanel(false);
-  if (!("List" in list) || !("Status" in status)) {
-    showToast("Неожиданный ответ демона на list/status");
+  if (!("List" in list)) {
+    showToast("Неожиданный ответ демона на list");
     return [];
   }
-  const rows = mergeListStatus(list.List.bottles, status.Status.bottles);
+  const runtime = status !== null && "Status" in status ? status.Status.bottles : [];
+  const rows = mergeListStatus(list.List.bottles, runtime);
   renderListTable(
     rows,
     (id, action) => {

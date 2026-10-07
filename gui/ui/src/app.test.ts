@@ -181,3 +181,17 @@ describe("nextPollDelayMs (I4: backoff при выключенном демон�
     expect(nextPollDelayMs(false)).toBe(2000);
   });
 });
+
+describe("refreshBottles: частичные данные (M7)", () => {
+  it("отказ status не прячет список — строки без рантайма", async () => {
+    document.body.innerHTML = HTML;
+    stubInvoker([
+      { List: { bottles: [{ id: "a", name: "Офис А", kind: "env", state: null }] } },
+      { __throw: "менеджер бутылок не подключён" },
+    ]);
+    const rows = await refreshBottles();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.state).toBe("stopped");
+    expect(document.querySelectorAll("#bottles tbody tr")).toHaveLength(1);
+  });
+});
