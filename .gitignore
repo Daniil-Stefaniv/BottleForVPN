@@ -20,3 +20,6 @@ gui/src-tauri/gen/
 # vz-спайк: артефакты сборки образов (бинарники/kernel) и cargo
 spikes/vz-poc/image/
 spikes/vz-poc/target/
+
+# Локальный UI-мокап (прототип, не часть продукта)
+ui-mockup/

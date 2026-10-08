@@ -1,6 +1,6 @@
-// Doctor-панель (M4 Task 4): `bottle --json doctor` → таблица ✓/⚠/✗,
-// кнопка «Собрать логи» → `logs export` → путь + «Открыть папку»
-// (Tauri opener — адаптер подключается из main.ts).
+// Doctor-панель: `bottle --json doctor` → чек-лист ✓/⚠/✗ со сводкой
+// (ок/предупреждения/ошибки), кнопка «Собрать логи» → `logs export` →
+// путь + «Открыть папку» (Tauri opener — адаптер подключается из main.ts).
 
 import { runBottleReply } from "./ipc";
 import type { CheckItem } from "./ipc";
@@ -12,43 +12,47 @@ const STATUS_GLYPH: Record<CheckItem["status"], string> = {
   Fail: "✗",
 };
 
-/** Рисует отчёт doctor в `#doctor-table`: глиф, код проверки, пояснение. */
-export function renderDoctorTable(items: CheckItem[]): void {
-  const table = document.querySelector<HTMLTableElement>("#doctor-table");
-  if (table === null) {
+/**
+ * Рисует отчёт doctor чек-листом в `#doctor-list` (строки .check-row со
+ * статус-классом) и сводку «N ок · N предупреждений · N ошибок» в
+ * `#doctor-summary`.
+ */
+export function renderDoctorChecks(items: CheckItem[]): void {
+  const list = document.querySelector<HTMLElement>("#doctor-list");
+  if (list === null) {
     return;
   }
-  table.innerHTML = "";
-  const thead = document.createElement("thead");
-  const headRow = document.createElement("tr");
-  for (const title of ["", "Проверка", "Результат"]) {
-    const th = document.createElement("th");
-    th.textContent = title;
-    headRow.append(th);
-  }
-  thead.append(headRow);
-  const tbody = document.createElement("tbody");
+  list.innerHTML = "";
   if (items.length === 0) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = 3;
-    td.textContent = "проверок нет";
-    tr.append(td);
-    tbody.append(tr);
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "проверок нет";
+    list.append(empty);
   }
   for (const item of items) {
-    const tr = document.createElement("tr");
-    const glyph = document.createElement("td");
+    const row = document.createElement("div");
+    row.className = `check-row status-${item.status.toLowerCase()}`;
+    const glyph = document.createElement("span");
+    glyph.className = "check-glyph";
     glyph.textContent = STATUS_GLYPH[item.status];
-    glyph.className = `status-${item.status.toLowerCase()}`;
-    const code = document.createElement("td");
+    const body = document.createElement("div");
+    const code = document.createElement("div");
+    code.className = "check-code";
     code.textContent = item.code;
-    const detail = document.createElement("td");
+    const detail = document.createElement("div");
+    detail.className = "check-detail";
     detail.textContent = item.detail;
-    tr.append(glyph, code, detail);
-    tbody.append(tr);
+    body.append(code, detail);
+    row.append(glyph, body);
+    list.append(row);
   }
-  table.append(thead, tbody);
+  const summary = document.querySelector<HTMLElement>("#doctor-summary");
+  if (summary !== null) {
+    const ok = items.filter((item) => item.status === "Ok").length;
+    const warn = items.filter((item) => item.status === "Warn").length;
+    const fail = items.filter((item) => item.status === "Fail").length;
+    summary.textContent = `${ok} ок · ${warn} предупреждений · ${fail} ошибок`;
+  }
 }
 
 /** Загружает и рисует отчёт doctor; ошибки прокидываются для тоста. */
@@ -57,7 +61,7 @@ export async function loadDoctor(): Promise<void> {
   if (!("DoctorReport" in reply)) {
     throw new Error("Неожиданный ответ демона на doctor");
   }
-  renderDoctorTable(reply.DoctorReport.items);
+  renderDoctorChecks(reply.DoctorReport.items);
 }
 
 /**

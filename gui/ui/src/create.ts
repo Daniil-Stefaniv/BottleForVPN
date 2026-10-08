@@ -1,6 +1,8 @@
-// Форма create/edit (M4 Task 4): поля как у `bottle create`; submit =
-// `bottle --json create …` — валидация на демоне, его ошибки показываются
-// красным под формой дословно (Review Focus #4: клиентских правил нет).
+// Форма create/edit: поля как у `bottle create`; submit =
+// `bottle --json create …` — валидация на демоне, его ошибки маппятся
+// на конкретное поле по ключевым словам (не распознали — красная строка
+// под формой дословно). Клиентская проверка только одна — формат
+// идентификатора (DNS-label), чтобы не гонять CLI зря.
 // Edit = `create --force` с тем же id (M3-семантика, одна операция).
 
 import { runBottleReply } from "./ipc";
@@ -150,26 +152,101 @@ export function fillFormFromProfile(profile: BottleProfile): void {
   }
 }
 
+/** Клиентская проверка идентификатора: DNS-label (как имя namespace). */
+export function validateBottleId(id: string): string | null {
+  if (id.trim() === "") {
+    return "Идентификатор обязателен.";
+  }
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(id.trim())) {
+    return "Строчные латинские буквы, цифры и дефис; начинается с буквы или цифры.";
+  }
+  return null;
+}
+
 /**
- * Отправляет форму: `bottle --json create …` (+--force в edit).
- * Успех — true и скрытая ошибка; ошибка демона — false и красная
- * строка под формой с его сообщением дословно.
+ * Маппинг ошибки демона на поле формы по ключевым словам сообщения.
+ * Возвращает селектор поля или null (покажем общей строкой под формой).
+ */
+export function fieldForError(message: string): string | null {
+  const lower = message.toLowerCase();
+  if (lower.includes("socks5") || lower.includes("порт")) {
+    return "f-socks5";
+  }
+  if (lower.includes("конфиг") || lower.includes("config")) {
+    return "f-config";
+  }
+  // «id» — только отдельным словом: «pid 4242» не должно срабатывать.
+  if (lower.includes("идентификатор") || /\bid\b/.test(lower)) {
+    return "f-id";
+  }
+  if (lower.includes("dns")) {
+    return "f-dns";
+  }
+  if (lower.includes("проброс") || lower.includes("forward")) {
+    return "f-forwards";
+  }
+  return null;
+}
+
+/** Показать ошибку под конкретным полем (.field-error[data-for=…]). */
+function showFieldError(fieldId: string, message: string): boolean {
+  const error = document.querySelector<HTMLElement>(`.field-error[data-for="${fieldId}"]`);
+  const field = document.querySelector<HTMLElement>(`#${fieldId}`);
+  if (error === null || field === null) {
+    return false;
+  }
+  error.textContent = message;
+  error.hidden = false;
+  field.setAttribute("aria-invalid", "true");
+  return true;
+}
+
+/** Скрыть все полевые ошибки и общую строку. */
+function clearErrors(): void {
+  for (const error of document.querySelectorAll<HTMLElement>(".field-error")) {
+    error.hidden = true;
+    error.textContent = "";
+  }
+  for (const field of document.querySelectorAll<HTMLElement>("#create-form [aria-invalid]")) {
+    field.removeAttribute("aria-invalid");
+  }
+  const general = document.querySelector<HTMLElement>("#create-error");
+  if (general !== null) {
+    general.hidden = true;
+    general.textContent = "";
+  }
+}
+
+/**
+ * Отправляет форму: сначала клиентская проверка id (без CLI-вызова),
+ * затем `bottle --json create …` (+--force в edit). Успех — true;
+ * ошибка демона маппится на поле по ключевым словам (fieldForError),
+ * не распознанная — false и красная строка под формой дословно.
  */
 export async function submitCreate(isEdit: boolean): Promise<boolean> {
+  clearErrors();
   const values = readForm();
-  const errorElement = document.querySelector<HTMLElement>("#create-error");
+  // В edit id не редактируется — проверять нечего; в create — без вызова CLI.
+  if (!isEdit) {
+    const idError = validateBottleId(values.id);
+    if (idError !== null) {
+      showFieldError("f-id", idError);
+      return false;
+    }
+  }
   try {
     await runBottleReply(["--json", ...buildCreateArgs(values, isEdit)]);
-    if (errorElement !== null) {
-      errorElement.hidden = true;
-      errorElement.textContent = "";
-    }
     return true;
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const fieldId = fieldForError(message);
+    if (fieldId !== null && showFieldError(fieldId, message)) {
+      return false;
+    }
+    const errorElement = document.querySelector<HTMLElement>("#create-error");
     if (errorElement !== null) {
       errorElement.hidden = false;
-      errorElement.textContent =
-        error instanceof Error ? error.message : String(error);
+      errorElement.textContent = message;
     }
     return false;
   }
@@ -193,8 +270,5 @@ export function resetForm(): void {
   if (idField !== null) {
     idField.readOnly = false;
   }
-  const errorElement = document.querySelector<HTMLElement>("#create-error");
-  if (errorElement !== null) {
-    errorElement.hidden = true;
-  }
+  clearErrors();
 }

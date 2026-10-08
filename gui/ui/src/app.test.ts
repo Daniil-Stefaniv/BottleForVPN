@@ -1,5 +1,6 @@
-// Тесты каркаса приложения (M4 Task 3): refresh списка через CLI-мост,
-// состояние «демон не запущен», старт/стоп с обновлением, тосты ошибок.
+// Тесты каркаса приложения: refresh списка через CLI-мост, master-detail
+// рендер, состояние «демон не запущен», старт/стоп с busy-спиннером и
+// обновлением, тосты ошибок/успеха, статус-бар.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -40,28 +41,39 @@ function stubInvoker(
 
 const HTML = `
 <main id="app">
-  <section id="screen-list">
-    <table id="bottles"></table>
+  <section id="screen-list" class="screen">
+    <span id="list-count"></span>
+    <div id="bottle-list"></div>
+    <div id="bottle-detail"></div>
   </section>
   <section id="daemon-panel" hidden>
     <p id="daemon-hint"></p>
     <button id="daemon-start">Запустить демона</button>
     <pre id="daemon-log"></pre>
   </section>
+  <footer id="statusbar">
+    <span id="statusbar-daemon"></span>
+    <span id="statusbar-active"></span>
+    <span id="statusbar-updated"></span>
+  </footer>
   <div id="toast" hidden></div>
 </main>`;
+
+const listReply = {
+  List: { bottles: [{ id: "a", name: "Офис А", kind: "env", state: null }] },
+};
+const statusReply = {
+  Status: { bottles: [{ id: "a", state: "Up", socks5: 1080, forwards: [] }] },
+};
 
 describe("refreshBottles", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it("list+status сливаются и рендерятся в таблицу", async () => {
+  it("list+status сливаются и рендерятся в master-список и detail", async () => {
     document.body.innerHTML = HTML;
-    stubInvoker([
-      { List: { bottles: [{ id: "a", name: "Офис А", kind: "env", state: null }] } },
-      { Status: { bottles: [{ id: "a", state: "Up", socks5: 1080, forwards: [] }] } },
-    ]);
+    stubInvoker([listReply, statusReply]);
     const rows = await refreshBottles();
     expect(rows).toEqual([
       {
@@ -74,24 +86,39 @@ describe("refreshBottles", () => {
         forwards: [],
       },
     ]);
-    const rendered = document.querySelectorAll("#bottles tbody tr");
-    expect(rendered).toHaveLength(1);
+    expect(document.querySelectorAll(".bottle-item")).toHaveLength(1);
+    // Первая (и единственная) строка авто-выбрана — detail показывает её.
+    expect(document.querySelector(".bottle-item")?.classList.contains("selected")).toBe(true);
+    expect(document.querySelector("#bottle-detail")?.textContent).toContain("Офис А");
     // Демон жив — панель инструкции скрыта.
     expect(
       document.querySelector<HTMLElement>("#daemon-panel")?.hidden,
     ).toBe(true);
   });
 
-  it("«демон не запущен» — отдельное состояние с инструкцией, таблица очищена", async () => {
+  it("повторный refresh не пересоздаёт узлы списка (точечный рендер)", async () => {
+    document.body.innerHTML = HTML;
+    stubInvoker([listReply, statusReply, listReply, statusReply]);
+    await refreshBottles();
+    const before = document.querySelector<HTMLElement>(".bottle-item");
+    await refreshBottles();
+    const after = document.querySelector<HTMLElement>(".bottle-item");
+    expect(after).toBe(before);
+  });
+
+  it("«демон не запущен» — отдельное состояние с инструкцией, список очищен", async () => {
     document.body.innerHTML = HTML;
     stubInvoker([{ __throw: "Не удалось подключиться к демону BottleForApps — запущен ли bottled?" }]);
     const rows = await refreshBottles();
     expect(rows).toEqual([]);
     const panel = document.querySelector<HTMLElement>("#daemon-panel");
     expect(panel?.hidden).toBe(false);
-    expect(panel?.textContent).toContain("bottled");
     expect(document.querySelector("#daemon-hint")?.textContent).toMatch(
       /Запустить демона|bottled/,
+    );
+    expect(document.querySelectorAll(".bottle-item")).toHaveLength(0);
+    expect(document.querySelector("#statusbar-daemon")?.textContent).toContain(
+      "демон остановлен",
     );
   });
 
@@ -104,6 +131,21 @@ describe("refreshBottles", () => {
     expect(toast?.hidden).toBe(false);
     expect(toast?.textContent).toContain("хранилище профилей недоступно");
   });
+
+  it("статус-бар: активные бутылки и демон работает", async () => {
+    document.body.innerHTML = HTML;
+    stubInvoker([listReply, statusReply]);
+    await refreshBottles();
+    expect(document.querySelector("#statusbar-active")?.textContent).toBe(
+      "активных: 1",
+    );
+    expect(document.querySelector("#statusbar-daemon")?.textContent).toContain(
+      "демон работает",
+    );
+    expect(
+      document.querySelector("#statusbar-updated")?.textContent,
+    ).toContain("обновлено");
+  });
 });
 
 describe("performBottleAction", () => {
@@ -111,8 +153,8 @@ describe("performBottleAction", () => {
     document.body.innerHTML = HTML;
     const invoker = stubInvoker([
       { Started: { id: "a" } },
-      { List: { bottles: [{ id: "a", name: "A", kind: "env", state: null }] } },
-      { Status: { bottles: [{ id: "a", state: "Starting", socks5: null, forwards: [] }] } },
+      listReply,
+      statusReply,
     ]);
     await performBottleAction("a", "start");
     expect(invoker.calls).toEqual([
@@ -120,7 +162,33 @@ describe("performBottleAction", () => {
       ["--json", "list"],
       ["--json", "status"],
     ]);
-    expect(document.querySelectorAll("#bottles tbody tr")).toHaveLength(1);
+    expect(document.querySelectorAll(".bottle-item")).toHaveLength(1);
+  });
+
+  it("на время CLI-вызова кнопка показывает спиннер (pending)", async () => {
+    document.body.innerHTML = HTML;
+    let release: (output: BottleOutput) => void = () => {};
+    const calls: string[][] = [];
+    setBottleInvoker((args) => {
+      calls.push(args);
+      if (args[1] === "start") {
+        return new Promise<BottleOutput>((resolve) => {
+          release = resolve;
+        });
+      }
+      return Promise.resolve(reply(args[1] === "list" ? listReply : statusReply));
+    });
+    await refreshBottles();
+    const pending = performBottleAction("a", "start");
+    // CLI-вызов в полёте — кнопка detail со спиннером и заблокирована.
+    const button = document.querySelector<HTMLButtonElement>("#detail-action");
+    expect(button?.disabled).toBe(true);
+    expect(button?.textContent).toContain("ждите");
+    release(reply({ Started: { id: "a" } }));
+    await pending;
+    expect(
+      document.querySelector<HTMLButtonElement>("#detail-action")?.textContent,
+    ).not.toContain("ждите");
   });
 
   it("stopped с warning демона показывает предупреждение тостом", async () => {
@@ -160,13 +228,6 @@ describe("кнопка «Запустить демона»", () => {
       { List: { bottles: [] } },
       { Status: { bottles: [] } },
     ]);
-    document
-      .querySelector<HTMLButtonElement>("#daemon-start")
-      ?.addEventListener("click", () => {
-        void mountApp()["noop"];
-      });
-    // Кнопка подключается в mountApp; вызываем обработчик напрямую через клик
-    // после монтирования обработчиков на текущем DOM.
     mountApp({ once: true });
     const button = document.querySelector<HTMLButtonElement>("#daemon-start");
     button?.click();
@@ -186,12 +247,12 @@ describe("refreshBottles: частичные данные (M7)", () => {
   it("отказ status не прячет список — строки без рантайма", async () => {
     document.body.innerHTML = HTML;
     stubInvoker([
-      { List: { bottles: [{ id: "a", name: "Офис А", kind: "env", state: null }] } },
+      listReply,
       { __throw: "менеджер бутылок не подключён" },
     ]);
     const rows = await refreshBottles();
     expect(rows).toHaveLength(1);
     expect(rows[0]?.state).toBe("stopped");
-    expect(document.querySelectorAll("#bottles tbody tr")).toHaveLength(1);
+    expect(document.querySelectorAll(".bottle-item")).toHaveLength(1);
   });
 });

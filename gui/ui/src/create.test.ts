@@ -1,13 +1,16 @@
-// Тесты формы create/edit (M4 Task 4): маппинг полей в аргументы
-// `bottle create`, edit через --force с тем же id (M3-семантика),
-// ошибки демона — красным под формой (Review Focus #4).
+// Тесты формы create/edit: маппинг полей в аргументы `bottle create`,
+// edit через --force с тем же id (M3-семантика), клиентская проверка
+// идентификатора, ошибки демона — на конкретное поле по ключевым словам
+// (не распознанные — общей строкой под формой, дословно).
 
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   buildCreateArgs,
+  fieldForError,
   fillFormFromProfile,
   readForm,
   submitCreate,
+  validateBottleId,
 } from "./create";
 import { setBottleInvoker } from "./ipc";
 import type { BottleProfile } from "./ipc";
@@ -16,6 +19,7 @@ import type { BottleProfile } from "./ipc";
 const FORM_HTML = `
 <form id="create-form">
   <input id="f-id" />
+  <p class="field-error" data-for="f-id" hidden></p>
   <input id="f-name" />
   <select id="f-kind">
     <option value="env">env</option>
@@ -26,11 +30,13 @@ const FORM_HTML = `
     <option value="openvpn">openvpn</option>
   </select>
   <input id="f-config" />
+  <p class="field-error" data-for="f-config" hidden></p>
   <input id="f-vpn" />
   <input id="f-vpn-args" />
   <input id="f-endpoints" />
   <input id="f-vpn-interface" />
   <input id="f-socks5" type="number" />
+  <p class="field-error" data-for="f-socks5" hidden></p>
   <input id="f-forwards" />
   <input id="f-dns" />
   <input id="f-launch" />
@@ -195,12 +201,39 @@ describe("edit-путь: show → форма → create --force", () => {
   });
 });
 
+describe("validateBottleId (клиентская проверка)", () => {
+  it("принимает DNS-label", () => {
+    expect(validateBottleId("office-a")).toBeNull();
+    expect(validateBottleId("a1")).toBeNull();
+  });
+
+  it("отклоняет пустой и недопустимые символы", () => {
+    expect(validateBottleId("")).not.toBeNull();
+    expect(validateBottleId("  ")).not.toBeNull();
+    expect(validateBottleId("Office_A")).not.toBeNull();
+    expect(validateBottleId("-office")).not.toBeNull();
+  });
+});
+
+describe("fieldForError (маппинг ошибок демона на поля)", () => {
+  it("порт/socks5 → f-socks5, конфиг → f-config, идентификатор → f-id", () => {
+    expect(fieldForError("порт 1080 занят процессом mstsc.exe")).toBe("f-socks5");
+    expect(fieldForError("файл конфигурации не найден")).toBe("f-config");
+    expect(fieldForError("идентификатор занят")).toBe("f-id");
+    expect(fieldForError("некорректный DNS-сервер")).toBe("f-dns");
+  });
+
+  it("нераспознанная ошибка — null (общая строка под формой)", () => {
+    expect(fieldForError("хранилище профилей недоступно")).toBeNull();
+  });
+});
+
 describe("submitCreate", () => {
   beforeEach(() => {
     document.body.innerHTML = FORM_HTML;
   });
 
-  it("успех: ошибка скрыта, список обновится (resolve на Created)", async () => {
+  it("успех: ошибки скрыты, список обновится (resolve на Created)", async () => {
     const calls: string[][] = [];
     setBottleInvoker(async (args) => {
       calls.push(args);
@@ -219,17 +252,86 @@ describe("submitCreate", () => {
     ).toBe(true);
   });
 
-  it("ошибка демона — красным под формой, дословно (Review Focus #4)", async () => {
+  it("клиентская проверка: невалидный id — ошибка у поля, CLI не вызывается", async () => {
+    let cliCalled = false;
+    setBottleInvoker(async () => {
+      cliCalled = true;
+      return { stdout: "{}", code: 0 };
+    });
+    document.querySelector<HTMLInputElement>("#f-id")!.value = "Bad_ID!";
+    const result = await submitCreate(false);
+    expect(result).toBe(false);
+    expect(cliCalled).toBe(false);
+    const fieldError = document.querySelector<HTMLElement>(
+      '.field-error[data-for="f-id"]',
+    );
+    expect(fieldError?.hidden).toBe(false);
+    expect(fieldError?.textContent).toContain("Строчные");
+    expect(
+      document.querySelector<HTMLInputElement>("#f-id")?.getAttribute("aria-invalid"),
+    ).toBe("true");
+  });
+
+  it("ошибка демона про порт маппится на поле SOCKS5, дословно", async () => {
     setBottleInvoker(async () => ({
       stdout: JSON.stringify({
         Error: { message: "порт 1080 занят процессом mstsc.exe (pid 4242)" },
       }),
       code: 1,
     }));
+    document.querySelector<HTMLInputElement>("#f-id")!.value = "office-a";
+    const result = await submitCreate(false);
+    expect(result).toBe(false);
+    const fieldError = document.querySelector<HTMLElement>(
+      '.field-error[data-for="f-socks5"]',
+    );
+    expect(fieldError?.hidden).toBe(false);
+    expect(fieldError?.textContent).toContain("порт 1080 занят");
+    // Общая строка остаётся скрытой — ошибка ушла в поле.
+    expect(
+      document.querySelector<HTMLElement>("#create-error")?.hidden,
+    ).toBe(true);
+  });
+
+  it("нераспознанная ошибка демона — общей строкой под формой, дословно", async () => {
+    setBottleInvoker(async () => ({
+      stdout: JSON.stringify({
+        Error: { message: "хранилище профилей недоступно" },
+      }),
+      code: 1,
+    }));
+    document.querySelector<HTMLInputElement>("#f-id")!.value = "office-a";
     const result = await submitCreate(false);
     expect(result).toBe(false);
     const error = document.querySelector<HTMLElement>("#create-error");
     expect(error?.hidden).toBe(false);
-    expect(error?.textContent).toContain("порт 1080 занят");
+    expect(error?.textContent).toContain("хранилище профилей недоступно");
+  });
+
+  it("повторный submit после ошибки очищает прошлые подсветки", async () => {
+    let attempt = 0;
+    setBottleInvoker(async () => {
+      attempt += 1;
+      if (attempt === 1) {
+        return {
+          stdout: JSON.stringify({
+            Error: { message: "порт 1080 занят" },
+          }),
+          code: 1,
+        };
+      }
+      return { stdout: JSON.stringify({ Created: { id: "a" } }), code: 0 };
+    });
+    document.querySelector<HTMLInputElement>("#f-id")!.value = "office-a";
+    await submitCreate(false);
+    const result = await submitCreate(false);
+    expect(result).toBe(true);
+    const fieldError = document.querySelector<HTMLElement>(
+      '.field-error[data-for="f-socks5"]',
+    );
+    expect(fieldError?.hidden).toBe(true);
+    expect(
+      document.querySelector<HTMLInputElement>("#f-socks5")?.getAttribute("aria-invalid"),
+    ).toBeNull();
   });
 });

@@ -1,12 +1,20 @@
-// Тесты экрана списка (M4 Task 3): merge list+status по id, отображаемые
-// состояния/порты, блокировка кнопок в переходах, рендер таблицы.
+// Тесты экрана списка: merge list+status по id, подписи состояний,
+// блокировка в переходах; точечный рендер master-списка (узлы строк
+// живут между поллингами) и detail-панели (перерисовка по сигнатуре).
 
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   bottleActionsLocked,
   mergeListStatus,
-  renderListTable,
+  renderBottleDetail,
+  renderBottleList,
+  resetDetailCache,
+  stateDotClass,
   stateLabel,
+  type BottleAction,
+  type BottleRow,
+  type DetailHandlers,
+  type ListHandlers,
 } from "./list";
 import type { BottleSummary, RuntimeState } from "./ipc";
 
@@ -23,6 +31,30 @@ const runtime = (over: Partial<RuntimeState>): RuntimeState => ({
   state: "Up",
   socks5: 1080,
   forwards: [],
+  ...over,
+});
+
+const row = (over: Partial<BottleRow>): BottleRow => ({
+  id: "office-a",
+  name: "Офис А",
+  kind: "env",
+  state: "up",
+  socks5: 1080,
+  forwards: [],
+  ...over,
+});
+
+const noopListHandlers = (over: Partial<ListHandlers> = {}): ListHandlers => ({
+  onSelect: () => {},
+  onCreate: () => {},
+  ...over,
+});
+
+const noopDetailHandlers = (over: Partial<DetailHandlers> = {}): DetailHandlers => ({
+  onAction: () => {},
+  onEdit: () => {},
+  onDelete: () => {},
+  onNotify: () => {},
   ...over,
 });
 
@@ -88,7 +120,7 @@ describe("mergeListStatus", () => {
     expect(rows[1]?.state).toBe("failed");
   });
 
-  it("пустые list и status — пустая таблица", () => {
+  it("пустые list и status — пустой список", () => {
     expect(mergeListStatus([], [])).toEqual([]);
   });
 });
@@ -108,6 +140,14 @@ describe("stateLabel", () => {
   });
 });
 
+describe("stateDotClass", () => {
+  it("класс точки по состоянию; неизвестное — как stopped", () => {
+    expect(stateDotClass("up")).toBe("dot dot-up");
+    expect(stateDotClass("starting")).toBe("dot dot-starting");
+    expect(stateDotClass("неведомое")).toBe("dot dot-stopped");
+  });
+});
+
 describe("bottleActionsLocked", () => {
   it("переходы (starting/stopping) блокируют кнопки", () => {
     expect(bottleActionsLocked("starting")).toBe(true);
@@ -121,101 +161,161 @@ describe("bottleActionsLocked", () => {
   });
 });
 
-describe("renderListTable", () => {
+describe("renderBottleList (master)", () => {
   beforeEach(() => {
-    document.body.innerHTML = '<table id="bottles"></table>';
+    document.body.innerHTML =
+      '<span id="list-count"></span><div id="bottle-list"></div>';
   });
 
-  it("рисует строки: колонки id/name/kind/state/socks5/forwards", () => {
-    renderListTable(
+  it("рисует строки: имя, тип, SOCKS5/состояние; счётчик в шапке", () => {
+    renderBottleList(
       [
-        {
-          id: "office-a",
-          name: "Офис А",
-          kind: "env",
-          state: "up",
-          socks5: 1080,
-          forwards: [{ port: 33389, target: "10.20.30.15:3389" }],
-        },
+        row({ socks5: 55123 }),
+        row({ id: "b", name: "", state: "stopped", socks5: null }),
       ],
-      () => {},
+      null,
+      noopListHandlers(),
     );
-    const rows = document.querySelectorAll<HTMLTableRowElement>("#bottles tbody tr");
-    expect(rows).toHaveLength(1);
-    const cells = rows[0]?.querySelectorAll("td") ?? [];
-    expect(cells[0]?.textContent).toBe("office-a");
-    expect(cells[1]?.textContent).toBe("Офис А");
-    expect(cells[2]?.textContent).toBe("env");
-    expect(cells[3]?.textContent).toBe("работает");
-    expect(cells[4]?.textContent).toBe("1080");
-    expect(cells[5]?.textContent).toContain("33389→10.20.30.15:3389");
+    const items = document.querySelectorAll<HTMLElement>(".bottle-item");
+    expect(items).toHaveLength(2);
+    expect(items[0]?.textContent).toContain("Офис А");
+    expect(items[0]?.textContent).toContain("env");
+    expect(items[0]?.textContent).toContain("SOCKS5 :55123 · работает");
+    // Без имени — показывается id.
+    expect(items[1]?.textContent).toContain("b");
+    expect(items[1]?.textContent).toContain("остановлена");
+    expect(document.querySelector("#list-count")?.textContent).toBe("Бутылки · 2");
   });
 
-  it("переходное состояние блокирует кнопки (disabled)", () => {
-    renderListTable(
-      [
-        {
-          id: "a",
-          name: "A",
-          kind: "env",
-          state: "starting",
-          socks5: null,
-          forwards: [],
-        },
-      ],
-      () => {},
-    );
-    const buttons = document.querySelectorAll<HTMLButtonElement>(
-      "#bottles tbody button",
-    );
-    for (const button of buttons) {
-      expect(button.disabled).toBe(true);
-    }
+  it("точечное обновление: узлы строк живут между поллингами", () => {
+    const handlers = noopListHandlers();
+    renderBottleList([row({})], null, handlers);
+    const before = document.querySelector<HTMLElement>(".bottle-item");
+    renderBottleList([row({ state: "stopped", socks5: null })], null, handlers);
+    const after = document.querySelector<HTMLElement>(".bottle-item");
+    // Тот же DOM-узел — не пересоздан (фокус/hover не сбрасываются).
+    expect(after).toBe(before);
+    expect(after?.textContent).toContain("остановлена");
+    expect(after?.querySelector(".dot")?.className).toBe("dot dot-stopped");
   });
 
-  it("кнопки старт/стоп вызывают действие с id бутылки", () => {
-    const calls: { id: string; action: string }[] = [];
-    renderListTable(
-      [
-        {
-          id: "a",
-          name: "A",
-          kind: "env",
-          state: "stopped",
-          socks5: null,
-          forwards: [],
-        },
-      ],
-      (id, action) => calls.push({ id, action }),
+  it("исчезнувшие бутылки удаляются, порядок совпадает со входом", () => {
+    const handlers = noopListHandlers();
+    renderBottleList([row({ id: "a" }), row({ id: "b" }), row({ id: "c" })], null, handlers);
+    renderBottleList([row({ id: "c" }), row({ id: "a" })], null, handlers);
+    const ids = [...document.querySelectorAll<HTMLElement>(".bottle-item")].map(
+      (item) => item.dataset.bottleId,
     );
-    const [start] = [
-      ...document.querySelectorAll<HTMLButtonElement>("#bottles tbody button"),
-    ];
-    start?.click();
-    expect(calls).toEqual([{ id: "a", action: "start" }]);
+    expect(ids).toEqual(["c", "a"]);
   });
 
-  it("кнопка «Изменить» открывает форму edit с id бутылки", () => {
+  it("выбранная строка помечается классом selected, клик зовёт onSelect", () => {
+    const selected: string[] = [];
+    renderBottleList(
+      [row({ id: "a" }), row({ id: "b" })],
+      "b",
+      noopListHandlers({ onSelect: (id) => selected.push(id) }),
+    );
+    const items = document.querySelectorAll<HTMLElement>(".bottle-item");
+    expect(items[0]?.classList.contains("selected")).toBe(false);
+    expect(items[1]?.classList.contains("selected")).toBe(true);
+    items[0]?.click();
+    expect(selected).toEqual(["a"]);
+  });
+});
+
+describe("renderBottleDetail (detail)", () => {
+  beforeEach(() => {
+    document.body.innerHTML = '<div id="bottle-detail"></div>';
+    resetDetailCache();
+  });
+
+  it("null — заглушка «выберите бутылку»", () => {
+    renderBottleDetail(null, null, noopDetailHandlers());
+    expect(document.querySelector("#detail-empty")?.textContent).toContain(
+      "Выберите бутылку",
+    );
+  });
+
+  it("параметры, пробросы и бейджи состояния", () => {
+    renderBottleDetail(
+      row({
+        forwards: [{ port: 13389, target: "10.20.30.15:3389" }],
+      }),
+      null,
+      noopDetailHandlers(),
+    );
+    const text = document.querySelector("#bottle-detail")?.textContent ?? "";
+    expect(text).toContain("Офис А");
+    expect(text).toContain("работает");
+    expect(text).toContain("127.0.0.1:1080");
+    expect(text).toContain("127.0.0.1:13389 → 10.20.30.15:3389");
+  });
+
+  it("повторный рендер без изменений не трогает DOM (сигнатура)", () => {
+    const handlers = noopDetailHandlers();
+    const data = row({});
+    renderBottleDetail(data, null, handlers);
+    const before = document.querySelector("#bottle-detail h2");
+    renderBottleDetail(data, null, handlers);
+    const after = document.querySelector("#bottle-detail h2");
+    expect(after).toBe(before);
+  });
+
+  it("кнопка действия: у работающей — «Стоп», у остановленной — «Старт»", () => {
+    const actions: BottleAction[] = [];
+    const handlers = noopDetailHandlers({
+      onAction: (_id, action) => actions.push(action),
+    });
+    renderBottleDetail(row({ state: "up" }), null, handlers);
+    document.querySelector<HTMLButtonElement>("#detail-action")?.click();
+    expect(actions).toEqual(["stop"]);
+
+    resetDetailCache();
+    renderBottleDetail(row({ state: "stopped" }), null, handlers);
+    document.querySelector<HTMLButtonElement>("#detail-action")?.click();
+    expect(actions).toEqual(["stop", "start"]);
+  });
+
+  it("pending: спиннер и заблокированная кнопка на время CLI-вызова", () => {
+    renderBottleDetail(row({ state: "stopped" }), "start", noopDetailHandlers());
+    const button = document.querySelector<HTMLButtonElement>("#detail-action");
+    expect(button?.disabled).toBe(true);
+    expect(button?.textContent).toContain("ждите");
+  });
+
+  it("переходное состояние блокирует кнопку действия", () => {
+    renderBottleDetail(row({ state: "starting" }), null, noopDetailHandlers());
+    expect(
+      document.querySelector<HTMLButtonElement>("#detail-action")?.disabled,
+    ).toBe(true);
+  });
+
+  it("удаление — двухшаговое: подтверждение → onDelete", () => {
+    const deleted: string[] = [];
+    const handlers = noopDetailHandlers({
+      onDelete: (id) => deleted.push(id),
+    });
+    const data = row({});
+    renderBottleDetail(data, null, handlers);
+    const button = document.querySelector<HTMLButtonElement>("#detail-delete");
+    expect(button?.textContent).toBe("Удалить");
+    button?.click();
+    const confirm = document.querySelector<HTMLButtonElement>("#detail-delete");
+    expect(confirm?.textContent).toBe("Подтвердить удаление");
+    expect(deleted).toEqual([]);
+    confirm?.click();
+    expect(deleted).toEqual(["office-a"]);
+  });
+
+  it("«Изменить» зовёт onEdit с id бутылки", () => {
     const edits: string[] = [];
-    renderListTable(
-      [
-        {
-          id: "a",
-          name: "A",
-          kind: "env",
-          state: "stopped",
-          socks5: null,
-          forwards: [],
-        },
-      ],
-      () => {},
-      (id) => edits.push(id),
+    renderBottleDetail(
+      row({}),
+      null,
+      noopDetailHandlers({ onEdit: (id) => edits.push(id) }),
     );
-    const buttons = [
-      ...document.querySelectorAll<HTMLButtonElement>("#bottles tbody button"),
-    ];
-    const edit = buttons.find((button) => button.textContent === "Изменить");
-    edit?.click();
-    expect(edits).toEqual(["a"]);
+    document.querySelector<HTMLButtonElement>("#detail-edit")?.click();
+    expect(edits).toEqual(["office-a"]);
   });
 });

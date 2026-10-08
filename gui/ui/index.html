@@ -8,61 +8,158 @@
   </head>
   <body>
     <main id="app">
-      <h1>BottleForApps</h1>
-
-      <nav id="tabs">
-        <button class="tab active" data-screen="list">Бутылки</button>
-        <button class="tab" data-screen="create">Создать</button>
-        <button class="tab" data-screen="doctor">Диагностика</button>
-      </nav>
+      <header id="app-header">
+        <span id="app-title">🧴 BottleForApps</span>
+        <nav id="tabs">
+          <button class="tab active" data-screen="list">Бутылки</button>
+          <button class="tab" data-screen="create">Создать</button>
+          <button class="tab" data-screen="doctor">Диагностика</button>
+        </nav>
+      </header>
 
       <section id="screen-list" class="screen">
-        <table id="bottles"></table>
+        <div id="list-layout">
+          <aside id="list-pane">
+            <div id="list-head">
+              <span id="list-count">Бутылки</span>
+              <button id="list-create" type="button" title="Новая бутылка">+</button>
+            </div>
+            <div id="bottle-list"></div>
+          </aside>
+          <div id="detail-pane">
+            <div id="bottle-detail">
+              <p id="detail-empty" class="muted">Выберите бутылку слева или создайте новую</p>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section id="screen-create" class="screen" hidden>
         <form id="create-form">
-          <label>Идентификатор <input id="f-id" placeholder="office-a" /></label>
-          <label>Имя <input id="f-name" placeholder="Офис А" /></label>
-          <label>Тип
-            <select id="f-kind">
-              <option value="env">env — изолирующее окружение</option>
-              <option value="host">host — фирменный клиент</option>
-            </select>
-          </label>
-          <!-- env -->
-          <label class="env-field">Протокол
-            <select id="f-protocol">
-              <option value="wireguard">WireGuard</option>
-              <option value="openvpn">OpenVPN</option>
-            </select>
-          </label>
-          <label class="env-field">Файл конфигурации
-            <input id="f-config" placeholder="/path/wg-office.conf" />
-            <button type="button" id="f-config-pick">Выбрать файл…</button>
-          </label>
-          <!-- host -->
-          <label class="host-field" hidden>VPN-клиент <input id="f-vpn" /></label>
-          <label class="host-field" hidden>Аргументы клиента <input id="f-vpn-args" /></label>
-          <label class="host-field" hidden>Endpoint'ы (через пробел) <input id="f-endpoints" /></label>
-          <label class="host-field" hidden>Интерфейс (необязательно) <input id="f-vpn-interface" /></label>
-          <!-- общее -->
-          <label>Порт SOCKS5 (0 — автоподбор) <input id="f-socks5" type="number" value="0" min="0" max="65535" /></label>
-          <label>TCP-пробросы host:port (через пробел) <input id="f-forwards" placeholder="10.20.30.15:3389" /></label>
-          <label>DNS внутри бутылки <input id="f-dns" placeholder="10.20.30.1" /></label>
-          <label>Команда после подъёма <input id="f-launch" placeholder="mstsc" /></label>
-          <button type="submit" id="create-submit">Создать</button>
-          <button type="button" id="create-reset">Новая бутылка</button>
+          <div class="form-scroll">
+            <h2 id="create-title">Новая бутылка</h2>
+
+            <fieldset class="form-section">
+              <legend>Основное</legend>
+              <p class="section-hint">Как бутылка называется и где живёт VPN.</p>
+              <div class="form-grid">
+                <div class="field">
+                  <label for="f-id">Идентификатор</label>
+                  <input id="f-id" placeholder="office-a" />
+                  <p class="field-hint">Уникальный, станет именем namespace в Linux.</p>
+                  <p class="field-error" data-for="f-id" hidden></p>
+                </div>
+                <div class="field">
+                  <label for="f-name">Имя</label>
+                  <input id="f-name" placeholder="Офис А" />
+                </div>
+                <div class="field span-2">
+                  <label for="f-kind">Тип бутылки</label>
+                  <select id="f-kind">
+                    <option value="env">env — изолирующее окружение в Linux VM</option>
+                    <option value="host">host — фирменный клиент на хосте</option>
+                  </select>
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset class="form-section" id="section-vpn-env">
+              <legend>VPN</legend>
+              <p class="section-hint">Конфигурационный туннель внутри изолированного окружения.</p>
+              <div class="form-grid">
+                <div class="field">
+                  <label for="f-protocol">Протокол</label>
+                  <select id="f-protocol">
+                    <option value="wireguard">WireGuard</option>
+                    <option value="openvpn">OpenVPN</option>
+                  </select>
+                </div>
+                <div class="field env-field">
+                  <label for="f-config">Файл конфигурации</label>
+                  <div class="input-row">
+                    <input id="f-config" placeholder="/path/wg-office.conf" />
+                    <button type="button" id="f-config-pick">Выбрать файл…</button>
+                  </div>
+                  <p class="field-error" data-for="f-config" hidden></p>
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset class="form-section" id="section-vpn-host" hidden>
+              <legend>VPN</legend>
+              <p class="section-hint">Фирменный клиент на хосте; маршруты ставит служба bottle-svc.</p>
+              <div class="form-grid">
+                <div class="field host-field" hidden>
+                  <label for="f-vpn">VPN-клиент</label>
+                  <input id="f-vpn" placeholder="Cisco AnyConnect Secure Mobility Client" />
+                </div>
+                <div class="field host-field" hidden>
+                  <label for="f-vpn-args">Аргументы клиента</label>
+                  <input id="f-vpn-args" />
+                </div>
+                <div class="field host-field" hidden>
+                  <label for="f-endpoints">Endpoint'ы (через пробел)</label>
+                  <input id="f-endpoints" />
+                </div>
+                <div class="field host-field" hidden>
+                  <label for="f-vpn-interface">Интерфейс (необязательно)</label>
+                  <input id="f-vpn-interface" />
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset class="form-section">
+              <legend>Публикация</legend>
+              <p class="section-hint">Что бутылка отдаёт наружу — только на 127.0.0.1.</p>
+              <div class="form-grid">
+                <div class="field">
+                  <label for="f-socks5">Порт SOCKS5</label>
+                  <input id="f-socks5" type="number" value="0" min="0" max="65535" />
+                  <p class="field-hint">0 — автоподбор свободного порта.</p>
+                  <p class="field-error" data-for="f-socks5" hidden></p>
+                </div>
+                <div class="field">
+                  <label for="f-dns">DNS внутри бутылки</label>
+                  <input id="f-dns" placeholder="10.20.30.1" />
+                </div>
+                <div class="field span-2">
+                  <label for="f-forwards">TCP-пробросы (через пробел)</label>
+                  <input id="f-forwards" placeholder="10.20.30.15:3389" />
+                  <p class="field-hint">Формат host:port. Порт на 127.0.0.1 назначит демон.</p>
+                </div>
+                <div class="field span-2">
+                  <label for="f-launch">Команда после подъёма</label>
+                  <input id="f-launch" placeholder="mstsc /v:127.0.0.1:13389" />
+                  <p class="field-hint">Запустится на хосте, когда туннель поднимется.</p>
+                </div>
+              </div>
+            </fieldset>
+
+            <p id="create-error" hidden></p>
+            <div class="form-actions">
+              <button type="submit" id="create-submit">Создать</button>
+              <button type="button" id="create-reset">Новая бутылка</button>
+            </div>
+          </div>
         </form>
-        <p id="create-error" hidden></p>
       </section>
 
       <section id="screen-doctor" class="screen" hidden>
-        <table id="doctor-table"></table>
-        <button id="doctor-refresh">Проверить снова</button>
-        <button id="logs-export">Собрать логи</button>
-        <p id="logs-path" hidden></p>
-        <button id="logs-open-dir" hidden>Открыть папку</button>
+        <div class="doctor-wrap">
+          <div id="doctor-head">
+            <div>
+              <h2>Диагностика</h2>
+              <p id="doctor-summary" class="muted"></p>
+            </div>
+            <div class="doctor-actions">
+              <button id="doctor-refresh" type="button">Проверить снова</button>
+              <button id="logs-export" type="button">Собрать логи</button>
+            </div>
+          </div>
+          <div id="doctor-list"></div>
+          <p id="logs-path" hidden></p>
+          <button id="logs-open-dir" hidden>Открыть папку</button>
+        </div>
       </section>
 
       <section id="daemon-panel" hidden>
@@ -70,6 +167,14 @@
         <button id="daemon-start">Запустить демона</button>
         <pre id="daemon-log"></pre>
       </section>
+
+      <footer id="statusbar">
+        <span id="statusbar-daemon" class="status-item">
+          <span class="dot dot-muted"></span>демон
+        </span>
+        <span id="statusbar-active" class="status-item">активных: 0</span>
+        <span id="statusbar-updated" class="status-item muted"></span>
+      </footer>
 
       <div id="toast" hidden></div>
     </main>
