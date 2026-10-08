@@ -1,4 +1,4 @@
-﻿# Сборка MSI BottleForApps (Windows + WiX v4/v5 CLI; CI: windows-раннер).
+# Сборка MSI BottleForApps (Windows + WiX v4/v5 CLI; CI: windows-раннер).
 #
 # Формирует artifacts/BottleForApps-<version>-win-x64.msi + SHA256.
 # Версия — из [workspace.package].version (cargo metadata); требует
@@ -28,10 +28,11 @@ if (-not (Test-Path $GuiExePath)) {
     throw "bottle-gui.exe не найден: $GuiExePath (артефакт gui-build обязателен)"
 }
 
-# WiX CLI: PATH → dotnet tool → choco.
+# WiX CLI: PATH → dotnet tool (пин 6.0.*: WiX 7 требует приёма OSMF EULA,
+# wix build без него падает WIX7015) → choco.
 if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
-    Write-Host "WiX не найден — устанавливаю dotnet tool..."
-    dotnet tool install --global wix
+    Write-Host "WiX не найден — устанавливаю dotnet tool (6.0.*)..."
+    dotnet tool install --global wix --version "6.0.*"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "dotnet tool не удался — пробую choco wixtoolset..."
         choco install wixtoolset -y

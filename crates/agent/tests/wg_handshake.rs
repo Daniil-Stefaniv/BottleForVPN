@@ -143,8 +143,11 @@ async fn wg_handshake_and_socks5_over_tunnel() {
     // (3) Сервер WireGuard в srv: wireguard-go wgsrv + setconf через stdin.
     // Имя wgsrv не пересекается с бутылочными wg<idx> (слот 1 → wg1):
     // UAPI-сокеты живут в общей файловой системе /var/run/wireguard.
+    // WG_PROCESS_FOREGROUND=1: без неё wireguard-go демонизируется, и
+    // wait_wg_ready видит «смерть» родителя («умер при старте»).
     let mut srv_wg = Command::new("ip")
         .args(["netns", "exec", NS_SRV, "wireguard-go", "wgsrv"])
+        .env("WG_PROCESS_FOREGROUND", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()

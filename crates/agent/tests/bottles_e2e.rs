@@ -156,8 +156,11 @@ async fn bottles_up_down_full_cycle() {
 
     // (3) Сервер WireGuard в srv: имя wgsrv не пересекается с бутылочными
     // wg<idx> — UAPI-сокеты живут в общей файловой системе.
+    // WG_PROCESS_FOREGROUND=1: без неё wireguard-go демонизируется, и
+    // wait_wg_ready видит «смерть» родителя («умер при старте»).
     let mut srv_wg = Command::new("ip")
         .args(["netns", "exec", NS_SRV, "wireguard-go", "wgsrv"])
+        .env("WG_PROCESS_FOREGROUND", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()

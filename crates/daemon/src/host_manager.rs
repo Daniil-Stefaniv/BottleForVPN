@@ -298,10 +298,30 @@ pub async fn dial_bound(
         Err(error) => return Err(error),
     }
     let stream = TcpStream::from_std(sock.into())?;
-    stream.writable().await?;
-    match stream.take_error()? {
-        Some(error) => Err(error),
-        None => Ok(stream),
+    // Готовность опрашиваем try_write, а не writable().await: на Windows
+    // событие завершения connect одноразовое и могло наступить ДО
+    // регистрации сокета в реакторе (конвертация из socket2) — тогда
+    // writable() не просыпается никогда (юнит-тесты висли на CI часами).
+    // На unix (level-triggered) первый же try_write отвечает, поведение
+    // не меняется.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(error) = stream.take_error()? {
+            return Err(error);
+        }
+        match stream.try_write(&[]) {
+            Ok(_) => return Ok(stream),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("connect к {addr} не завершился за 30 с"),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 

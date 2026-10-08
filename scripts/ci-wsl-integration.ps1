@@ -1,4 +1,4 @@
-﻿# ci-wsl-integration.ps1 — WSL-интеграционный сценарий CI (задача 18, M1).
+# ci-wsl-integration.ps1 — WSL-интеграционный сценарий CI (задача 18, M1).
 #
 # Полный вертикальный срез env-бутылки на windows-раннере:
 #   1) импорт rootfs-апплайенса как дистрибутива `bottleforapps-ci`;
@@ -292,9 +292,12 @@ try {
 
     # (2) Стенд WG-сервера внутри VM (первый exec будит дистрибутив и
     #     запускает boot.command — стенд сам останавливает boot-агента).
+    # Стенд-скрипт — POSIX sh (bash в appliance нет). `tr -d '\r'`
+    # обязателен: checkout на windows-раннере ставит CRLF, и `set -eu\r`
+    # умирал «set: line 1: illegal option -».
     $standB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($StandScript))
     $standOut = Invoke-Wsl `
-        -Arguments @('/bin/sh', '-c', "echo $standB64 | base64 -d | sh") `
+        -Arguments @('/bin/sh', '-c', "echo $standB64 | base64 -d | tr -d '\r' | sh") `
         -Description 'Подъём WG-стенда в VM (srv-netns + wireguard + DNAT)'
 
     if ($standOut -notmatch 'BFA-STAND-OK') {
