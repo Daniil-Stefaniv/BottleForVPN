@@ -119,6 +119,12 @@ body {
   flex-direction: column;
 }
 
+/* display:flex выше перекрывает UA-стиль атрибута hidden — возвращаем
+   скрытие неактивных экранов (switchScreen ставит section.hidden). */
+.screen[hidden] {
+  display: none;
+}
+
 /* ── Кнопки и инпуты ──────────────────────────────────────────── */
 
 button {
