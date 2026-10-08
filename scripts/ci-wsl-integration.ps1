@@ -1,4 +1,4 @@
-# ci-wsl-integration.ps1 — WSL-интеграционный сценарий CI (задача 18, M1).
+﻿# ci-wsl-integration.ps1 — WSL-интеграционный сценарий CI (задача 18, M1).
 #
 # Полный вертикальный срез env-бутылки на windows-раннере:
 #   1) импорт rootfs-апплайенса как дистрибутива `bottleforapps-ci`;

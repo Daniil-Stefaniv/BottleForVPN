@@ -21,6 +21,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 bytes = "1"
 # boot_cleanup завершает осиротевшие relay/туннели сигналами (kill(2)).
 libc = "0.2"
+# Энтропия токена на Windows (token.rs): /dev/urandom там нет.
+getrandom = "0.3"
 
 [dev-dependencies]
 # Интеграционные тесты (wg_handshake, bottles_e2e, openvpn_e2e) входят в

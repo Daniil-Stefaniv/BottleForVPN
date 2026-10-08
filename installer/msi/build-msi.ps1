@@ -1,4 +1,4 @@
-# Сборка MSI BottleForApps (Windows + WiX v4/v5 CLI; CI: windows-раннер).
+﻿# Сборка MSI BottleForApps (Windows + WiX v4/v5 CLI; CI: windows-раннер).
 #
 # Формирует artifacts/BottleForApps-<version>-win-x64.msi + SHA256.
 # Версия — из [workspace.package].version (cargo metadata); требует

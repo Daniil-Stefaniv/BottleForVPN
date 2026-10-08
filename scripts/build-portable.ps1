@@ -1,4 +1,4 @@
-# Сборка portable-дистрибутива BottleForApps (Windows, CI или локально).
+﻿# Сборка portable-дистрибутива BottleForApps (Windows, CI или локально).
 #
 # Формирует dist/portable/BottleForApps/: bottle.exe, bottled.exe,
 # bottle-svc.exe (для --install по желанию админа), appliance/

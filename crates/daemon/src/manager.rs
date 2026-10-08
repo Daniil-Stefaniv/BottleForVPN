@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bottle_core::ipc::{BottleState, CliReply, RuntimeState};
@@ -61,8 +61,8 @@ use crate::store::{atomic_write, Store};
 pub const PORT_DYNAMIC_MIN: u16 = 49152;
 /// Верхняя граница диапазона автоподбора портов.
 pub const PORT_DYNAMIC_MAX: u16 = 65535;
-/// Попыток `bind :0`, прежде чем сдаться: на системах с более широким
-/// диапазоном ephemeral-портов не каждая попытка попадает в 49152–65535.
+/// Портов перебирается, прежде чем сдаться (прямой bind конкретных
+/// номеров диапазона, со случайного старта).
 const PORT_DYNAMIC_ATTEMPTS: usize = 1000;
 /// Сколько [`RealAgentConnect`] ждёт соединения с агентом после wake
 /// (агент стартует при первом обращении к VM; спека §4.3 — ≤30 с).
@@ -1099,18 +1099,27 @@ fn port_busy_after_retry(profile: &BottleProfile, agent_message: &str) -> String
     }
 }
 
-/// Занимает свободный порт динамического диапазона: bind :0, пока выпавший
-/// порт не окажется в 49152–65535 (порты вне диапазона освобождаются).
+/// Занимает свободный порт динамического диапазона: прямой перебор
+/// 49152–65535 со случайного старта, `bind` конкретного номера.
+/// Эфемерный `bind :0` не используем: на Linux-хостах его диапазон
+/// (`ip_local_port_range`, обычно 32768–60999) может не пересекаться
+/// с нашим окном — на CI-раннерах лотерея :0 исчерпывала все попытки.
 fn reserve_dynamic_port() -> Result<StdTcpListener, String> {
-    for _ in 0..PORT_DYNAMIC_ATTEMPTS {
-        let listener = StdTcpListener::bind("127.0.0.1:0")
-            .map_err(|e| format!("не удалось занять слушателя: {e}"))?;
-        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-        if (PORT_DYNAMIC_MIN..=PORT_DYNAMIC_MAX).contains(&port) {
-            set_nonblocking(&listener, port)?;
-            return Ok(listener);
+    let span = u32::from(PORT_DYNAMIC_MAX - PORT_DYNAMIC_MIN) + 1;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let start = (nanos ^ std::process::id()) % span;
+    for i in 0..PORT_DYNAMIC_ATTEMPTS {
+        let port = PORT_DYNAMIC_MIN + ((start + i as u32) % span) as u16;
+        match StdTcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => {
+                set_nonblocking(&listener, port)?;
+                return Ok(listener);
+            }
+            Err(_) => continue, // порт занят — следующий номер
         }
-        drop(listener);
     }
     Err(format!(
         "не удалось подобрать порт в диапазоне {PORT_DYNAMIC_MIN}–{PORT_DYNAMIC_MAX}"

@@ -1,10 +1,13 @@
 //! Токен авторизации control-канала: создание и чтение файла.
 
 use std::fs;
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{self, Write};
 use std::path::Path;
 
-/// Источник энтропии для нового токена.
+/// Источник энтропии для нового токена (unix; на Windows — getrandom).
+#[cfg(unix)]
 const RANDOM_SOURCE: &str = "/dev/urandom";
 
 /// Размер токена в байтах до hex-кодирования (hex — 64 символа).
@@ -12,7 +15,8 @@ const TOKEN_BYTES: usize = 32;
 
 /// Загружает токен из `path` или создаёт новый.
 ///
-/// Если файла нет: читаются 32 случайных байта из `/dev/urandom`,
+/// Если файла нет: читаются 32 случайных байта из системного CSPRNG
+/// (`/dev/urandom` на unix, getrandom/BCryptGenRandom на Windows),
 /// hex-кодируются и записываются в файл с правами 0600
 /// (родительский каталог создаётся с режимом по умолчанию 0755).
 /// Если файл есть: содержимое читается, пробелы по краям игнорируются.
@@ -52,10 +56,20 @@ fn create_token(path: &Path) -> io::Result<String> {
 }
 
 /// Читает `n` случайных байтов из системного источника энтропии.
+#[cfg(unix)]
 fn random_bytes(n: usize) -> io::Result<Vec<u8>> {
     let mut file = fs::File::open(RANDOM_SOURCE)?;
     let mut buf = vec![0u8; n];
     file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// `n` случайных байтов системного CSPRNG (Windows: BCryptGenRandom
+/// через getrandom — `/dev/urandom` там не существует).
+#[cfg(not(unix))]
+fn random_bytes(n: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    getrandom::fill(&mut buf).map_err(|e| io::Error::other(e.to_string()))?;
     Ok(buf)
 }
 
