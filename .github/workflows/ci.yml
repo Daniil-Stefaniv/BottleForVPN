@@ -1,8 +1,21 @@
 name: CI
 
+# Экономия Actions-минут (приватный репо: Windows ×2, macOS ×10):
+#   PR            — только дешёвый ubuntu-гейт (rust-checks);
+#   push в main   — ubuntu-джобы (rust-checks, agent-integration,
+#                   appliance-build);
+#   тег v* / кнопка (workflow_dispatch) — полный конвейер: Windows,
+#   macOS, WSL-срез и релизные джобы.
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rust-checks:
@@ -17,6 +30,8 @@ jobs:
 
   windows-checks:
     runs-on: windows-latest
+    # Дорогой раннер (×2): только теги и ручной запуск.
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,6 +71,8 @@ jobs:
   # реальный UDS-круг сервер+клиент (Task 7) + явный check aarch64.
   macos-checks:
     runs-on: macos-14
+    # Самый дорогой раннер (×10): только теги и ручной запуск.
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,6 +85,8 @@ jobs:
 
   agent-integration:
     runs-on: ubuntu-latest
+    # Дёшево (×1), но долго: на PR не гоняем, гейт PR — rust-checks.
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -81,6 +100,8 @@ jobs:
 
   appliance-build:
     runs-on: ubuntu-latest
+    # Дёшево (×1): main, теги, ручной запуск; на PR не нужно.
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
       # Сборка rootfs-апплайенса (Alpine + bottle-agent) и smoke внутри docker.
@@ -103,6 +124,8 @@ jobs:
           - os: macos-14
             binary: bottle-gui
     runs-on: ${{ matrix.os }}
+    # Windows + macOS (×2/×10): только теги и ручной запуск.
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -146,6 +169,8 @@ jobs:
     runs-on: windows-latest
     needs: appliance-build
     continue-on-error: true
+    # Долгий и дорогой (×2): только теги и ручной запуск.
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
