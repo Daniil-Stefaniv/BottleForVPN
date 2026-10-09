@@ -245,6 +245,11 @@ pub async fn tunnel_up_wg(h: &mut NetnsHandle, cfg: ParsedWg) -> Result<(), Agen
 
     let child = Command::new("ip")
         .args(["netns", "exec", &ns, "wireguard-go", &iface])
+        // Без foreground wireguard-go демонизируется: прямой потомок
+        // (`ip netns exec …`) сразу завершается, и wait_wg_ready
+        // принимает это за падение туннеля. Плюс foreground глушит
+        // stderr-баннер про kernel-поддержку WireGuard.
+        .env("WG_PROCESS_FOREGROUND", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
