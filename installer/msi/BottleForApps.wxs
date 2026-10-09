@@ -74,10 +74,10 @@
         <File Id="bottled.exe" Source="$(BuildDir)bottled.exe" KeyPath="yes" />
       </Component>
       <Component Id="bottle_svc_exe" Guid="C3E75F4A-9B62-4DAC-BE43-7F80B12D3C56">
-        <File Id="bottle-svc.exe" Source="$(BuildDir)bottle-svc.exe" KeyPath="yes" />
+        <File Id="bottle_svc.exe" Source="$(BuildDir)bottle-svc.exe" KeyPath="yes" />
       </Component>
       <Component Id="bottle_gui_exe" Guid="A7B19D8E-5F06-4C1B-9265-B04E67A81F90">
-        <File Id="bottle-gui.exe" Source="$(GuiExePath)" Name="bottle-gui.exe" KeyPath="yes" />
+        <File Id="bottle_gui.exe" Source="$(GuiExePath)" Name="bottle-gui.exe" KeyPath="yes" />
       </Component>
       <Component Id="rootfs_tar" Directory="ApplianceDir" Guid="D4F86A5B-0C73-4EBD-AF54-8A91C23E4D67">
         <File Id="rootfs.tar.gz" Source="$(RootfsPath)" Name="bottleforapps-rootfs.tar.gz" KeyPath="yes" />
@@ -103,23 +103,27 @@
          ERROR_SERVICE_EXISTS — снимите службу вручную (bottle-svc
          с аргументом uninstall) перед MSI. -->
     <CustomAction Id="InstallSvc"
-        FileRef="bottle-svc.exe"
+        FileRef="bottle_svc.exe"
         ExeCommand="--install"
         Execute="deferred"
         Impersonate="no"
         Return="check" />
     <CustomAction Id="UninstallSvc"
-        FileRef="bottle-svc.exe"
+        FileRef="bottle_svc.exe"
         ExeCommand="--uninstall"
         Execute="deferred"
         Impersonate="no"
         Return="ignore" />
-    <!-- WSL: включение компонентов без дистрибутива. Обёртка переводит
-         3010 («нужна перезагрузка») в 0 — принудительную перезагрузку
-         не назначаем (см. шапку). -->
+    <!-- WSL: включение компонентов без дистрибутива. Обёртка на
+         PowerShell переводит 3010 («нужна перезагрузка») в 0 —
+         принудительную перезагрузку не назначаем (см. шапку).
+         powershell.exe ищется по PATH (System32\WindowsPowerShell\v1.0
+         входит в machine PATH по умолчанию): deferred-CA не может
+         сослаться на [System64Folder], а Script="PowerShell" в WiX
+         не существует (finding локальной сборки 2026-10). -->
     <CustomAction Id="EnableWsl"
-        Script="PowerShell"
-        ExeCommand="&amp; { $p = Start-Process wsl -ArgumentList '--install','--no-distribution' -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -eq 3010) { exit 0 } else { exit $p.ExitCode } }"
+        Directory="System64Folder"
+        ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -Command &quot;&amp; { $p = Start-Process wsl.exe -ArgumentList '--install','--no-distribution' -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -eq 3010) { exit 0 } else { exit $p.ExitCode } }&quot;"
         Execute="deferred"
         Impersonate="no"
         Return="check" />
@@ -128,7 +132,7 @@
          залоченной политикой машине) не должен оставлять службу,
          ссылающуюся на откатанные файлы. -->
     <CustomAction Id="RollbackSvc"
-        FileRef="bottle-svc.exe"
+        FileRef="bottle_svc.exe"
         ExeCommand="--uninstall"
         Execute="rollback"
         Impersonate="no"
