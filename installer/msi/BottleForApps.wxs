@@ -32,7 +32,7 @@
     <!-- Major upgrade: даунгрейд отвергается (Review Focus M3 #3);
          старая версия сносится до установки новой (служба успевает
          сняться её же uninstall-действием). -->
-    <MajorUpgrade DowngradeErrorMessage="Более новая версия BottleForApps уже установлена: сначала удалите её (Панель управления → Приложения)." />
+    <MajorUpgrade DowngradeErrorMessage="Более новая версия BottleForApps уже установлена: сначала удалите её (Панель управления - Приложения)." />
 
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 

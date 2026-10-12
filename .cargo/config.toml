@@ -1,0 +1,9 @@
+# Статическая линковка MSVC CRT для Windows-релизов:
+# без этого бинарники требуют VCRUNTIME140.dll (VC++ Redist), которого нет
+# на чистой Windows — установщик падал бы с STATUS_DLL_NOT_FOUND (0xC0000135).
+# Найдено smoke-прогоном MSI на свежей Windows 11 ARM64 (2026-10-12).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
