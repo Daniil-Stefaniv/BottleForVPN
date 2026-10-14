@@ -116,17 +116,15 @@ impl ClientSpawner for RealClientSpawner {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        command
-            .spawn()
-            .map(|child| {
-                // Аргументы клиентов маскируются целиком (спека §10).
-                tracing::info!(
-                    client,
-                    args = %crate::logging::mask_args(&args.join(" ")),
-                    pid = child.id(),
-                    "VPN-клиент запущен"
-                );
-            })
+        command.spawn().map(|child| {
+            // Аргументы клиентов маскируются целиком (спека §10).
+            tracing::info!(
+                client,
+                args = %crate::logging::mask_args(&args.join(" ")),
+                pid = child.id(),
+                "VPN-клиент запущен"
+            );
+        })
     }
 }
 

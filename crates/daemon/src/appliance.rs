@@ -79,7 +79,7 @@ impl RealWsl {
         // Демон может быть запущен из GUI без консоли: без этого флага
         // каждый вызов wsl.exe создавал бы видимое окно консоли.
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        // Без WSL_UTF8=1 wsl.exe печатает UTF-16LE.
+                                         // Без WSL_UTF8=1 wsl.exe печатает UTF-16LE.
         cmd.env("WSL_UTF8", "1");
         for arg in &args {
             cmd.arg(arg);
