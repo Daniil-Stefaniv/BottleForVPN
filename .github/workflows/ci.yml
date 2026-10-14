@@ -204,6 +204,10 @@ jobs:
     runs-on: windows-latest
     needs: [appliance-build, gui-build]
     if: startsWith(github.ref, 'refs/tags/v')
+    # Публикация GitHub Release: GITHUB_TOKEN нужна запись contents
+    # (иначе шаг action-gh-release падает 403 Resource not accessible).
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
