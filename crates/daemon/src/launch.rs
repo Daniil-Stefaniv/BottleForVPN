@@ -111,7 +111,16 @@ pub(crate) fn spawn_launch(command: &str) {
         tracing::warn!(command, "launch пуст — не запущен");
         return;
     };
-    match std::process::Command::new(program).args(argv).spawn() {
+    let mut process = std::process::Command::new(program);
+    process.args(argv);
+    // Демон может быть запущен из GUI без консоли: без этого флага
+    // консольный launch-процесс показывал бы окно консоли.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        process.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    match process.spawn() {
         Ok(child) => tracing::info!(command, pid = child.id(), "launch запущен"),
         Err(error) => tracing::warn!(command, %error, "не удалось запустить launch"),
     }

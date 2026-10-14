@@ -72,9 +72,13 @@ impl RealWsl {
     /// Блокирующее выполнение wsl.exe; вызывается из `spawn_blocking`.
     fn run_sync(args: Vec<String>, stdin: Option<Vec<u8>>) -> io::Result<String> {
         use std::io::Write;
+        use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
 
         let mut cmd = Command::new("wsl.exe");
+        // Демон может быть запущен из GUI без консоли: без этого флага
+        // каждый вызов wsl.exe создавал бы видимое окно консоли.
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         // Без WSL_UTF8=1 wsl.exe печатает UTF-16LE.
         cmd.env("WSL_UTF8", "1");
         for arg in &args {

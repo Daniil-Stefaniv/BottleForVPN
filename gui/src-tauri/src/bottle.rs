@@ -16,6 +16,12 @@ pub const BOTTLE_BIN_ENV: &str = "BOTTLE_GUI_BOTTLE_BIN";
 /// (CLI-транспорт сам ждёт столько же) — GUI не отрезает его раньше.
 pub const BOTTLE_TIMEOUT: Duration = Duration::from_secs(130);
 
+/// `CREATE_NO_WINDOW` (Windows): GUI — windows-подсистема без консоли,
+/// поэтому каждый спавн консольного `bottle.exe`/`bottled.exe` иначе
+/// создаёт видимое окно cmd (при периодическом refresh — «моргание»).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Результат вызова CLI для TypeScript-стороны.
 #[derive(Debug, Clone, Serialize)]
 pub struct BottleOutput {
@@ -67,11 +73,17 @@ pub async fn run_program(
     timeout: Duration,
 ) -> Result<BottleOutput, String> {
     let program = program.into();
-    let child = Command::new(&program)
+    let mut command = Command::new(&program);
+    command
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // Без CREATE_NO_WINDOW спавн консольного подпроцесса из GUI
+    // показывал бы окно cmd на каждый вызов.
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let child = command
         .spawn()
         .map_err(|error| format!("не удалось запустить {}: {error}", program.display()))?;
 

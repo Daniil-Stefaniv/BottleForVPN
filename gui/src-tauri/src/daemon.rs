@@ -15,6 +15,11 @@ pub const BOTTLED_BIN_ENV: &str = "BOTTLE_GUI_BOTTLED_BIN";
 /// Хвост журнала демона, который держит GUI (кольцо ~32 КиБ).
 const LOG_LIMIT: usize = 32 * 1024;
 
+/// `CREATE_NO_WINDOW` (Windows): GUI — windows-подсистема без консоли,
+/// спавн консольного `bottled.exe` иначе создаёт видимое окно cmd.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Статус демона для фронтенда.
 #[derive(Debug, Clone, Serialize)]
 pub struct DaemonStatus {
@@ -52,10 +57,16 @@ impl DaemonHandle {
         args: Vec<String>,
     ) -> Result<(), String> {
         let program = program.into();
-        let mut child = Command::new(&program)
+        let mut command = Command::new(&program);
+        command
             .args(&args)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // Без CREATE_NO_WINDOW старт консольного bottled из GUI
+        // показывал бы окно cmd.
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        let mut child = command
             // Демон живёт дольше GUI: kill_on_drop сознательно НЕ ставим.
             .spawn()
             .map_err(|error| format!("не удалось запустить {}: {error}", program.display()))?;

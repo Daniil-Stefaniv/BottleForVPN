@@ -193,6 +193,8 @@ pub async fn run_ps(
 /// маршрутов проходит через [`run_ps`].
 #[cfg(windows)]
 pub async fn run_ps_raw(args: &[String]) -> Result<String, RouteOpError> {
+    // Служба работает в сессии 0 без консоли: без CREATE_NO_WINDOW
+    // каждый powershell-вызов создавал бы отдельное консольное окно.
     let child = tokio::process::Command::new("powershell")
         .arg("-NoProfile")
         .arg("-NonInteractive")
@@ -202,6 +204,7 @@ pub async fn run_ps_raw(args: &[String]) -> Result<String, RouteOpError> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .spawn()
         .map_err(RouteOpError::Spawn)?;
     let output = match tokio::time::timeout(PS_TIMEOUT, child.wait_with_output()).await {

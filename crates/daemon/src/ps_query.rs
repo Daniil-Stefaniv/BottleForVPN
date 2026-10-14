@@ -119,6 +119,13 @@ fn run_with_piped_output(
     mut command: Command,
     timeout: Duration,
 ) -> io::Result<(std::process::ExitStatus, String, String)> {
+    // Демон может быть запущен из GUI без консоли: без этого флага
+    // каждый powershell-опрос показывал бы окно консоли.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
