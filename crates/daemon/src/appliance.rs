@@ -5,10 +5,10 @@
 //! отсутствие фатально — восстановить токен нельзя); свежий импорт
 //! генерирует токен, записывает его в VM (`/etc/bottle-agent/token`,
 //! stdin команды `cat`) и сохраняет локальную копию в хранилище
-//! (права 0600). Затем аплаенс будится, по `ip -4 -o addr show scope
-//! global` узнаётся его адрес в сети WSL NAT (BusyBox-совместимо —
-//! `hostname -I` в Alpine отсутствует) и открывается control-соединение
-//! с агентом:
+//! (права 0600). Затем аплаенс будится, по `/sbin/ip -4 -o addr show
+//! scope global` узнаётся его адрес в сети WSL NAT (BusyBox-совместимо —
+//! `hostname -I` в Alpine отсутствует; путь абсолютный, т.к. PATH у
+//! `wsl --exec` минимален) и открывается control-соединение с агентом:
 //! кадры [`bottle_core::frame`], handshake `Hello`/`HelloAck`.
 
 use std::fs;
@@ -107,11 +107,20 @@ impl RealWsl {
 
         let output = child.wait_with_output()?;
         if !output.status.success() {
+            // Детали обычно в stderr, но старые версии wsl.exe пишут
+            // «command not found» и т.п. в stdout — тогда берём его,
+            // иначе ошибка выходит пустой («код 1: » и тишина).
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            } else {
+                stderr
+            };
             return Err(io::Error::other(format!(
                 "wsl {} завершился с кодом {}: {}",
                 args.join(" "),
                 output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
+                detail
             )));
         }
         String::from_utf8(output.stdout)
@@ -208,7 +217,7 @@ async fn ensure_appliance_with_port(
 ) -> Result<ApplianceHandle, DaemonError> {
     let token = provision_token(wsl, store, rootfs_tar).await?;
     wake(wsl).await?;
-    let vm_ip = appliance_ip(wsl).await?;
+    let vm_ip = appliance_ip(wsl, connect_timeout).await?;
     let stream = connect_with_retries(vm_ip, port, connect_timeout).await?;
     let mut conn = Framed::new(stream, AgentCodec);
     let (_, appliance_version) = handshake(&mut conn, &token, connect_timeout).await?;
@@ -318,31 +327,60 @@ async fn wake(wsl: &dyn WslRunner) -> Result<(), DaemonError> {
 }
 
 /// IP аплаенса в сети WSL NAT — первый global-адрес из
-/// `ip -4 -o addr show scope global`.
+/// `/sbin/ip -4 -o addr show scope global` с ретраями до `timeout`.
 ///
 /// BusyBox-совместимо: аплаенс собран на Alpine, где `hostname` из
 /// BusyBox не знает флаг `-I` (GNU inetutils); `iproute2` при этом
 /// входит в образ (см. `appliance/Dockerfile`). Фильтр `scope global`
 /// отсекает loopback и link-local на стороне VM.
-async fn appliance_ip(wsl: &dyn WslRunner) -> Result<Ipv4Addr, DaemonError> {
-    let out = wsl
-        .run(
-            &[
-                "-d",
-                DISTRIBUTION,
-                "--exec",
-                "ip",
-                "-4",
-                "-o",
-                "addr",
-                "show",
-                "scope",
-                "global",
-            ],
-            None,
-        )
-        .await?;
-    // Строки вида: "2: eth0    inet 172.25.144.7/20 brd ... scope global eth0".
+///
+/// Путь абсолютный: `wsl --exec` запускает команду без логин-шелла,
+/// и PATH там минимален — на части версий WSL без /sbin, где и лежит
+/// iproute2. Ретраи нужны на холодном старте: после wake адрес на eth0
+/// появляется не мгновенно.
+async fn appliance_ip(wsl: &dyn WslRunner, timeout: Duration) -> Result<Ipv4Addr, DaemonError> {
+    let args = [
+        "-d",
+        DISTRIBUTION,
+        "--exec",
+        "/sbin/ip",
+        "-4",
+        "-o",
+        "addr",
+        "show",
+        "scope",
+        "global",
+    ];
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match wsl.run(&args, None).await {
+            Ok(out) => match parse_global_ipv4(&out) {
+                Some(ip) => return Ok(ip),
+                None if tokio::time::Instant::now() >= deadline => {
+                    return Err(DaemonError::Appliance(format!(
+                        "/sbin/ip -4 -o addr show scope global: нет global IPv4 в выводе: {out:?}"
+                    )));
+                }
+                None => {
+                    tracing::debug!(%out, "global IPv4 ещё нет, повтор");
+                }
+            },
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(DaemonError::Appliance(format!(
+                        "не удалось получить адрес аплаенса за {timeout:?}: {e}"
+                    )));
+                }
+                tracing::debug!(error = %e, "запрос адреса аплаенса не удался, повтор");
+            }
+        }
+        tokio::time::sleep(CONNECT_RETRY_STEP).await;
+    }
+}
+
+/// Первый IPv4 из вывода `ip -4 -o addr show scope global`:
+/// строки вида "2: eth0    inet 172.25.144.7/20 brd ... scope global eth0".
+fn parse_global_ipv4(out: &str) -> Option<Ipv4Addr> {
     for line in out.lines() {
         let mut parts = line.split_whitespace();
         while let Some(part) = parts.next() {
@@ -353,13 +391,11 @@ async fn appliance_ip(wsl: &dyn WslRunner) -> Result<Ipv4Addr, DaemonError> {
                 break;
             };
             if let Ok(ip) = raw.split('/').next().unwrap_or("").parse::<Ipv4Addr>() {
-                return Ok(ip);
+                return Some(ip);
             }
         }
     }
-    Err(DaemonError::Appliance(format!(
-        "ip -4 -o addr show scope global: нет global IPv4 в выводе: {out:?}"
-    )))
+    None
 }
 
 /// Подключается к агенту с ретраями весь `timeout` (шаг 500 мс):
@@ -690,11 +726,13 @@ mod tests {
                     }
                     // wake: `wsl -d bottleforapps --exec /bin/true`
                     Some(&"/bin/true") => return Ok(String::new()),
-                    // `ip -4 -o addr show scope global`: первый global-адрес
-                    // — 127.0.0.1, чтобы демон подключился к фейк-агенту на
-                    // localhost; вторая строка проверяет, что берётся именно
-                    // первый адрес, а не последний.
-                    Some(&"ip") if args[4..] == ["-4", "-o", "addr", "show", "scope", "global"] => {
+                    // `/sbin/ip -4 -o addr show scope global`: первый
+                    // global-адрес — 127.0.0.1, чтобы демон подключился к
+                    // фейк-агенту на localhost; вторая строка проверяет,
+                    // что берётся именно первый адрес, а не последний.
+                    Some(&"/sbin/ip")
+                        if args[4..] == ["-4", "-o", "addr", "show", "scope", "global"] =>
+                    {
                         return Ok(concat!(
                             "2: eth0    inet 127.0.0.1/20 brd 127.0.0.255 scope global eth0\n",
                             "3: eth1    inet 192.168.77.99/24 brd 192.168.77.255 scope global eth1\n"
@@ -944,7 +982,7 @@ mod tests {
         assert!(wake < ip_addr, "wake до ip addr: {calls:?}");
         assert_eq!(
             calls[ip_addr].args()[3..],
-            ["ip", "-4", "-o", "addr", "show", "scope", "global"]
+            ["/sbin/ip", "-4", "-o", "addr", "show", "scope", "global"]
         );
 
         // Фейк-агент сверил токен Hello с записанным в VM (assert внутри
@@ -1083,7 +1121,7 @@ mod tests {
             if args == ["-l", "-q"] {
                 return Ok(format!("{DISTRIBUTION}\n"));
             }
-            if args.first() == Some(&"-d") && args.get(3) == Some(&"ip") {
+            if args.first() == Some(&"-d") && args.get(3) == Some(&"/sbin/ip") {
                 // Ни одной строки с global IPv4: только link-local inet6.
                 return Ok("2: eth0    inet6 fe80::1/64 scope link".to_string());
             }
@@ -1097,6 +1135,7 @@ mod tests {
         std::fs::write(store.appliance_token_path(), "local-token\n").unwrap();
         let wsl = GarbageIpWsl;
 
+        // connect_timeout=1с — он же дедлайн ретраев опроса адреса.
         let error =
             ensure_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(1), AGENT_PORT)
                 .await
