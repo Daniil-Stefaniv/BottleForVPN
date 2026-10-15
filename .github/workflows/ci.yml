@@ -323,8 +323,13 @@ jobs:
         shell: pwsh
         run: |
           if (Test-Path 'C:\Program Files\BottleForApps') { throw 'каталог Program Files\BottleForApps пережил uninstall' }
-          sc.exe query BottleForAppsRouteHelper
-          if ($LASTEXITCODE -eq 0) { throw 'служба пережила uninstall' }
+          sc.exe query BottleForAppsRouteHelper | Out-Null
+          $svcSurvived = $LASTEXITCODE -eq 0
+          # sc.exe на отсутствующей службе выходит с 1060 — это ожидаемо,
+          # но Actions роняет шаг по ненулевому $LASTEXITCODE в конце
+          # скрипта; сбрасываем ПОСЛЕ проверки.
+          $global:LASTEXITCODE = 0
+          if ($svcSurvived) { throw 'служба пережила uninstall' }
       - name: Portable — распаковка и отклик
         shell: pwsh
         run: |
@@ -344,3 +349,7 @@ jobs:
           } finally {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           }
+          # doctor может отчитаться предупреждениями с ненулевым кодом —
+          # это норма на CI без WSL; шаг ронять нельзя (см. выше про
+          # $LASTEXITCODE в конце pwsh-скрипта).
+          $global:LASTEXITCODE = 0
