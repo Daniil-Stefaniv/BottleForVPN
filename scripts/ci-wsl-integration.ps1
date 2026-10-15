@@ -1,4 +1,4 @@
-﻿# ci-wsl-integration.ps1 — WSL-интеграционный сценарий CI (задача 18, M1).
+# ci-wsl-integration.ps1 — WSL-интеграционный сценарий CI (задача 18, M1).
 #
 # Полный вертикальный срез env-бутылки на windows-раннере:
 #   1) импорт rootfs-апплайенса как дистрибутива `bottleforapps-ci`;
@@ -238,7 +238,8 @@ ip netns exec srv ip route add 10.99.0.2/32 dev bfa-wgsrv
 
 # (7) Endpoint клиента = IP eth0 VM: UDP 51820 на этот адрес DNAT-ится
 #     в srv (зашифрованный трафик туннеля идёт «через физику» VM).
-vm_ip="$(hostname -I | awk '{print $1}')"
+#     IP — через iproute2: в Alpine/BusyBox `hostname -I` отсутствует.
+vm_ip="$(ip -4 -o addr show dev eth0 | awk '{split($4,a,"/"); print a[1]}')"
 iptables -t nat -A PREROUTING -d "$vm_ip" -p udp --dport 51820 \
     -j DNAT --to-destination 10.77.253.1:51820
 iptables -A FORWARD -d 10.77.253.0/30 -j ACCEPT
