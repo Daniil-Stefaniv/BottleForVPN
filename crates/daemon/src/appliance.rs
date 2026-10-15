@@ -5,8 +5,10 @@
 //! отсутствие фатально — восстановить токен нельзя); свежий импорт
 //! генерирует токен, записывает его в VM (`/etc/bottle-agent/token`,
 //! stdin команды `cat`) и сохраняет локальную копию в хранилище
-//! (права 0600). Затем аплаенс будится, по `hostname -I` узнаётся его
-//! адрес в сети WSL NAT и открывается control-соединение с агентом:
+//! (права 0600). Затем аплаенс будится, по `ip -4 -o addr show scope
+//! global` узнаётся его адрес в сети WSL NAT (BusyBox-совместимо —
+//! `hostname -I` в Alpine отсутствует) и открывается control-соединение
+//! с агентом:
 //! кадры [`bottle_core::frame`], handshake `Hello`/`HelloAck`.
 
 use std::fs;
@@ -176,6 +178,12 @@ async fn upgrade_appliance_with_port(
     connect_timeout: Duration,
     port: u16,
 ) -> Result<String, DaemonError> {
+    // Сначала гасим VM: --unregister по работающей дистрибуции может не
+    // снять регистрацию (VHD заблокирован), и последующий --import упадёт
+    // с невнятным «дистрибуция уже существует» (exit code 0xffffffff).
+    if let Err(error) = wsl.run(&["--terminate", DISTRIBUTION], None).await {
+        tracing::warn!(%error, "wsl --terminate не удался (дистрибуции нет?) — продолжаю");
+    }
     if let Err(error) = wsl.run(&["--unregister", DISTRIBUTION], None).await {
         tracing::warn!(%error, "wsl --unregister не удался (дистрибуции нет?) — продолжаю");
     }
@@ -242,7 +250,17 @@ async fn provision_token(
         ],
         None,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        // Частый случай — «дистрибуция уже существует» (код 0xffffffff)
+        // после прерванной установки: голый вывод wsl.exe ничего не
+        // объясняет пользователю, поэтому добавляем путь восстановления.
+        DaemonError::Appliance(format!(
+            "не удалось импортировать дистрибуцию {DISTRIBUTION}: {e}. \
+             Если она уже существует (например, после прерванной установки), \
+             выполните `wsl --unregister {DISTRIBUTION}` и повторите, либо `bottle upgrade`"
+        ))
+    })?;
     tracing::info!(
         distribution = DISTRIBUTION,
         "дистрибутив аплаенса импортирован"
@@ -299,17 +317,49 @@ async fn wake(wsl: &dyn WslRunner) -> Result<(), DaemonError> {
     Ok(())
 }
 
-/// IP аплаенса в сети WSL NAT — первый адрес из `hostname -I`.
+/// IP аплаенса в сети WSL NAT — первый global-адрес из
+/// `ip -4 -o addr show scope global`.
+///
+/// BusyBox-совместимо: аплаенс собран на Alpine, где `hostname` из
+/// BusyBox не знает флаг `-I` (GNU inetutils); `iproute2` при этом
+/// входит в образ (см. `appliance/Dockerfile`). Фильтр `scope global`
+/// отсекает loopback и link-local на стороне VM.
 async fn appliance_ip(wsl: &dyn WslRunner) -> Result<Ipv4Addr, DaemonError> {
     let out = wsl
-        .run(&["-d", DISTRIBUTION, "--exec", "hostname", "-I"], None)
+        .run(
+            &[
+                "-d",
+                DISTRIBUTION,
+                "--exec",
+                "ip",
+                "-4",
+                "-o",
+                "addr",
+                "show",
+                "scope",
+                "global",
+            ],
+            None,
+        )
         .await?;
-    let first = out.split_whitespace().next().ok_or_else(|| {
-        DaemonError::Appliance(format!("hostname -I вернул пустой вывод: {out:?}"))
-    })?;
-    first
-        .parse::<Ipv4Addr>()
-        .map_err(|_| DaemonError::Appliance(format!("hostname -I вернул не IPv4: {first}")))
+    // Строки вида: "2: eth0    inet 172.25.144.7/20 brd ... scope global eth0".
+    for line in out.lines() {
+        let mut parts = line.split_whitespace();
+        while let Some(part) = parts.next() {
+            if part != "inet" {
+                continue;
+            }
+            let Some(raw) = parts.next() else {
+                break;
+            };
+            if let Ok(ip) = raw.split('/').next().unwrap_or("").parse::<Ipv4Addr>() {
+                return Ok(ip);
+            }
+        }
+    }
+    Err(DaemonError::Appliance(format!(
+        "ip -4 -o addr show scope global: нет global IPv4 в выводе: {out:?}"
+    )))
 }
 
 /// Подключается к агенту с ретраями весь `timeout` (шаг 500 мс):
@@ -411,7 +461,7 @@ async fn read_reply(
 /// Запросы уходят кадрами [`bottle_core::frame`], ответы читаются
 /// последовательно (контрол-протокол — strict request-response).
 pub struct ApplianceHandle {
-    /// IP аплаенса в сети WSL NAT (из `hostname -I`).
+    /// IP аплаенса в сети WSL NAT (из `ip addr`, см. [`appliance_ip`]).
     pub vm_ip: Ipv4Addr,
     /// Версия аплаенса из `HelloAck` (для сводок и диагностики).
     pub appliance_version: String,
@@ -610,6 +660,9 @@ mod tests {
                     },
                 );
             }
+            if args.first() == Some(&"--terminate") {
+                return Ok(String::new());
+            }
             if args.first() == Some(&"--unregister") {
                 self.installed
                     .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -637,8 +690,16 @@ mod tests {
                     }
                     // wake: `wsl -d bottleforapps --exec /bin/true`
                     Some(&"/bin/true") => return Ok(String::new()),
-                    Some(&"hostname") if args[4..] == ["-I"] => {
-                        return Ok("127.0.0.1 192.168.77.99\n".to_string());
+                    // `ip -4 -o addr show scope global`: первый global-адрес
+                    // — 127.0.0.1, чтобы демон подключился к фейк-агенту на
+                    // localhost; вторая строка проверяет, что берётся именно
+                    // первый адрес, а не последний.
+                    Some(&"ip") if args[4..] == ["-4", "-o", "addr", "show", "scope", "global"] => {
+                        return Ok(concat!(
+                            "2: eth0    inet 127.0.0.1/20 brd 127.0.0.255 scope global eth0\n",
+                            "3: eth1    inet 192.168.77.99/24 brd 192.168.77.255 scope global eth1\n"
+                        )
+                        .to_string());
                     }
                     _ => {}
                 }
@@ -856,7 +917,7 @@ mod tests {
         }
 
         // Последовательность вызовов: листинг → импорт → запись токена
-        // в VM → wake → hostname.
+        // в VM → wake → ip addr.
         let calls = wsl.calls();
         assert_eq!(calls[0].args(), ["-l", "-q"], "всё начинается с листинга");
 
@@ -877,11 +938,14 @@ mod tests {
         );
 
         let wake = position(&calls, "/bin/true");
-        let hostname = position(&calls, "hostname");
+        let ip_addr = position(&calls, "scope");
         assert!(import < token_write, "импорт до записи токена: {calls:?}");
         assert!(token_write < wake, "запись токена до wake: {calls:?}");
-        assert!(wake < hostname, "wake до hostname -I: {calls:?}");
-        assert_eq!(calls[hostname].args()[3..], ["hostname", "-I"]);
+        assert!(wake < ip_addr, "wake до ip addr: {calls:?}");
+        assert_eq!(
+            calls[ip_addr].args()[3..],
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"]
+        );
 
         // Фейк-агент сверил токен Hello с записанным в VM (assert внутри
         // сценария); локальная копия совпадает с записанным в VM.
@@ -915,11 +979,16 @@ mod tests {
             "версия из HelloAck нового аплаенса"
         );
         let calls = wsl.calls();
+        let terminate = position(&calls, "--terminate");
         let unregister = position(&calls, "--unregister");
         assert_eq!(
             calls[unregister].args(),
             ["--unregister", DISTRIBUTION],
             "сносится только дистрибуция аплаенса"
+        );
+        assert!(
+            terminate < unregister,
+            "VM гасится до снятия регистрации: {calls:?}"
         );
         let import = position(&calls, "--import");
         assert!(unregister < import, "unregister до пере-импорта: {calls:?}");
@@ -999,8 +1068,43 @@ mod tests {
             "wake нужен"
         );
         assert!(
-            calls.iter().any(|c| c.args().contains(&"hostname")),
-            "hostname -I нужен"
+            calls.iter().any(|c| c.args().contains(&"scope")),
+            "ip addr нужен"
+        );
+    }
+
+    /// WslRunner, отвечающий мусором на `ip addr`: проверка, что
+    /// разбор вывода не паникует и возвращает понятную ошибку.
+    struct GarbageIpWsl;
+
+    #[async_trait]
+    impl WslRunner for GarbageIpWsl {
+        async fn run(&self, args: &[&str], _stdin: Option<Vec<u8>>) -> io::Result<String> {
+            if args == ["-l", "-q"] {
+                return Ok(format!("{DISTRIBUTION}\n"));
+            }
+            if args.first() == Some(&"-d") && args.get(3) == Some(&"ip") {
+                // Ни одной строки с global IPv4: только link-local inet6.
+                return Ok("2: eth0    inet6 fe80::1/64 scope link".to_string());
+            }
+            Ok(String::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn appliance_ip_without_global_ipv4_is_clear_error() {
+        let (_tmp, store, rootfs) = test_store();
+        std::fs::write(store.appliance_token_path(), "local-token\n").unwrap();
+        let wsl = GarbageIpWsl;
+
+        let error =
+            ensure_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(1), AGENT_PORT)
+                .await
+                .expect_err("нет global IPv4 — понятная ошибка");
+
+        assert!(
+            matches!(&error, DaemonError::Appliance(message) if message.contains("нет global IPv4")),
+            "ожидалась Appliance-ошибка с диагностикой разбора: {error}"
         );
     }
 
