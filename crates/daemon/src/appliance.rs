@@ -226,15 +226,14 @@ async fn upgrade_appliance_with_port(
     connect_timeout: Duration,
     port: u16,
 ) -> Result<String, DaemonError> {
-    // Сначала гасим VM: --unregister по работающей дистрибуции может не
-    // снять регистрацию (VHD заблокирован), и последующий --import упадёт
-    // с невнятным «дистрибуция уже существует» (exit code 0xffffffff).
-    if let Err(error) = wsl.run(&["--terminate", DISTRIBUTION], None).await {
-        tracing::warn!(%error, "wsl --terminate не удался (дистрибуции нет?) — продолжаю");
-    }
-    if let Err(error) = wsl.run(&["--unregister", DISTRIBUTION], None).await {
-        tracing::warn!(%error, "wsl --unregister не удался (дистрибуции нет?) — продолжаю");
-    }
+    // Сначала гасим VM и снимаем регистрацию: --unregister по работающей
+    // дистрибуции может не отработать (VHD заблокирован), и последующий
+    // --import упадёт с невнятным «дистрибуция уже существует» (exit code
+    // 0xffffffff). Обязательно проверяем листинг ПОСЛЕ unregister и до
+    // удаления локального токена — иначе при неудачном unregister демон
+    // встретит старую дистрибуцию без токена и ответит «токен утерян»
+    // (наблюдалось на inbox wsl.exe, 0.2.4).
+    unregister_appliance(wsl).await?;
     match fs::remove_file(store.appliance_token_path()) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -242,6 +241,38 @@ async fn upgrade_appliance_with_port(
     }
     let handle = ensure_appliance_with_port(wsl, store, rootfs_tar, connect_timeout, port).await?;
     Ok(handle.appliance_version)
+}
+
+/// Гасит VM и снимает регистрацию дистрибуции аплаенса с проверкой
+/// результата: после каждой попытки смотрит `wsl -l -q`. Вторая попытка —
+/// с паузой, VM отпускает VHD не мгновенно. Ошибка — с ручной инструкцией;
+/// вызывающий при этом НЕ удаляет локальный токен.
+async fn unregister_appliance(wsl: &dyn WslRunner) -> Result<(), DaemonError> {
+    for attempt in 0..2 {
+        if let Err(error) = wsl.run(&["--terminate", DISTRIBUTION], None).await {
+            tracing::warn!(%error, "wsl --terminate не удался (дистрибуции нет?) — продолжаю");
+        }
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if let Err(error) = wsl.run(&["--unregister", DISTRIBUTION], None).await {
+            tracing::warn!(%error, "wsl --unregister не удался (дистрибуции нет?) — продолжаю");
+        }
+        match wsl.run(&["-l", "-q"], None).await {
+            Ok(listing) if !is_installed(&listing) => return Ok(()),
+            Ok(_) => {
+                tracing::warn!(attempt, "дистрибуция пережила unregister — повторяю")
+            }
+            Err(error) => {
+                tracing::warn!(attempt, %error, "не удалось проверить листинг после unregister")
+            }
+        }
+    }
+    Err(DaemonError::Appliance(format!(
+        "не удалось снять регистрацию дистрибуции {DISTRIBUTION} — \
+         выполните `wsl --shutdown`, затем `wsl --unregister {DISTRIBUTION}` \
+         вручную и повторите `bottle upgrade`"
+    )))
 }
 
 /// Реализация [`ensure_appliance`] с настраиваемым портом агента:
@@ -280,7 +311,7 @@ async fn provision_token(
 ) -> Result<String, DaemonError> {
     let listing = wsl.run(&["-l", "-q"], None).await?;
     if is_installed(&listing) {
-        return local_token(store);
+        return local_token(wsl, store).await;
     }
 
     let token = generate_token()?;
@@ -309,7 +340,7 @@ async fn provision_token(
                 error = %e,
                 "wsl --import отказал, но дистрибутив уже существует — используем её"
             );
-            return local_token(store);
+            return local_token(wsl, store).await;
         }
         return Err(DaemonError::Appliance(format!(
             "не удалось импортировать дистрибуцию {DISTRIBUTION}: {e}. \
@@ -328,13 +359,47 @@ async fn provision_token(
 }
 
 /// Читает токен из локальной копии хранилища (ветка «дистрибутив уже
-/// импортирован»): `NotFound` превращается в [`DaemonError::ApplianceTokenLost`].
-fn local_token(store: &Store) -> Result<String, DaemonError> {
+/// импортирован»). Локальная копия утеряна (например, upgrade 0.2.4 мог
+/// удалить её при неудачном unregister) — токен восстанавливается из VM,
+/// где агент хранит его в `/etc/bottle-agent/token`; если и там его нет —
+/// [`DaemonError::ApplianceTokenLost`].
+async fn local_token(wsl: &dyn WslRunner, store: &Store) -> Result<String, DaemonError> {
     match read_local_token(store) {
         Ok(token) => Ok(token),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(DaemonError::ApplianceTokenLost),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => read_token_from_vm(wsl, store).await,
         Err(e) => Err(e.into()),
     }
+}
+
+/// Восстанавливает утерянную локальную копию токена из VM (агент читает
+/// тот же файл, так что handshake пройдёт) и сохраняет её в хранилище.
+/// Токен читается выводом `cat` — не аргументом, чтобы не светить секрет
+/// в списке процессов хоста.
+async fn read_token_from_vm(wsl: &dyn WslRunner, store: &Store) -> Result<String, DaemonError> {
+    let raw = wsl
+        .run(
+            &[
+                "-d",
+                DISTRIBUTION,
+                "--exec",
+                "/bin/cat",
+                "/etc/bottle-agent/token",
+            ],
+            None,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "не удалось прочитать токен из VM");
+            DaemonError::ApplianceTokenLost
+        })?;
+    let token = raw.trim();
+    if token.is_empty() {
+        tracing::warn!("файл токена в VM пуст");
+        return Err(DaemonError::ApplianceTokenLost);
+    }
+    crate::store::atomic_write(&store.appliance_token_path(), token.as_bytes())?;
+    tracing::info!("локальная копия токена аплаенса восстановлена из VM");
+    Ok(token.to_string())
 }
 
 /// Читает локальную копию токена (пробелы по краям игнорируются).
@@ -716,6 +781,9 @@ mod tests {
         /// Дистрибуция уже импортирован (что вернёт `wsl -l -q`);
         /// `--unregister` сбрасывает флаг.
         installed: std::sync::atomic::AtomicBool,
+        /// Сколько первых вызовов `--unregister` НЕ снимают регистрацию
+        /// (симптом: VHD заблокирован работающей VM).
+        unregister_failures: std::sync::atomic::AtomicUsize,
         calls: Mutex<Vec<Call>>,
         token: SharedToken,
     }
@@ -724,6 +792,7 @@ mod tests {
         fn new(installed: bool) -> Self {
             Self {
                 installed: std::sync::atomic::AtomicBool::new(installed),
+                unregister_failures: std::sync::atomic::AtomicUsize::new(0),
                 calls: Mutex::new(Vec::new()),
                 token: SharedToken::default(),
             }
@@ -757,8 +826,15 @@ mod tests {
                 return Ok(String::new());
             }
             if args.first() == Some(&"--unregister") {
-                self.installed
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                use std::sync::atomic::Ordering::SeqCst;
+                if self.unregister_failures.load(SeqCst) > 0 {
+                    // VHD заблокирован: регистрация не снимается,
+                    // wsl при этом отвечает успехом (0xffffffff бывает,
+                    // но чаще молчаливая неудача на inbox wsl.exe).
+                    self.unregister_failures.fetch_sub(1, SeqCst);
+                    return Ok(String::new());
+                }
+                self.installed.store(false, SeqCst);
                 return Ok(String::new());
             }
             if args.first() == Some(&"--import") {
@@ -783,6 +859,17 @@ mod tests {
                     }
                     // wake: `wsl -d bottleforapps --exec /bin/true`
                     Some(&"/bin/true") => return Ok(String::new()),
+                    // Восстановление токена из VM:
+                    // `wsl -d bottleforapps --exec /bin/cat /etc/bottle-agent/token`
+                    Some(&"/bin/cat") => {
+                        return match self.token.get() {
+                            Some(token) => Ok(format!("{token}\n")),
+                            None => Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "cat: /etc/bottle-agent/token: No such file or directory",
+                            )),
+                        };
+                    }
                     // `/sbin/ip -4 -o addr show scope global`: первый
                     // global-адрес — 127.0.0.1, чтобы демон подключился к
                     // фейк-агенту на localhost; вторая строка проверяет,
@@ -1120,6 +1207,132 @@ mod tests {
             result.is_ok(),
             "без дистрибуции upgrade = свежий импорт: {result:?}"
         );
+    }
+
+    /// unregister по работающей VM молча не снимает регистрацию (VHD
+    /// заблокирован, inbox wsl.exe): upgrade повторяет terminate+unregister
+    /// и со второй попытки доводит пере-импорт до конца.
+    #[tokio::test]
+    async fn upgrade_retries_sticky_unregister_and_succeeds() {
+        let (_tmp, store, rootfs) = test_store();
+        std::fs::write(store.appliance_token_path(), "old-token\n").unwrap();
+        let wsl = FakeWsl::new(true);
+        wsl.token.set("old-token".to_string());
+        wsl.unregister_failures
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let addr = spawn_fake_agent(
+            AgentScenario::Happy {
+                answer_requests: usize::MAX,
+            },
+            wsl.token.clone(),
+        )
+        .await;
+
+        let new_version =
+            upgrade_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
+                .await
+                .expect("вторая попытка unregister успешна");
+
+        assert_eq!(new_version, "0.1.0-test");
+        let calls = wsl.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.args()[0] == "--unregister")
+                .count(),
+            2,
+            "unregister вызван дважды: {calls:?}"
+        );
+        let new_token = std::fs::read_to_string(store.appliance_token_path())
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_ne!(new_token, "old-token", "токен перегенерирован");
+    }
+
+    /// Дистрибуция пережила обе попытки unregister: upgrade отвечает
+    /// понятной ошибкой с ручной инструкцией и НЕ удаляет локальный токен
+    /// (0.2.4 удалял — дистрибутив оставалась без токена, «токен утерян»).
+    #[tokio::test]
+    async fn upgrade_with_stuck_distribution_fails_keeping_local_token() {
+        let (_tmp, store, rootfs) = test_store();
+        std::fs::write(store.appliance_token_path(), "old-token\n").unwrap();
+        let wsl = FakeWsl::new(true);
+        wsl.unregister_failures
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+
+        let error = upgrade_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), 1)
+            .await
+            .expect_err("застрявшая дистрибуция — ошибка");
+
+        assert!(
+            error.to_string().contains("wsl --unregister"),
+            "ручная инструкция в тексте: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.appliance_token_path())
+                .unwrap()
+                .trim(),
+            "old-token",
+            "локальный токен не удалён при неудачном unregister"
+        );
+        let calls = wsl.calls();
+        assert!(
+            !calls.iter().any(|c| c.args()[0] == "--import"),
+            "импорт не начинается, пока старая дистрибуция жива: {calls:?}"
+        );
+    }
+
+    /// Локальная копия токена утеряна (upgrade 0.2.4 при неудачном
+    /// unregister): токен читается из VM, handshake проходит, локальная
+    /// копия восстанавливается.
+    #[tokio::test]
+    async fn lost_local_token_is_recovered_from_vm() {
+        let (_tmp, store, rootfs) = test_store();
+        let wsl = FakeWsl::new(true);
+        wsl.token.set("vm-token".to_string());
+        let addr = spawn_fake_agent(
+            AgentScenario::Happy {
+                answer_requests: usize::MAX,
+            },
+            wsl.token.clone(),
+        )
+        .await;
+
+        let token = provision_token(&wsl, &store, &rootfs)
+            .await
+            .expect("токен восстановлен из VM");
+
+        assert_eq!(token, "vm-token");
+        assert_eq!(
+            std::fs::read_to_string(store.appliance_token_path())
+                .unwrap()
+                .trim(),
+            "vm-token",
+            "локальная копия восстановлена"
+        );
+        let calls = wsl.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.args().len() > 3 && c.args()[3] == "/bin/cat"),
+            "токен прочитан из VM: {calls:?}"
+        );
+        let _ = addr; // handshake не нужен — проверяется сам provision_token
+    }
+
+    /// Ни локальной копии, ни токена в VM (битый импорт) — честный
+    /// ApplianceTokenLost с советом `wsl --unregister`.
+    #[tokio::test]
+    async fn lost_local_token_without_vm_copy_is_token_lost() {
+        let (_tmp, store, rootfs) = test_store();
+        let wsl = FakeWsl::new(true);
+
+        let error = provision_token(&wsl, &store, &rootfs)
+            .await
+            .expect_err("токена нет нигде");
+
+        assert!(matches!(error, DaemonError::ApplianceTokenLost));
     }
 
     #[tokio::test]
