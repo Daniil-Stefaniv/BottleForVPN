@@ -301,6 +301,44 @@ async fn create_bottle(store: &Store, profile: &BottleProfile, force: bool) -> C
             ),
         };
     }
+    // OpenVPN-конфиг делается самодостаточным до сохранения: внешние
+    // файлы (ca/cert/key/tls-auth…) инлайнятся в хранимую копию — они не
+    // копируются в хранилище, и openvpn в аплаенсе умирал с невнятным
+    // «процесс завершился до создания tun0» (наблюдалось в 0.2.5).
+    // `auth-user-pass <файл>` приводится к голой форме — креды не
+    // хранятся, они запрашиваются при каждом старте.
+    if let bottle_core::profile::VpnConfig::Env {
+        protocol: bottle_core::profile::TunnelProtocol::OpenVpn,
+        config,
+    } = &profile.vpn
+    {
+        let source = std::path::Path::new(config.as_str());
+        let text = match std::fs::read_to_string(source) {
+            Ok(text) => text,
+            Err(error) => {
+                return CliReply::Error {
+                    message: format!("не удалось прочитать конфиг {config}: {error}"),
+                }
+            }
+        };
+        let base = source.parent().unwrap_or(std::path::Path::new("."));
+        let inlined = match bottle_core::profile::inline_openvpn_config(&text, base) {
+            Ok(inlined) => inlined,
+            Err(error) => {
+                return CliReply::Error {
+                    message: format!("конфиг OpenVPN: {error}"),
+                }
+            }
+        };
+        return match store.save_with_config_text(profile, &inlined) {
+            Ok(()) => CliReply::Created {
+                id: profile.id.clone(),
+            },
+            Err(error) => CliReply::Error {
+                message: error.to_string(),
+            },
+        };
+    }
     match store.save(profile) {
         Ok(()) => CliReply::Created {
             id: profile.id.clone(),
@@ -471,6 +509,16 @@ mod tests {
                 launch: Some("mstsc".to_string()),
             },
         }
+    }
+
+    /// Env-профиль OpenVPN (конфиг ссылается на внешние файлы).
+    fn env_openvpn_profile(id: &str, config: &str) -> BottleProfile {
+        let mut profile = env_profile(id, config);
+        profile.vpn = VpnConfig::Env {
+            protocol: TunnelProtocol::OpenVpn,
+            config: config.to_string(),
+        };
+        profile
     }
 
     /// Host-профиль (не требует файла конфига в хранилище).
@@ -675,6 +723,84 @@ endpoints = ["e.example"]
             "wg-secret"
         );
         assert!(root.join("bottles").join("office-a.toml").exists());
+    }
+
+    /// OpenVPN create: внешние файлы (ca, tls-auth) инлайнятся в хранимую
+    /// копию конфига; `auth-user-pass <файл>` приводится к голой форме.
+    #[tokio::test]
+    async fn create_openvpn_inlines_referenced_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("ca.crt"), "CA-PEM\n").unwrap();
+        fs::write(tmp.path().join("login.txt"), "user\npass\n").unwrap();
+        let src = tmp.path().join("corp.ovpn");
+        fs::write(
+            &src,
+            "client\nremote vpn.example 443\nca ca.crt\nauth-user-pass login.txt\n",
+        )
+        .unwrap();
+        let root = tmp.path().join("store");
+        let store = Store::open(&root).unwrap();
+
+        let reply = dispatch(
+            &store,
+            None,
+            None,
+            None,
+            CliRequest::Create {
+                profile: env_openvpn_profile("corp", src.to_str().unwrap()),
+                force: false,
+            },
+        )
+        .await;
+
+        assert_eq!(reply, CliReply::Created { id: "corp".into() });
+        let stored = fs::read_to_string(root.join("bottles").join("corp.conf")).unwrap();
+        assert!(
+            stored.contains("<ca>\nCA-PEM\n</ca>"),
+            "ca инлайнится: {stored}"
+        );
+        assert!(
+            stored.contains("auth-user-pass\n"),
+            "креды из файла не хранятся — голая форма: {stored}"
+        );
+        assert!(
+            !stored.contains("login.txt"),
+            "ссылка на файл кредов убрана"
+        );
+        // Хранимый конфиг с голой формой требует креды при старте.
+        assert!(bottle_core::profile::openvpn_config_needs_auth(&stored));
+    }
+
+    /// OpenVPN create: отсутствующий файл директивы — понятная ошибка
+    /// сразу, а не смерть openvpn в аплаенсе.
+    #[tokio::test]
+    async fn create_openvpn_missing_referenced_file_is_clear_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("corp.ovpn");
+        fs::write(&src, "client\nca missing-ca.crt\n").unwrap();
+        let root = tmp.path().join("store");
+        let store = Store::open(&root).unwrap();
+
+        let reply = dispatch(
+            &store,
+            None,
+            None,
+            None,
+            CliRequest::Create {
+                profile: env_openvpn_profile("corp", src.to_str().unwrap()),
+                force: false,
+            },
+        )
+        .await;
+
+        let CliReply::Error { message } = reply else {
+            panic!("ожидалась ошибка: {reply:?}");
+        };
+        assert!(message.contains("missing-ca.crt"), "имя файла: {message}");
+        assert!(
+            store.load("corp").is_err(),
+            "профиль не сохраняется при битом конфиге"
+        );
     }
 
     /// Занятый id — отказ без --force (Review Focus M3 #5): профиль и

@@ -83,13 +83,26 @@ impl Store {
     /// `config` уже равен `<id>.conf` (профиль из [`Store::load`]), копия
     /// не выполняется — используется уже лежащая в хранилище.
     pub fn save(&self, p: &BottleProfile) -> Result<(), DaemonError> {
+        self.save_inner(p, None)
+    }
+
+    /// Как [`Store::save`], но конфиг не копируется из исходного пути —
+    /// в `bottles/<id>.conf` записывается готовый текст (например, OpenVPN
+    /// после инлайнинга внешних файлов — [`inline_openvpn_config`]).
+    pub fn save_with_config_text(&self, p: &BottleProfile, text: &str) -> Result<(), DaemonError> {
+        self.save_inner(p, Some(text))
+    }
+
+    fn save_inner(&self, p: &BottleProfile, config_text: Option<&str>) -> Result<(), DaemonError> {
         validate_id(&p.id)?;
 
         let mut stored = p.clone();
         if let VpnConfig::Env { config, .. } = &stored.vpn {
             let conf_name = format!("{}.conf", p.id);
             let conf_path = self.root.join("bottles").join(&conf_name);
-            if config != &conf_name {
+            if let Some(text) = config_text {
+                atomic_write(&conf_path, text.as_bytes())?;
+            } else if config != &conf_name {
                 copy_config(Path::new(config), &conf_path)?;
             } else if !conf_path.exists() {
                 return Err(DaemonError::SourceConfigMissing { path: conf_path });

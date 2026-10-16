@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -340,16 +340,26 @@ fn prepare_openvpn_config(args: &UpArgs, run_dir: &Path) -> Result<String, Agent
 /// Поднимает OpenVPN-туннель внутри namespace бутылки.
 ///
 /// Конфиг уже записан в `config_path` (общая файловая система — процесс
-/// в namespace видит тот же файл). Готовность — появление интерфейса
-/// `tun0` (≤60 с, шаг 1 с): поллинг `ip link show tun0`; смерть процесса
-/// и таймаут — [`AgentError::TunnelFailed`].
+/// в namespace видит тот же файл). Вывод openvpn пишется в
+/// `openvpn.log` рядом с конфигом: при ранней смерти процесса его хвост
+/// попадает в текст ошибки (иначе «завершился до создания tun0» не
+/// диагностируется — stdio агента пользователь не видит, 0.2.5).
+/// Готовность — появление интерфейса `tun0` (≤60 с, шаг 1 с): поллинг
+/// `ip link show tun0`; смерть процесса и таймаут —
+/// [`AgentError::TunnelFailed`].
 async fn openvpn_up(handle: &mut NetnsHandle, config_path: &Path) -> Result<(), AgentError> {
     let ns = handle.ns_name.clone();
     let config = config_path
         .to_str()
         .ok_or_else(|| AgentError::InvalidConfig("путь конфига openvpn не UTF-8".into()))?
         .to_string();
+    let log_path = config_path.with_file_name("openvpn.log");
 
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|e| AgentError::TunnelFailed(format!("не удалось создать лог openvpn: {e}")))?;
+    let log_err = log_file
+        .try_clone()
+        .map_err(|e| AgentError::TunnelFailed(format!("не удалось открыть лог openvpn: {e}")))?;
     let child = Command::new("ip")
         .args([
             "netns",
@@ -363,10 +373,8 @@ async fn openvpn_up(handle: &mut NetnsHandle, config_path: &Path) -> Result<(), 
             "--dev-type",
             "tun",
         ])
-        // Лог openvpn наследует stdio агента — у пользователей нет другого
-        // окна диагностики «Initialization Sequence Completed».
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(log_file)
+        .stderr(log_err)
         .spawn()?;
     handle.tunnel_child = Some(child);
 
@@ -376,18 +384,37 @@ async fn openvpn_up(handle: &mut NetnsHandle, config_path: &Path) -> Result<(), 
             return Ok(());
         }
         if tunnel_child_dead(handle) {
-            return Err(AgentError::TunnelFailed(
-                "процесс openvpn завершился до создания tun0".into(),
-            ));
+            return Err(AgentError::TunnelFailed(format!(
+                "процесс openvpn завершился до создания tun0{}",
+                openvpn_log_hint(&log_path)
+            )));
         }
         if Instant::now() + OPENVPN_POLL > deadline {
             return Err(AgentError::TunnelFailed(format!(
-                "интерфейс tun0 не появился за {} с",
-                OPENVPN_WAIT.as_secs()
+                "интерфейс tun0 не появился за {} с{}",
+                OPENVPN_WAIT.as_secs(),
+                openvpn_log_hint(&log_path)
             )));
         }
         tokio::time::sleep(OPENVPN_POLL).await;
     }
+}
+
+/// Хвост лога openvpn для текста ошибки: последние ≤8 непустых строк;
+/// пустая строка-подсказка, если лог прочитать не удалось или он пуст.
+fn openvpn_log_hint(log_path: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(log_path) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let tail = lines[lines.len().saturating_sub(8)..].join("\n");
+    format!(". Последние строки лога openvpn:\n{tail}")
 }
 
 /// Полный разбор бутылки по down-пути (используется при неудаче up):
@@ -771,6 +798,28 @@ mod tests {
             username,
             password,
         }
+    }
+
+    /// Хвост лога openvpn попадает в подсказку ошибки: последние непустые
+    /// строки, без лога — пустая подсказка.
+    #[test]
+    fn openvpn_log_hint_returns_tail_and_tolerates_missing_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("openvpn.log");
+        let lines: Vec<String> = (1..=12).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&log, lines.concat()).unwrap();
+
+        let hint = openvpn_log_hint(&log);
+        assert!(hint.contains("line 12"), "последняя строка есть: {hint}");
+        assert!(!hint.contains("line 4\n"), "обрезано до 8 строк: {hint}");
+        assert!(hint.contains("line 5"), "хвост из 8 строк: {hint}");
+
+        let missing = tmp.path().join("no-such.log");
+        assert_eq!(openvpn_log_hint(&missing), "");
+
+        let empty = tmp.path().join("empty.log");
+        std::fs::write(&empty, "\n\n").unwrap();
+        assert_eq!(openvpn_log_hint(&empty), "");
     }
 
     /// Конфиг без auth-user-pass проходит без изменений, auth-файл не пишется.

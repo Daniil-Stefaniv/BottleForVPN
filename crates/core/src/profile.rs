@@ -138,6 +138,89 @@ pub fn is_bare_auth_user_pass_line(line: &str) -> bool {
     }
 }
 
+/// Директивы OpenVPN, чей единственный аргумент — файл с ключевым
+/// материалом; поддерживают inline-форму `<директива>…</директива>`.
+/// `tls-auth` обрабатывается отдельно (необязательный аргумент направления).
+const OPENVPN_FILE_DIRECTIVES: [&str; 8] = [
+    "ca",
+    "cert",
+    "key",
+    "dh",
+    "extra-certs",
+    "crl-verify",
+    "secret",
+    "tls-crypt",
+];
+
+/// Делает конфиг OpenVPN самодостаточным: директивы, ссылающиеся на
+/// внешние файлы (`ca ca.crt` и т.п. — такие файлы в хранилище не
+/// копируются, и openvpn в аплаенсе умирал с невнятным «завершился до
+/// создания tun0»), переписываются в inline-блоки `<ca>…</ca>`.
+/// Относительные пути резолвятся от `base_dir` — каталога исходного
+/// конфига. `tls-auth файл [0|1]` превращается в `<tls-auth>` + отдельную
+/// `key-direction`. Строки с `[inline]` и уже inline-блоки не трогаются.
+///
+/// Особый случай — `auth-user-pass <файл>`: креды не хранятся (политика),
+/// поэтому директива приводится к голой форме — логин/пароль будут
+/// запрошены при каждом старте.
+///
+/// Ошибка — если файл не читается: понятный текст с именем директивы.
+pub fn inline_openvpn_config(config: &str, base_dir: &std::path::Path) -> Result<String, String> {
+    let mut out = String::with_capacity(config.len() + 256);
+    for line in config.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let directive = tokens.first().copied().unwrap_or("");
+        let is_comment = directive.starts_with('#') || directive.starts_with(';');
+        if is_comment || tokens.len() < 2 || tokens[1] == "[inline]" {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if directive == "auth-user-pass" {
+            // Креды из файла не храним — голая форма, спросим при старте.
+            out.push_str("auth-user-pass\n");
+            continue;
+        }
+        let (directive, direction) = match directive {
+            "tls-auth" => ("tls-auth", tokens.get(2).copied()),
+            d if OPENVPN_FILE_DIRECTIVES.contains(&d) => (d, None),
+            _ => {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+        };
+        let path = std::path::Path::new(tokens[1]);
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base_dir.join(path)
+        };
+        let content = std::fs::read_to_string(&resolved).map_err(|e| {
+            format!(
+                "директива `{directive}` ссылается на файл `{}`, который не читается: {e} \
+                 (искали как {})",
+                tokens[1],
+                resolved.display()
+            )
+        })?;
+        out.push('<');
+        out.push_str(directive);
+        out.push_str(">\n");
+        out.push_str(content.trim_end_matches('\n'));
+        out.push('\n');
+        out.push_str("</");
+        out.push_str(directive);
+        out.push_str(">\n");
+        if let Some(direction) = direction {
+            out.push_str("key-direction ");
+            out.push_str(direction);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 /// Резервированные имена устройств Windows. id бутылки становится именем
 /// файла `bottles/<id>.toml`, а Windows считает такие имена устройствами
 /// независимо от расширения (`nul.toml` так же неоткрываем, как `nul`) —
@@ -788,5 +871,63 @@ config = "c.conf"
             "client\nremote vpn.example 443\n"
         ));
         assert!(!openvpn_config_needs_auth(""));
+    }
+
+    // ---------------------------------------------------------------
+    // inline_openvpn_config: самодостаточный конфиг (внешние файлы →
+    // inline-блоки; auth-user-pass с файлом → голая форма).
+    // ---------------------------------------------------------------
+
+    /// Пишет файл во временный каталог и возвращает (tmp, полный путь).
+    fn tmp_file(name: &str, content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        (tmp, path)
+    }
+
+    #[test]
+    fn inline_rewrites_file_references_to_inline_blocks() {
+        let (tmp, _) = tmp_file("ca.crt", "CA-PEM\n");
+        std::fs::write(tmp.path().join("ta.key"), "TA-KEY\n").unwrap();
+        let config = "client\nca ca.crt\ntls-auth ta.key 1\nremote vpn.example 443\n";
+
+        let out = inline_openvpn_config(config, tmp.path()).expect("инлайнинг");
+
+        assert!(out.contains("<ca>\nCA-PEM\n</ca>\n"), "ca inline: {out}");
+        assert!(
+            out.contains("<tls-auth>\nTA-KEY\n</tls-auth>\nkey-direction 1\n"),
+            "tls-auth inline + key-direction: {out}"
+        );
+        assert!(out.contains("remote vpn.example 443"), "прочие строки целы");
+        assert!(!out.contains("ca ca.crt"), "внешняя ссылка убрана: {out}");
+    }
+
+    #[test]
+    fn inline_keeps_inline_marker_comments_and_unknown_directives() {
+        let (tmp, _) = tmp_file("x", "");
+        let config = "# ca ca.crt\nca [inline]\n<ca>\nPEM\n</ca>\nhttp-proxy p 8080\n";
+        let out = inline_openvpn_config(config, tmp.path()).expect("без изменений");
+        assert_eq!(out, config);
+    }
+
+    #[test]
+    fn inline_missing_file_is_clear_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = inline_openvpn_config("ca no-such.crt\n", tmp.path()).expect_err("нет файла");
+        assert!(error.contains("no-such.crt"), "имя файла: {error}");
+        assert!(error.contains("ca"), "директива: {error}");
+    }
+
+    #[test]
+    fn inline_auth_user_pass_with_file_becomes_bare() {
+        let (tmp, _) = tmp_file("login.txt", "user\npass\n");
+        let out = inline_openvpn_config("auth-user-pass login.txt\n", tmp.path())
+            .expect("креды из файла не храним");
+        assert_eq!(out, "auth-user-pass\n");
+        assert!(
+            openvpn_config_needs_auth(&out),
+            "голая форма → запрос при старте"
+        );
     }
 }
