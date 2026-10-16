@@ -65,6 +65,7 @@ export type CliReply =
   | { List: { bottles: BottleSummary[] } }
   | { Show: { profile: BottleProfile | null; runtime: RuntimeState | null } }
   | { Started: { id: string } }
+  | { NeedCredentials: { id: string } }
   | { Stopped: { id: string; warning: string | null } }
   | { Status: { bottles: RuntimeState[] } }
   | { Path: string }

@@ -58,6 +58,13 @@ enum Command {
     Start {
         /// Идентификатор бутылки
         id: String,
+        /// Логин VPN (OpenVPN auth-user-pass); без флага логин и пароль
+        /// спрашиваются интерактивно, если конфиг требует авторизацию
+        #[arg(long, requires = "password")]
+        username: Option<String>,
+        /// Пароль VPN (OpenVPN auth-user-pass)
+        #[arg(long, requires = "username")]
+        password: Option<String>,
     },
     /// Опустить бутылку
     Stop {
@@ -234,7 +241,21 @@ impl Command {
         match self {
             Command::List => CliRequest::List,
             Command::Show { id } => CliRequest::Show { id: id.clone() },
-            Command::Start { id } => CliRequest::Start { id: id.clone() },
+            Command::Start {
+                id,
+                username,
+                password,
+            } => CliRequest::Start {
+                id: id.clone(),
+                credentials: match (username, password) {
+                    (Some(username), Some(password)) => Some(bottle_core::ipc::VpnCredentials {
+                        username: username.clone(),
+                        password: password.clone(),
+                    }),
+                    // clap гарантирует парность флагов (requires).
+                    _ => None,
+                },
+            },
             Command::Stop { id } => CliRequest::Stop { id: id.clone() },
             Command::Status => CliRequest::Status,
             Command::Doctor => CliRequest::Doctor,
@@ -321,48 +342,9 @@ async fn main() -> ExitCode {
     // Windows — named pipe (спека §4.4); macOS/Unix — UDS
     // `<data>/daemon.sock` (M4 Task 7). Рендер и разбор аргументов
     // кроссплатформенны и тестируются на любой платформе.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     {
-        let request = command.to_request();
-        match client::exchange(&request).await {
-            Ok(reply) => {
-                if cli.json {
-                    handle_reply_json(&reply)
-                } else {
-                    handle_reply(&command, reply)
-                }
-            }
-            Err(error) => {
-                if cli.json {
-                    println!(
-                        "{}",
-                        render_json(&CliReply::Error {
-                            message: error.to_string()
-                        })
-                    );
-                } else {
-                    eprintln!("{error}");
-                }
-                ExitCode::FAILURE
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        let request = command.to_request();
-        let socket = bottle_core::ipc::daemon_socket_path(
-            &bottle_core::ipc::default_data_dir()
-                .expect("каталог данных пользователя определимся на unix"),
-        );
-        match bottle_core::ipc::uds_exchange(
-            &socket,
-            &request,
-            reply_timeout(&request),
-            CONNECT_RETRY_WINDOW,
-        )
-        .await
-        {
+        match exchange_with_creds_retry(&command, cli.json).await {
             Ok(reply) => {
                 if cli.json {
                     handle_reply_json(&reply)
@@ -397,6 +379,101 @@ async fn main() -> ExitCode {
         }
         ExitCode::FAILURE
     }
+}
+
+/// Обмен с демоном по транспорту платформы: Windows — named pipe,
+/// macOS/Unix — UDS `<data>/daemon.sock`. Ошибки — русские строки.
+#[cfg(windows)]
+async fn daemon_exchange(request: &CliRequest) -> Result<CliReply, String> {
+    client::exchange(request).await.map_err(|e| e.to_string())
+}
+
+/// Обмен с демоном по транспорту платформы: Windows — named pipe,
+/// macOS/Unix — UDS `<data>/daemon.sock`. Ошибки — русские строки.
+#[cfg(unix)]
+async fn daemon_exchange(request: &CliRequest) -> Result<CliReply, String> {
+    let socket = bottle_core::ipc::daemon_socket_path(
+        &bottle_core::ipc::default_data_dir()
+            .expect("каталог данных пользователя определимся на unix"),
+    );
+    bottle_core::ipc::uds_exchange(
+        &socket,
+        request,
+        reply_timeout(request),
+        CONNECT_RETRY_WINDOW,
+    )
+    .await
+}
+
+/// Отправляет запрос демону; если демон ответил [`CliReply::NeedCredentials`]
+/// (конфиг OpenVPN с голым auth-user-pass), в текстовом режиме спрашивает
+/// логин/пароль (пароль — скрытым вводом) и повторяет `Start` с кредами.
+/// Креды не хранятся — запрашиваются при каждом подключении. В json-режиме
+/// `NeedCredentials` уходит вызывающему как есть: диалог показывает GUI.
+#[cfg(any(windows, unix))]
+async fn exchange_with_creds_retry(command: &Command, json: bool) -> Result<CliReply, String> {
+    let request = command.to_request();
+    let reply = daemon_exchange(&request).await?;
+    let Some(retry) = credentials_prompt(command, &reply, json)? else {
+        return Ok(reply);
+    };
+    daemon_exchange(&retry).await
+}
+
+/// Решает, нужен ли повтор `Start` с кредами: `NeedCredentials` на `Start`
+/// без кредов в текстовом режиме терминала → интерактивный запрос.
+/// Не терминал (скрипт) — понятная ошибка с флагами, а не молчаливый висяк.
+#[cfg(any(windows, unix))]
+fn credentials_prompt(
+    command: &Command,
+    reply: &CliReply,
+    json: bool,
+) -> Result<Option<CliRequest>, String> {
+    let (
+        Command::Start {
+            id,
+            username: None,
+            password: None,
+        },
+        CliReply::NeedCredentials { .. },
+    ) = (command, reply)
+    else {
+        return Ok(None);
+    };
+    if json {
+        return Ok(None);
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Err(format!(
+            "конфиг бутылки {id} требует логин и пароль (auth-user-pass) — \
+             передайте их флагами: bottle start {id} --username <логин> --password <пароль>"
+        ));
+    }
+    let username = prompt_line("Логин VPN: ")?;
+    if username.is_empty() {
+        return Err("логин не может быть пустым".to_string());
+    }
+    let password = rpassword::prompt_password("Пароль VPN: ")
+        .map_err(|e| format!("не удалось прочитать пароль: {e}"))?;
+    Ok(Some(CliRequest::Start {
+        id: id.clone(),
+        credentials: Some(bottle_core::ipc::VpnCredentials { username, password }),
+    }))
+}
+
+/// Читает строку с stdin с приглашением в stderr (логин не секрет —
+/// скрывать не нужно).
+#[cfg(any(windows, unix))]
+fn prompt_line(prompt: &str) -> Result<String, String> {
+    use std::io::Write;
+    eprint!("{prompt}");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("не удалось прочитать логин: {e}"))?;
+    Ok(line.trim().to_string())
 }
 
 /// Ошибка разбора аргументов в json-режиме: `{"Error":…}` в stdout
@@ -485,6 +562,15 @@ fn handle_reply(command: &Command, reply: CliReply) -> ExitCode {
         (Command::Start { .. }, CliReply::Started { id }) => {
             println!("Бутылка {id} поднята");
             ExitCode::SUCCESS
+        }
+        (Command::Start { .. }, CliReply::NeedCredentials { id }) => {
+            // Досюда доходит только json-режим без TTY (credentials_prompt
+            // отрабатывает раньше): подсказка с флагами.
+            eprintln!(
+                "Конфиг бутылки {id} требует логин и пароль (auth-user-pass) — \
+                 передайте их: bottle start {id} --username <логин> --password <пароль>"
+            );
+            ExitCode::FAILURE
         }
         (Command::Stop { .. }, CliReply::Stopped { id, warning }) => {
             println!("Бутылка {id} опущена");
@@ -680,7 +766,7 @@ mod tests {
         ));
         assert!(matches!(
             parse(&["bottle", "start", "office-a"]),
-            Command::Start { id } if id == "office-a"
+            Command::Start { id, .. } if id == "office-a"
         ));
         assert!(matches!(
             parse(&["bottle", "stop", "office-a"]),
@@ -1398,7 +1484,8 @@ mod tests {
         // агент, handshake) не укладывается в базовое ожидание.
         assert_eq!(
             reply_timeout(&CliRequest::Start {
-                id: "office-a".to_string()
+                id: "office-a".to_string(),
+                credentials: None,
             }),
             Duration::from_secs(120)
         );
@@ -1431,12 +1518,46 @@ mod tests {
         );
         assert_eq!(
             Command::Start {
-                id: "office-a".to_string()
+                id: "office-a".to_string(),
+                username: None,
+                password: None,
             }
             .to_request(),
             CliRequest::Start {
-                id: "office-a".to_string()
+                id: "office-a".to_string(),
+                credentials: None,
             }
+        );
+
+        // Креды auth-user-pass: флаги start отображаются в credentials.
+        let command = parse(&[
+            "bottle",
+            "start",
+            "office-a",
+            "--username",
+            "user@corp",
+            "--password",
+            "s3cret",
+        ]);
+        assert_eq!(
+            command.to_request(),
+            CliRequest::Start {
+                id: "office-a".to_string(),
+                credentials: Some(bottle_core::ipc::VpnCredentials {
+                    username: "user@corp".to_string(),
+                    password: "s3cret".to_string(),
+                }),
+            }
+        );
+
+        // Флаги парные (clap requires): только логин — ошибка разбора.
+        assert!(
+            Cli::try_parse_from(["bottle", "start", "a", "--username", "u"]).is_err(),
+            "--username без --password отвергается"
+        );
+        assert!(
+            Cli::try_parse_from(["bottle", "start", "a", "--password", "p"]).is_err(),
+            "--password без --username отвергается"
         );
         assert_eq!(
             Command::Stop {

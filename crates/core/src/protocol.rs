@@ -8,6 +8,10 @@
 //! и `Down` номером поколения бутылки, агент отвергает `Down` чужого
 //! поколения ([`err::STALE_INSTANCE`]) — защита от TOCTOU «Down проигравшего
 //! рестарта убивает живую бутылку победителя».
+//!
+//! Версия 3 добавила креды OpenVPN `auth-user-pass` в [`UpArgs`]
+//! (`username`/`password`): агент подставляет их в auth-файл рядом с
+//! конфигом туннеля.
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -16,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::profile::TunnelProtocol;
 
 /// Версия RPC-протокола; сверяется в `Hello`/`HelloAck`.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Запрос демона к агенту.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +58,14 @@ pub struct UpArgs {
     /// номером — `Down` перезапущенного/проигравшего демона получает
     /// [`err::STALE_INSTANCE`] и не убивает живую бутылку.
     pub instance: u64,
+    /// Логин для OpenVPN `auth-user-pass` (протокол v3); `None` —
+    /// конфиг без авторизации или с собственным auth-файлом.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Пароль к логину; агент пишет оба в auth-файл рядом с конфигом
+    /// (tmpfs `/run/bottles/<id>/`, права 0600).
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 /// Один TCP-проброс: слушатель на 127.0.0.1 → цель `host:port` в туннеле.
@@ -160,6 +172,8 @@ mod tests {
                     target: "10.20.30.15:3389".to_string(),
                 }],
                 instance: 7,
+                username: None,
+                password: None,
             }),
             AgentRequest::Up(UpArgs {
                 id: "corp".to_string(),
@@ -169,6 +183,8 @@ mod tests {
                 socks5_port: 0,
                 forwards: vec![],
                 instance: 0,
+                username: Some("user@corp".to_string()),
+                password: Some("s3cret".to_string()),
             }),
             AgentRequest::Down {
                 id: "office-a".to_string(),
@@ -240,6 +256,8 @@ mod tests {
             socks5_port: 1080,
             forwards: vec![],
             instance: 7,
+            username: None,
+            password: None,
         };
         let json = serde_json::to_string(&wireguard).expect("serialize UpArgs");
         assert!(
@@ -275,9 +293,25 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_two() {
-        // Версия 2 добавила instance-поколения в Up/Down; аплаенсы v1
-        // отвергаются handshake-ошибкой VERSION (без обратной совместимости).
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_version_is_three() {
+        // Версия 2 добавила instance-поколения в Up/Down; версия 3 —
+        // креды auth-user-pass в UpArgs. Аплаенсы старших версий
+        // отвергаются handshake-ошибкой VERSION (без обратной
+        // совместимости: демон и агент ставятся одним пакетом).
+        assert_eq!(PROTOCOL_VERSION, 3);
+    }
+
+    /// Кадр `Up` старой формы (без полей кредов, протокол v2) читается:
+    /// serde default даёт `None` — смешанный аплаенс всё равно отвергнет
+    /// handshake, но сериализация не добавляет ломки сверх версии.
+    #[test]
+    fn up_args_without_credentials_deserializes_as_none() {
+        let args: UpArgs = serde_json::from_str(
+            r#"{"id":"a","protocol":"openvpn","config":"c.ovpn","dns":null,
+                "socks5_port":0,"forwards":[],"instance":1}"#,
+        )
+        .expect("старая форма кадра без кредов читается");
+        assert_eq!(args.username, None);
+        assert_eq!(args.password, None);
     }
 }

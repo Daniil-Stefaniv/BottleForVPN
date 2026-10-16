@@ -202,6 +202,8 @@ async fn openvpn_static_key_tunnel_and_socks5_over_it() {
         socks5_port: SOCKS5_PORT,
         forwards: Vec::new(),
         instance: INSTANCE,
+        username: None,
+        password: None,
     };
     let reply = bottles.up(args).await;
     assert_eq!(

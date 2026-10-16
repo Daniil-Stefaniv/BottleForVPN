@@ -14,6 +14,11 @@ RUN cargo build --release -p agent --target x86_64-unknown-linux-musl
 # агента — ip netns exec <ns> wireguard-go) отсутствует в репозиториях 3.20.
 FROM --platform=linux/amd64 alpine:3.22
 RUN apk add --no-cache wireguard-go wireguard-tools openvpn iproute2 iptables
+# Старый inbox wsl.exe резолвит команду после `--exec` по урезанному PATH
+# без /sbin, где лежит настоящий iproute2. Демон зовёт /sbin/ip абсолютным
+# путём, а эти симлинки — страховка для относительного `ip` (ручные
+# --exec, будущие вызовы): busybox в /bin свой ip не имеет.
+RUN ln -sf /sbin/ip /bin/ip && ln -sf /sbin/ip /usr/bin/ip
 COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/bottle-agent /bin/bottle-agent
 RUN chmod 0755 /bin/bottle-agent
 COPY appliance/overlay/etc/wsl.conf /etc/wsl.conf

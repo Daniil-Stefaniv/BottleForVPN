@@ -677,8 +677,42 @@ button.copy {
   margin-left: auto;
 }
 
-/* ── Тост ─────────────────────────────────────────────────────── */
+/* ── Диалог авторизации VPN (auth-user-pass) ────────────────────── */
 
+#creds-dialog {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  max-width: 380px;
+  width: calc(100% - 2rem);
+  background: var(--bg);
+  color: var(--fg);
+}
+
+#creds-dialog::backdrop {
+  background: rgb(0 0 0 / 0.4);
+}
+
+#creds-dialog h2 {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+}
+
+#creds-dialog .field {
+  margin-top: 0.75rem;
+}
+
+#creds-error {
+  margin-top: 0.75rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-sm);
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: 0.82rem;
+}
+
+/* ── Тост ─────────────────────────────────────────────────────── */
 #toast {
   position: fixed;
   bottom: 2.5rem;

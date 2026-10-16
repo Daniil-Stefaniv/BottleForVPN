@@ -74,9 +74,9 @@ pub async fn dispatch(
                 None => None,
             },
         },
-        CliRequest::Start { id } => match manager {
+        CliRequest::Start { id, credentials } => match manager {
             Some(manager) => manager
-                .start(&id)
+                .start(&id, credentials)
                 .await
                 .unwrap_or_else(|error| CliReply::Error {
                     message: error.to_string(),
@@ -623,6 +623,7 @@ endpoints = ["e.example"]
         let commands = vec![
             CliRequest::Start {
                 id: "office-a".to_string(),
+                credentials: None,
             },
             CliRequest::Stop {
                 id: "office-a".to_string(),
@@ -1110,6 +1111,7 @@ endpoints = ["e.example"]
                 &mut slow_client,
                 CliRequest::Start {
                     id: "office-a".to_string(),
+                    credentials: None,
                 },
             )
             .await

@@ -24,7 +24,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use bottle_core::profile::TunnelProtocol;
+use bottle_core::profile::{
+    is_bare_auth_user_pass_line, openvpn_config_needs_auth, TunnelProtocol,
+};
 use bottle_core::protocol::{err, AgentReply, BottleStatusInfo, UpArgs};
 
 use crate::error::AgentError;
@@ -276,7 +278,8 @@ async fn launch_tunnel(handle: &mut NetnsHandle, args: &UpArgs) -> Result<(), Ag
         }
         TunnelProtocol::OpenVpn => {
             let config_path = run_dir.join("openvpn.conf");
-            write_secret_file(&config_path, &args.config)?;
+            let config = prepare_openvpn_config(args, &run_dir)?;
+            write_secret_file(&config_path, &config)?;
             openvpn_up(handle, &config_path).await?;
         }
     }
@@ -285,6 +288,53 @@ async fn launch_tunnel(handle: &mut NetnsHandle, args: &UpArgs) -> Result<(), Ag
         write_pid_file(&run_dir.join("pid-tunnel"), child.id())?;
     }
     Ok(())
+}
+
+/// Готовит конфиг OpenVPN к записи в `run_dir`: находит голый
+/// `auth-user-pass` (без файла-аргумента) и переписывает его на файл
+/// `auth.txt` рядом с конфигом (две строки «логин/пароль», права 0600),
+/// добавляя `auth-nocache` — при `resolv-retry infinite` openvpn
+/// перечитывает креды при реконнектах, stdin-пайп их не пережил бы.
+///
+/// Голый `auth-user-pass` без переданных кредов — понятная ошибка, а не
+/// мгновенный exit openvpn («could not read Auth username from stdin»:
+/// stdin агента закрыт). Конфиг, где `auth-user-pass` уже ссылается на
+/// файл, не трогается — его содержимое на ответственности пользователя.
+fn prepare_openvpn_config(args: &UpArgs, run_dir: &Path) -> Result<String, AgentError> {
+    if !openvpn_config_needs_auth(&args.config) {
+        return Ok(args.config.clone());
+    }
+    let (Some(username), Some(password)) = (&args.username, &args.password) else {
+        return Err(AgentError::InvalidConfig(format!(
+            "конфиг OpenVPN требует авторизацию (auth-user-pass) — \
+             задайте логин и пароль при запуске: bottle start {}",
+            args.id
+        )));
+    };
+    let auth_path = run_dir.join("auth.txt");
+    write_secret_file(&auth_path, &format!("{username}\n{password}\n"))?;
+
+    let auth_arg = auth_path
+        .to_str()
+        .ok_or_else(|| AgentError::InvalidConfig("путь auth-файла не UTF-8".into()))?;
+    let mut out = String::with_capacity(args.config.len() + 64);
+    for line in args.config.lines() {
+        if is_bare_auth_user_pass_line(line) {
+            out.push_str("auth-user-pass ");
+            out.push_str(auth_arg);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if !args
+        .config
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("auth-nocache"))
+    {
+        out.push_str("auth-nocache\n");
+    }
+    Ok(out)
 }
 
 /// Поднимает OpenVPN-туннель внутри namespace бутылки.
@@ -701,6 +751,110 @@ mod tests {
         assert!(reply.message().contains("отказано в доступе"));
     }
 
+    // ---------------------------------------------------------------
+    // prepare_openvpn_config: голый auth-user-pass → auth-файл.
+    // ---------------------------------------------------------------
+
+    fn openvpn_args(config: &str, creds: Option<(&str, &str)>) -> UpArgs {
+        let (username, password) = match creds {
+            Some((u, p)) => (Some(u.to_string()), Some(p.to_string())),
+            None => (None, None),
+        };
+        UpArgs {
+            id: "office-a".to_string(),
+            protocol: TunnelProtocol::OpenVpn,
+            config: config.to_string(),
+            dns: None,
+            socks5_port: 0,
+            forwards: vec![],
+            instance: 0,
+            username,
+            password,
+        }
+    }
+
+    /// Конфиг без auth-user-pass проходит без изменений, auth-файл не пишется.
+    #[test]
+    fn openvpn_config_without_auth_directive_is_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = "remote vpn.example.com 1194\ndev tun\n";
+        let args = openvpn_args(config, None);
+
+        let out = prepare_openvpn_config(&args, tmp.path()).expect("конфиг проходит");
+
+        assert_eq!(out, config);
+        assert!(!tmp.path().join("auth.txt").exists());
+    }
+
+    /// Конфиг с auth-user-pass <файл> — на ответственности пользователя,
+    /// не переписывается.
+    #[test]
+    fn openvpn_config_with_auth_file_is_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = "auth-user-pass /etc/secret/auth.txt\n";
+        let args = openvpn_args(config, None);
+
+        let out = prepare_openvpn_config(&args, tmp.path()).expect("конфиг проходит");
+
+        assert_eq!(out, config);
+        assert!(!tmp.path().join("auth.txt").exists());
+    }
+
+    /// Голый auth-user-pass + креды: директива переписана на auth.txt
+    /// (0600, две строки), добавлен auth-nocache.
+    #[test]
+    fn bare_auth_user_pass_is_rewritten_to_auth_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = "client\nauth-user-pass\nremote vpn.example.com 443\n";
+        let args = openvpn_args(config, Some(("user@corp", "s3cret")));
+
+        let out = prepare_openvpn_config(&args, tmp.path()).expect("креды подставлены");
+
+        let auth_path = tmp.path().join("auth.txt");
+        let expected_directive = format!("auth-user-pass {}", auth_path.display());
+        assert!(
+            out.contains(&expected_directive),
+            "директива переписана на файл: {out}"
+        );
+        assert!(out.contains("auth-nocache"), "auth-nocache добавлен: {out}");
+        assert!(
+            !out.contains("client\nauth-user-pass\n"),
+            "голая директива исчезла: {out}"
+        );
+        assert_eq!(
+            fs::read_to_string(&auth_path).unwrap(),
+            "user@corp\ns3cret\n",
+            "auth-файл — две строки: логин и пароль"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "auth-файл — секрет, права 0600");
+        }
+    }
+
+    /// Голый auth-user-pass без кредов — понятная ошибка с подсказкой,
+    /// а не мгновенный exit openvpn «could not read Auth username».
+    #[test]
+    fn bare_auth_user_pass_without_credentials_is_clear_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = openvpn_args("auth-user-pass\n", None);
+
+        let error = prepare_openvpn_config(&args, tmp.path()).expect_err("отказ без кредов");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("auth-user-pass"),
+            "названа директива: {message}"
+        );
+        assert!(
+            message.contains("bottle start office-a"),
+            "подсказка запуска с кредами: {message}"
+        );
+        assert!(!tmp.path().join("auth.txt").exists());
+    }
+
     #[tokio::test]
     async fn up_rejects_path_traversal_before_any_syscall() {
         let bottles = Bottles::new();
@@ -712,6 +866,8 @@ mod tests {
             socks5_port: 0,
             forwards: vec![],
             instance: 0,
+            username: None,
+            password: None,
         };
         let reply = bottles.up(args).await;
         assert_eq!(reply.code(), err::BAD_REQUEST, "барьер id на уровне API");
@@ -732,6 +888,8 @@ mod tests {
             socks5_port: 0,
             forwards: vec![],
             instance: 0,
+            username: None,
+            password: None,
         };
         let reply = bottles.up(args).await;
         assert_eq!(reply.code(), err::BAD_REQUEST);

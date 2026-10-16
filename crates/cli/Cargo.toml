@@ -19,6 +19,9 @@ serde_json = "1"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
 thiserror = "2"
+# Скрытый ввод пароля для `bottle start`, когда конфиг OpenVPN требует
+# auth-user-pass (креды не хранятся — спрашиваются при каждом старте).
+rpassword = "7"
 
 # Named pipe клиента и коды ошибок Win32.
 [target.'cfg(windows)'.dependencies]

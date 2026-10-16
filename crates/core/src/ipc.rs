@@ -100,8 +100,16 @@ pub enum CliRequest {
     List,
     /// Показать профиль и/или рантайм-состояние бутылки.
     Show { id: String },
-    /// Поднять бутылку.
-    Start { id: String },
+    /// Поднять бутылку. `credentials` — логин/пароль для OpenVPN
+    /// `auth-user-pass`, если демон запросил их ответом
+    /// [`CliReply::NeedCredentials`]; не хранятся, живут только в рамках
+    /// этого запуска (передаются агенту в `Up`).
+    Start {
+        id: String,
+        /// Креды VPN этой сессии запуска; `None` — без авторизации.
+        #[serde(default)]
+        credentials: Option<VpnCredentials>,
+    },
     /// Опустить бутылку.
     Stop { id: String },
     /// Рантайм-состояние всех поднятых бутылок.
@@ -128,6 +136,17 @@ pub enum CliRequest {
     RoutesCleanup,
 }
 
+/// Логин/пароль VPN для одного запуска бутылки (OpenVPN
+/// `auth-user-pass`). Передаются от CLI/GUI демону и далее агенту в
+/// `Up`; на диск не пишутся — запрашиваются при каждом подключении.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpnCredentials {
+    /// Логин VPN.
+    pub username: String,
+    /// Пароль VPN.
+    pub password: String,
+}
+
 /// Ответ демона CLI.
 ///
 /// `Show` крупнее остальных вариантов из-за встроенного профиля;
@@ -146,6 +165,11 @@ pub enum CliReply {
     },
     /// Бутылка поднята (ответ на `Start`).
     Started { id: String },
+    /// Ответ на `Start`: конфиг OpenVPN требует `auth-user-pass`, а креды
+    /// в запросе не переданы — клиент должен спросить логин/пароль у
+    /// пользователя (CLI — скрытым вводом, GUI — диалогом) и повторить
+    /// `Start` с `credentials`.
+    NeedCredentials { id: String },
     /// Бутылка опущена (ответ на `Stop`); `warning` — предупреждение
     /// о неочищенных эффектах (host-бутылка: VPN-клиент остаётся
     /// работать — спека §7.2, шаг 6). Отсутствующее поле в старом
@@ -333,6 +357,14 @@ mod tests {
             },
             CliRequest::Start {
                 id: "office-a".to_string(),
+                credentials: None,
+            },
+            CliRequest::Start {
+                id: "office-a".to_string(),
+                credentials: Some(VpnCredentials {
+                    username: "user@corp".to_string(),
+                    password: "s3cret".to_string(),
+                }),
             },
             CliRequest::Stop {
                 id: "office-a".to_string(),
@@ -407,6 +439,9 @@ mod tests {
                 runtime: None,
             },
             CliReply::Started {
+                id: "office-a".to_string(),
+            },
+            CliReply::NeedCredentials {
                 id: "office-a".to_string(),
             },
             CliReply::Stopped {
@@ -552,6 +587,21 @@ mod tests {
             CliReply::Stopped {
                 id: "office-a".to_string(),
                 warning: None
+            }
+        );
+    }
+
+    /// Поле `credentials` в `Start` опционально на проводе: кадр старой
+    /// формы (без поля) читается как `credentials: None`.
+    #[test]
+    fn start_without_credentials_field_deserializes_as_none() {
+        let request: CliRequest =
+            serde_json::from_str(r#"{"Start":{"id":"office-a"}}"#).expect("старая форма кадра");
+        assert_eq!(
+            request,
+            CliRequest::Start {
+                id: "office-a".to_string(),
+                credentials: None
             }
         );
     }

@@ -293,6 +293,8 @@ mod tests {
             socks5_port: 0,
             forwards: vec![],
             instance: 0,
+            username: None,
+            password: None,
         }
     }
 

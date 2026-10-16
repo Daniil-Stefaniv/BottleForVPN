@@ -28,3 +28,5 @@ getrandom = "0.3"
 # Интеграционные тесты (wg_handshake, bottles_e2e, openvpn_e2e) входят в
 # network namespace через setns(2) из libc (dependencies): echo-сервер
 # теста слушает в srv-namespace на адресе туннельного интерфейса.
+# tempfile: unit-тесты auth-файла openvpn (prepare_openvpn_config).
+tempfile = "3"

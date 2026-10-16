@@ -33,6 +33,7 @@ pub struct PortProbe {
 pub async fn run(wsl: &dyn WslRunner, store: &Store, manager: &BottleManager) -> Vec<CheckItem> {
     let wsl_status = wsl.run(&["--status"], None).await;
     let wsl_list = wsl.run(&["-l", "-q"], None).await;
+    let wsl_version = wsl.run(&["--version"], None).await;
     let wslconfig = std::env::var_os("USERPROFILE")
         .map(|home| std::path::Path::new(&home).join(".wslconfig"))
         .and_then(|path| std::fs::read_to_string(path).ok());
@@ -43,6 +44,7 @@ pub async fn run(wsl: &dyn WslRunner, store: &Store, manager: &BottleManager) ->
     let live_ports = live_listener_ports(manager).await;
 
     let mut items = check_wsl(&wsl_status, &wsl_list, &wslconfig);
+    items.push(check_wsl_version(&wsl_version));
     items.push(check_appliance(installed, &appliance_version));
     items.push(check_service(crate::svc_client::svc_pipe_exists()));
     items.push(check_agent(installed, &appliance_version));
@@ -190,8 +192,29 @@ pub fn check_wsl(
     items
 }
 
-/// Проверка аплаенса: не импортирован → warn (ленивый импорт при
-/// первом старте — не ошибка); импортирован → ok с версией из
+/// Версия WSL: современный (Store) wsl.exe отвечает на `--version`
+/// (ok, первая строка с номером); inbox wsl.exe такой опции не знает —
+/// warn с пояснением, что вывод декодируется с учётом UTF-16LE
+/// (appliance::decode_wsl_output). Не fail: inbox WSL работает.
+pub fn check_wsl_version(version: &io::Result<String>) -> CheckItem {
+    match version {
+        Ok(text) => {
+            let first = text.lines().next().unwrap_or_default().trim();
+            CheckItem {
+                code: "wsl-version".to_string(),
+                status: CheckStatus::Ok,
+                detail: format!("Версия WSL: {first}"),
+            }
+        }
+        Err(_) => CheckItem {
+            code: "wsl-version".to_string(),
+            status: CheckStatus::Warn,
+            detail: "wsl --version не поддерживается — старый inbox wsl.exe; \
+                     его вывод (UTF-16LE) декодируется автоматически"
+                .to_string(),
+        },
+    }
+}
 /// последнего handshake (если сессия уже подключалась).
 pub fn check_appliance(installed: bool, version: &Option<String>) -> CheckItem {
     match (installed, version) {
@@ -421,6 +444,30 @@ mod tests {
         assert!(
             item.detail.contains("NAT"),
             "подсказка возврата на NAT: {}",
+            item.detail
+        );
+    }
+
+    #[test]
+    fn wsl_version_modern_store_wsl_is_ok_with_number() {
+        let item = check_wsl_version(&Ok("Версия WSL: 2.5.7.0\nВерсия ядра: 5.15".into()));
+        assert_eq!(item.code, "wsl-version");
+        assert_eq!(item.status, CheckStatus::Ok);
+        assert!(
+            item.detail.contains("2.5.7.0"),
+            "номер версии: {}",
+            item.detail
+        );
+    }
+
+    #[test]
+    fn wsl_version_inbox_wsl_is_warn_not_fail() {
+        let item = check_wsl_version(&Err(io::Error::other("Invalid command line option")));
+        assert_eq!(item.code, "wsl-version");
+        assert_eq!(item.status, CheckStatus::Warn);
+        assert!(
+            item.detail.contains("UTF-16LE"),
+            "пояснение про декод: {}",
             item.detail
         );
     }

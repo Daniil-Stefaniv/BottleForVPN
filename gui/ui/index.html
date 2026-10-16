@@ -177,6 +177,29 @@
       </footer>
 
       <div id="toast" hidden></div>
+
+      <dialog id="creds-dialog">
+        <form id="creds-form">
+          <h2>Авторизация VPN</h2>
+          <p class="section-hint">
+            Конфиг бутылки «<span id="creds-bottle-id"></span>» требует логин и пароль
+            (auth-user-pass). Они не сохраняются — спрашиваются при каждом подключении.
+          </p>
+          <div class="field">
+            <label for="creds-username">Логин</label>
+            <input id="creds-username" autocomplete="username" />
+          </div>
+          <div class="field">
+            <label for="creds-password">Пароль</label>
+            <input id="creds-password" type="password" autocomplete="current-password" />
+          </div>
+          <p id="creds-error" hidden></p>
+          <div class="form-actions">
+            <button type="submit" id="creds-submit" class="primary">Подключить</button>
+            <button type="button" id="creds-cancel">Отмена</button>
+          </div>
+        </form>
+      </dialog>
     </main>
     <script type="module" src="/src/main.ts"></script>
   </body>

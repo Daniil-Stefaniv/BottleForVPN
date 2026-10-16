@@ -55,6 +55,40 @@ const TOKEN_BYTES: usize = 32;
 const TOKEN_WRITE_CMD: &str =
     "mkdir -p /etc/bottle-agent && cat > /etc/bottle-agent/token && chmod 600 /etc/bottle-agent/token";
 
+/// Декодирует вывод `wsl.exe`, толерантно к UTF-16LE.
+///
+/// Старый встроенный (inbox) `wsl.exe` игнорирует `WSL_UTF8=1` и пишет
+/// свои сообщения (`-l`, `--status`, ошибки импорта) в UTF-16LE — с BOM
+/// или без. Современный (Store) wsl и вывод Linux-команд `--exec` —
+/// честный UTF-8, поэтому UTF-8 проверяется первым: байты из Linux
+/// гарантированно не переинтерпретируются. Эвристика BOM-less UTF-16LE —
+/// нулевые байты в потоке (ASCII-символы в UTF-16LE дают `<c> 00`);
+/// поток без нулевых байтов, не разобранный как UTF-8, отдаётся lossy.
+pub fn decode_wsl_output(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        // UTF-16LE с BOM.
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if bytes.contains(&0) {
+        // Старый wsl.exe: UTF-16LE без BOM. Проверка раньше UTF-8 —
+        // ASCII-подобный UTF-16LE формально валиден как UTF-8.
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        // Обычный вывод Linux-команд (--exec) и современного wsl.exe.
+        return s.to_string();
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 /// Выполнитель команд WSL (абстракция для тестов).
 ///
 /// `run` выполняет `wsl <args>`, опционально передаёт `stdin`,
@@ -82,6 +116,8 @@ impl RealWsl {
         // каждый вызов wsl.exe создавал бы видимое окно консоли.
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
                                          // Без WSL_UTF8=1 wsl.exe печатает UTF-16LE.
+                                         // WSL_UTF8=1 просит честный UTF-8; старый inbox wsl.exe его
+                                         // игнорирует и пишет UTF-16LE — это покрывает decode_wsl_output.
         cmd.env("WSL_UTF8", "1");
         for arg in &args {
             cmd.arg(arg);
@@ -107,12 +143,22 @@ impl RealWsl {
 
         let output = child.wait_with_output()?;
         if !output.status.success() {
+            // Сырые байты в debug-журнал: «пустой stderr с кодом 1»
+            // на старом wsl.exe (UTF-16LE без BOM) иначе не отличить
+            // от «команда не найдена» — hex снимает неоднозначность.
+            tracing::debug!(
+                args = ?args,
+                status = %output.status,
+                stderr_hex = %hex(&output.stderr),
+                stdout_hex = %hex(&output.stdout),
+                "wsl.exe завершился с ошибкой"
+            );
             // Детали обычно в stderr, но старые версии wsl.exe пишут
             // «command not found» и т.п. в stdout — тогда берём его,
             // иначе ошибка выходит пустой («код 1: » и тишина).
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr = decode_wsl_output(&output.stderr).trim().to_string();
             let detail = if stderr.is_empty() {
-                String::from_utf8_lossy(&output.stdout).trim().to_string()
+                decode_wsl_output(&output.stdout).trim().to_string()
             } else {
                 stderr
             };
@@ -123,14 +169,7 @@ impl RealWsl {
                 detail
             )));
         }
-        String::from_utf8(output.stdout)
-            .map(|out| out.trim().to_string())
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("wsl вернул не-UTF-8 вывод: {e}"),
-                )
-            })
+        Ok(decode_wsl_output(&output.stdout).trim().to_string())
     }
 }
 
@@ -241,35 +280,43 @@ async fn provision_token(
 ) -> Result<String, DaemonError> {
     let listing = wsl.run(&["-l", "-q"], None).await?;
     if is_installed(&listing) {
-        return match read_local_token(store) {
-            Ok(token) => Ok(token),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(DaemonError::ApplianceTokenLost),
-            Err(e) => Err(e.into()),
-        };
+        return local_token(store);
     }
 
     let token = generate_token()?;
     let vm_dir = store.data_root().join(VM_DIR_NAME);
-    wsl.run(
-        &[
-            "--import",
-            DISTRIBUTION,
-            &vm_dir.to_string_lossy(),
-            &rootfs_tar.to_string_lossy(),
-        ],
-        None,
-    )
-    .await
-    .map_err(|e| {
-        // Частый случай — «дистрибуция уже существует» (код 0xffffffff)
-        // после прерванной установки: голый вывод wsl.exe ничего не
-        // объясняет пользователю, поэтому добавляем путь восстановления.
-        DaemonError::Appliance(format!(
+    if let Err(e) = wsl
+        .run(
+            &[
+                "--import",
+                DISTRIBUTION,
+                &vm_dir.to_string_lossy(),
+                &rootfs_tar.to_string_lossy(),
+            ],
+            None,
+        )
+        .await
+    {
+        // «Дистрибутив уже существует» (код 0xffffffff после прерванной
+        // установки): листинг на входе мог быть недоступен/стар — на
+        // старом inbox wsl.exe его UTF-16LE вывод раньше вообще не
+        // декодировался, и демон бесконечно долбил --import. Страховка:
+        // перепроверяем листинг — дистрибутив есть → используем её,
+        // а не отправляем пользователя в `wsl --unregister`.
+        let relisting = wsl.run(&["-l", "-q"], None).await.unwrap_or_default();
+        if is_installed(&relisting) {
+            tracing::warn!(
+                error = %e,
+                "wsl --import отказал, но дистрибутив уже существует — используем её"
+            );
+            return local_token(store);
+        }
+        return Err(DaemonError::Appliance(format!(
             "не удалось импортировать дистрибуцию {DISTRIBUTION}: {e}. \
              Если она уже существует (например, после прерванной установки), \
              выполните `wsl --unregister {DISTRIBUTION}` и повторите, либо `bottle upgrade`"
-        ))
-    })?;
+        )));
+    }
     tracing::info!(
         distribution = DISTRIBUTION,
         "дистрибутив аплаенса импортирован"
@@ -278,6 +325,16 @@ async fn provision_token(
     write_token_into_vm(wsl, &token).await?;
     crate::store::atomic_write(&store.appliance_token_path(), token.as_bytes())?;
     Ok(token)
+}
+
+/// Читает токен из локальной копии хранилища (ветка «дистрибутив уже
+/// импортирован»): `NotFound` превращается в [`DaemonError::ApplianceTokenLost`].
+fn local_token(store: &Store) -> Result<String, DaemonError> {
+    match read_local_token(store) {
+        Ok(token) => Ok(token),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(DaemonError::ApplianceTokenLost),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Читает локальную копию токена (пробелы по краям игнорируются).
@@ -1267,6 +1324,8 @@ mod tests {
             socks5_port: 0,
             forwards: Vec::new(),
             instance: 0,
+            username: None,
+            password: None,
         });
         assert_eq!(
             handle.send(up).await.expect("Up отвечает"),
@@ -1311,5 +1370,116 @@ mod tests {
             "токен не hex: {first}"
         );
         assert_ne!(first, second, "каждая установка получает свой токен");
+    }
+
+    // ---------------------------------------------------------------
+    // decode_wsl_output: UTF-8 / UTF-16LE с BOM / UTF-16LE без BOM.
+    // ---------------------------------------------------------------
+
+    /// UTF-16LE-кодировка строки для тестов (опционально с BOM).
+    fn utf16le(text: &str, bom: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if bom {
+            bytes.extend_from_slice(&[0xFF, 0xFE]);
+        }
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn decode_wsl_output_passes_utf8_through() {
+        // Вывод Linux-команд (--exec) и современного wsl.exe — не трогаем.
+        let text = "2: eth0    inet 172.25.144.7/20 brd … scope global eth0\n";
+        assert_eq!(decode_wsl_output(text.as_bytes()), text);
+        assert_eq!(decode_wsl_output(b""), "");
+    }
+
+    #[test]
+    fn decode_wsl_output_reads_utf16le_with_bom() {
+        let bytes = utf16le("bottleforapps\r\nUbuntu\r\n", true);
+        assert_eq!(decode_wsl_output(&bytes), "bottleforapps\r\nUbuntu\r\n");
+    }
+
+    #[test]
+    fn decode_wsl_output_reads_utf16le_without_bom() {
+        // Старый inbox wsl.exe: UTF-16LE без BOM — маркер «нулевые байты».
+        let bytes = utf16le("The distribution already exists.\r\n", false);
+        assert_eq!(
+            decode_wsl_output(&bytes),
+            "The distribution already exists.\r\n"
+        );
+    }
+
+    #[test]
+    fn decode_wsl_output_falls_back_to_lossy_for_garbage() {
+        // Не UTF-8 и без нулевых байтов (не UTF-16LE) — lossy, без паники.
+        let bytes = [0xE4, 0xB8, 0xAD, 0xFF]; // обрезанный UTF-8 + мусор
+        let decoded = decode_wsl_output(&bytes);
+        assert!(!decoded.is_empty());
+    }
+
+    /// `--import` отказал («дистрибутив уже существует», 0xffffffff), но
+    /// перепроверка листинга видит дистрибутив: используем её и читаем
+    /// локальный токен вместо совета `wsl --unregister`.
+    #[tokio::test]
+    async fn import_conflict_with_existing_distribution_falls_back_to_local_token() {
+        /// Фейк: первый листинг дистрибутив «не видит» (симптом
+        /// inbox-WSL: UTF-16LE вывод не декодировался), `--import`
+        /// отказывает «уже существует» (0xffffffff), перепроверка
+        /// листинга дистрибутив видит.
+        struct AlreadyExistsWsl {
+            calls: Mutex<Vec<Call>>,
+        }
+
+        #[async_trait]
+        impl WslRunner for AlreadyExistsWsl {
+            async fn run(&self, args: &[&str], _stdin: Option<Vec<u8>>) -> io::Result<String> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(Call {
+                    args: args.iter().map(|s| s.to_string()).collect(),
+                    stdin: None,
+                });
+                if args == ["-l", "-q"] {
+                    let first = calls.iter().filter(|c| c.args() == ["-l", "-q"]).count() == 1;
+                    return Ok(if first {
+                        "Ubuntu\r\n".to_string()
+                    } else {
+                        format!("{DISTRIBUTION}\r\nUbuntu\r\n")
+                    });
+                }
+                if args.first() == Some(&"--import") {
+                    return Err(io::Error::other(
+                        "wsl --import завершился с кодом 0xffffffff: уже существует",
+                    ));
+                }
+                panic!("фейковый wsl: неожиданные аргументы {args:?}");
+            }
+        }
+
+        let (_tmp, store, rootfs) = test_store();
+        std::fs::write(store.appliance_token_path(), "local-token\n").unwrap();
+        let wsl = AlreadyExistsWsl {
+            calls: Mutex::new(Vec::new()),
+        };
+
+        // Проверяем provision_token напрямую: важен сам факт, что
+        // отказ --import при существующей дистрибуции приводит к чтению
+        // локального токена, а не к ошибке с советом `wsl --unregister`.
+        let token = provision_token(&wsl, &store, &rootfs)
+            .await
+            .expect("существующая дистрибуция используется, несмотря на отказ --import");
+
+        assert_eq!(token, "local-token");
+        let calls = wsl.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.args()[0] == "--import"),
+            "попытка импорта была: {calls:?}"
+        );
+        assert!(
+            calls.iter().filter(|c| c.args() == ["-l", "-q"]).count() >= 2,
+            "после отказа --import листинг перепроверяется: {calls:?}"
+        );
     }
 }

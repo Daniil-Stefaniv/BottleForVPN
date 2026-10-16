@@ -114,6 +114,30 @@ pub enum ProfileError {
     Toml(#[from] toml::de::Error),
 }
 
+/// Есть ли в конфиге OpenVPN голая директива `auth-user-pass` (без
+/// файла-аргумента): такой конфиг требует логин/пароль при каждом
+/// запуске — openvpn читает их из auth-файла, который подставляет агент.
+///
+/// Используется и демоном (запрос кредов до обращения к аплаенсу),
+/// и агентом (переписывание директивы на auth-файл).
+pub fn openvpn_config_needs_auth(config: &str) -> bool {
+    config.lines().any(is_bare_auth_user_pass_line)
+}
+
+/// Строка — голый `auth-user-pass`: первый токен совпадает, аргументов
+/// нет (комментарий `#` аргументом не считается).
+pub fn is_bare_auth_user_pass_line(line: &str) -> bool {
+    let line = line.trim();
+    let mut tokens = line.split_whitespace();
+    if tokens.next() != Some("auth-user-pass") {
+        return false;
+    }
+    match tokens.next() {
+        None => true,
+        Some(arg) => arg.starts_with('#'),
+    }
+}
+
 /// Резервированные имена устройств Windows. id бутылки становится именем
 /// файла `bottles/<id>.toml`, а Windows считает такие имена устройствами
 /// независимо от расширения (`nul.toml` так же неоткрываем, как `nul`) —
@@ -741,5 +765,28 @@ config = "c.conf"
             validate_profile(&p),
             Err(ProfileError::InvalidTarget)
         ));
+    }
+
+    // ---------------------------------------------------------------
+    // openvpn_config_needs_auth: детекция голого auth-user-pass.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn openvpn_needs_auth_detects_bare_directive() {
+        assert!(openvpn_config_needs_auth("client\nauth-user-pass\n"));
+        assert!(openvpn_config_needs_auth("  auth-user-pass  \n"));
+        // Комментарий после директивы — всё ещё голая форма.
+        assert!(openvpn_config_needs_auth("auth-user-pass # спросить\n"));
+    }
+
+    #[test]
+    fn openvpn_needs_auth_ignores_file_form_and_other_directives() {
+        assert!(!openvpn_config_needs_auth("auth-user-pass /etc/auth.txt\n"));
+        assert!(!openvpn_config_needs_auth("auth-user-pass auth.txt\n"));
+        assert!(!openvpn_config_needs_auth("# auth-user-pass\n"));
+        assert!(!openvpn_config_needs_auth(
+            "client\nremote vpn.example 443\n"
+        ));
+        assert!(!openvpn_config_needs_auth(""));
     }
 }

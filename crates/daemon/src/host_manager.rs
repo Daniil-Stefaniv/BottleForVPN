@@ -2539,7 +2539,10 @@ mod tests {
         let TestSetup { host, .. } = setup;
         let manager = BottleManager::new_with_host(store, Arc::new(FailingAgentConnect), host);
 
-        let reply = manager.start("corp").await.expect("start через менеджера");
+        let reply = manager
+            .start("corp", None)
+            .await
+            .expect("start через менеджера");
         assert_eq!(reply, CliReply::Started { id: "corp".into() });
 
         let bottles = manager.status().await;
@@ -2754,10 +2757,13 @@ mod tests {
             host,
         );
 
-        manager.start("corp").await.expect("первая бутылка");
+        manager.start("corp", None).await.expect("первая бутылка");
         // Вторая бутылка резолвится в другой адрес (B).
         resolver.set(vec![ip("198.51.100.20")]);
-        manager.start("partner").await.expect("вторая бутылка");
+        manager
+            .start("partner", None)
+            .await
+            .expect("вторая бутылка");
         let corp_socks5 = manager
             .status()
             .await
@@ -2833,7 +2839,7 @@ mod tests {
             Arc::new(FailingAgentConnect),
             host,
         );
-        manager.start("corp").await.expect("start");
+        manager.start("corp", None).await.expect("start");
 
         // Профиль удалён (load → NotFound): раньше stop уходил в env-ветку
         // «не запущена»; теперь сессия разбирается по runtime-состоянию.

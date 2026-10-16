@@ -238,6 +238,8 @@ async fn bottles_up_down_full_cycle() {
             target: format!("{WG_SRV_ADDR}:{}", echo_addr.port()),
         }],
         instance: INSTANCE,
+        username: None,
+        password: None,
     };
 
     let reply = bottles.up(args.clone()).await;
