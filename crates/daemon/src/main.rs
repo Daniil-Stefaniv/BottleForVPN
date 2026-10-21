@@ -59,6 +59,8 @@ mod manager;
 mod pipe;
 #[allow(dead_code)]
 mod ps_query;
+#[allow(dead_code)]
+mod registry;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod store;
 #[allow(dead_code)]
