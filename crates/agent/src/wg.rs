@@ -357,8 +357,17 @@ async fn wait_handshake(ns: &str, iface: &str, h: &mut NetnsHandle) -> Result<()
             ));
         }
         if Instant::now() + HANDSHAKE_POLL > deadline {
+            // Диагностика в тексте ошибки (CI-стенд agent-integration):
+            // счётчики transfer показывают, уходят ли initiation'ы и
+            // возвращаются ли ответы; маршруты — куда смотрит endpoint.
+            let show = run_in_ns(ns, &["wg", "show", iface])
+                .map(|s| s.trim().replace('\n', "; "))
+                .unwrap_or_else(|e| format!("wg show не удался: {e}"));
+            let routes = run_in_ns(ns, &["ip", "route", "show"])
+                .map(|s| s.trim().replace('\n', "; "))
+                .unwrap_or_else(|e| format!("ip route не удался: {e}"));
             return Err(AgentError::TunnelFailed(format!(
-                "handshake {iface} не произошёл за {} с",
+                "handshake {iface} не произошёл за {} с; wg show: {show}; маршруты: {routes}",
                 HANDSHAKE_WAIT.as_secs()
             )));
         }
