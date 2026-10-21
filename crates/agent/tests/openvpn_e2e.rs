@@ -301,6 +301,7 @@ fn cleanup_leftovers() {
     let _ = Command::new("ip").args(["link", "del", VETH_HOST]).status();
     let _ = std::fs::remove_file(KEY_FILE);
     remove_stale_veths();
+    cleanup_foreign_stands();
 }
 
 /// Сносит хостовые veth первых слотов, оставшиеся от аварийно
@@ -311,6 +312,32 @@ fn remove_stale_veths() {
         let _ = Command::new("ip")
             .args(["link", "del", &format!("p{idx}")])
             .status();
+    }
+}
+
+/// Сносит остатки СОСЕДНИХ srv-стендов этого CI-прогона: паника не
+/// доходит до разборного кода, и выживший чужой namespace с сервером на
+/// той же подсети 10.77.253.0/30 (duplicate route) молча съедает наши
+/// handshake'и. Тесты бегут последовательно — чужих живых стендов нет.
+fn cleanup_foreign_stands() {
+    for ns in ["t-be2e-srv", "t-wg-srv", "t-ovpn-srv"] {
+        let _ = Command::new("ip").args(["netns", "del", ns]).status();
+    }
+    for veth in ["t-be2e-h", "t-wg-h", "t-ovpn-h"] {
+        let _ = Command::new("ip").args(["link", "del", veth]).status();
+    }
+    for sock in [
+        "/var/run/wireguard/wgsrv.sock",
+        "/var/run/wireguard/wghs.sock",
+    ] {
+        let _ = std::fs::remove_file(sock);
+    }
+    for pattern in [
+        "wireguard-go wgsrv",
+        "wireguard-go wghs",
+        "openvpn --dev tun-srv",
+    ] {
+        let _ = Command::new("pkill").args(["-f", pattern]).status();
     }
 }
 
@@ -518,13 +545,42 @@ async fn socks5_connect_echo_with_retry(socks5_port: u16, target: SocketAddr) {
                 if Instant::now() >= deadline {
                     panic!(
                         "SOCKS5 CONNECT через мост 127.0.0.1:{socks5_port} к {target} \
-                         не прошёл за {WAIT:?}: {error:?}"
+                         не прошёл за {WAIT:?}: {error:?}\n{}",
+                        tunnel_diag()
                     );
                 }
                 tokio::time::sleep(RETRY).await;
             }
         }
     }
+}
+
+/// Снимок диагностики туннеля при непроходе трафика: хвост лога
+/// openvpn-клиента бутылки + адреса/маршруты обоих namespace.
+/// Видно, завершился ли «Initialization Sequence» и куда смотрит 10.99.3.0/24.
+fn tunnel_diag() -> String {
+    let log = std::fs::read_to_string(format!("/run/bottles/{ID}/openvpn.log"))
+        .map(|text| {
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            lines[lines.len().saturating_sub(12)..].join("\n")
+        })
+        .unwrap_or_else(|e| format!("<лог не прочитан: {e}>"));
+    let grab = |ns: &str| -> String {
+        Command::new("ip")
+            .args(["netns", "exec", ns, "ip", "-o", "addr"])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .replace('\n', "; ")
+            })
+            .unwrap_or_else(|e| format!("<{e}>"))
+    };
+    format!(
+        "лог клиента (хвост):\n{log}\nадреса bottle-{ID}: {}\nадреса {NS_SRV}: {}",
+        grab(&format!("bottle-{ID}")),
+        grab(NS_SRV),
+    )
 }
 
 /// Один цикл: согласование метода → CONNECT на echo → обмен байтами

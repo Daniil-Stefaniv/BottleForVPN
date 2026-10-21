@@ -397,6 +397,33 @@ fn cleanup_leftovers() {
     // с тем же именем интерфейса не должен его наследовать.
     let _ = std::fs::remove_file("/var/run/wireguard/wgsrv.sock");
     remove_stale_veths();
+    cleanup_foreign_stands();
+}
+
+/// Сносит остатки СОСЕДНИХ srv-стендов этого CI-прогона: паника не
+/// доходит до разборного кода, и выживший чужой namespace с сервером на
+/// той же подсети 10.77.253.0/30 (duplicate route) молча съедает наши
+/// handshake'и. Тесты бегут последовательно — чужих живых стендов нет.
+fn cleanup_foreign_stands() {
+    for ns in ["t-be2e-srv", "t-wg-srv", "t-ovpn-srv"] {
+        let _ = Command::new("ip").args(["netns", "del", ns]).status();
+    }
+    for veth in ["t-be2e-h", "t-wg-h", "t-ovpn-h"] {
+        let _ = Command::new("ip").args(["link", "del", veth]).status();
+    }
+    for sock in [
+        "/var/run/wireguard/wgsrv.sock",
+        "/var/run/wireguard/wghs.sock",
+    ] {
+        let _ = std::fs::remove_file(sock);
+    }
+    for pattern in [
+        "wireguard-go wgsrv",
+        "wireguard-go wghs",
+        "openvpn --dev tun-srv",
+    ] {
+        let _ = Command::new("pkill").args(["-f", pattern]).status();
+    }
 }
 
 /// Сносит хостовые veth первых слотов, оставшиеся от аварийно

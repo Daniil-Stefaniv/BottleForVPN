@@ -159,19 +159,7 @@ pub async fn netns_up(
         run_cmd("ip", &["netns", "add", &ns_name])?;
         ns_created = true;
 
-        run_cmd(
-            "ip",
-            &[
-                "link",
-                "add",
-                &peer_veth,
-                "type",
-                "veth",
-                "peer",
-                "name",
-                &inner_veth,
-            ],
-        )?;
+        add_veth_pair(&peer_veth, &inner_veth)?;
         run_cmd("ip", &["link", "set", &inner_veth, "netns", &ns_name])?;
         run_cmd(
             "ip",
@@ -310,6 +298,24 @@ pub fn netns_down(handle: NetnsHandle) -> Result<(), AgentError> {
     let (host_veth, _) = veth_names(slot.idx);
     wait_host_veth_gone(&host_veth);
     Ok(())
+}
+
+/// Создаёт veth-пару слота. Ядро сносит namespace асинхронно: хостовый
+/// конец прошлой бутылки на этом слоте может пережить `ip netns del` на
+/// миллисекунды (wait_host_veth_gone в netns_down сужает окно, но не
+/// гарантирует). «File exists» → снос сироты и одна повторная попытка.
+fn add_veth_pair(peer_veth: &str, inner_veth: &str) -> Result<(), AgentError> {
+    let args = [
+        "link", "add", peer_veth, "type", "veth", "peer", "name", inner_veth,
+    ];
+    match run_cmd("ip", &args) {
+        Ok(_) => Ok(()),
+        Err(AgentError::CommandFailed { stderr, .. }) if stderr.contains("File exists") => {
+            let _ = run_cmd("ip", &["link", "del", peer_veth]);
+            run_cmd("ip", &args).map(|_| ())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Ждёт исчезновения хостового конца veth-пары после `ip netns del`.
