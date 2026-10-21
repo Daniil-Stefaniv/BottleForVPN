@@ -213,8 +213,9 @@ pub async fn upgrade_appliance(
     store: &Store,
     rootfs_tar: &Path,
     connect_timeout: Duration,
+    force: bool,
 ) -> Result<String, DaemonError> {
-    upgrade_appliance_with_port(wsl, store, rootfs_tar, connect_timeout, AGENT_PORT).await
+    upgrade_appliance_with_port(wsl, store, rootfs_tar, connect_timeout, AGENT_PORT, force).await
 }
 
 /// Реализация [`upgrade_appliance`] с настраиваемым портом агента
@@ -225,7 +226,16 @@ async fn upgrade_appliance_with_port(
     rootfs_tar: &Path,
     connect_timeout: Duration,
     port: u16,
+    force: bool,
 ) -> Result<String, DaemonError> {
+    // Полный сброс (`upgrade --force`, кнопка «Сбросить аплаенс»): гасим
+    // WSL целиком — это снимает блокировки VHD работающей VM, из-за
+    // которых unregister молча не отрабатывал (inbox wsl.exe, 0.2.4-0.2.6).
+    if force {
+        if let Err(error) = wsl.run(&["--shutdown"], None).await {
+            tracing::warn!(%error, "wsl --shutdown не удался — продолжаю");
+        }
+    }
     // Сначала гасим VM и снимаем регистрацию: --unregister по работающей
     // дистрибуции может не отработать (VHD заблокирован), и последующий
     // --import упадёт с невнятным «дистрибуция уже существует» (exit code
@@ -245,11 +255,16 @@ async fn upgrade_appliance_with_port(
 
 /// Гасит VM и снимает регистрацию дистрибуции аплаенса с проверкой
 /// результата: после каждой попытки смотрит `wsl -l -q`. Вторая попытка —
-/// с паузой, VM отпускает VHD не мгновенно. Ошибка — с ручной инструкцией;
-/// вызывающий при этом НЕ удаляет локальный токен.
+/// с паузой, VM отпускает VHD не мгновенно; третья — после полного
+/// `wsl --shutdown` (снимает блокировки VHD на inbox wsl.exe). Ошибка —
+/// с ручной инструкцией; вызывающий при этом НЕ удаляет локальный токен.
 async fn unregister_appliance(wsl: &dyn WslRunner) -> Result<(), DaemonError> {
-    for attempt in 0..2 {
-        if let Err(error) = wsl.run(&["--terminate", DISTRIBUTION], None).await {
+    for attempt in 0..3 {
+        if attempt == 2 {
+            if let Err(error) = wsl.run(&["--shutdown"], None).await {
+                tracing::warn!(%error, "wsl --shutdown не удался — продолжаю");
+            }
+        } else if let Err(error) = wsl.run(&["--terminate", DISTRIBUTION], None).await {
             tracing::warn!(%error, "wsl --terminate не удался (дистрибуции нет?) — продолжаю");
         }
         if attempt > 0 {
@@ -825,6 +840,9 @@ mod tests {
             if args.first() == Some(&"--terminate") {
                 return Ok(String::new());
             }
+            if args.first() == Some(&"--shutdown") {
+                return Ok(String::new());
+            }
             if args.first() == Some(&"--unregister") {
                 use std::sync::atomic::Ordering::SeqCst;
                 if self.unregister_failures.load(SeqCst) > 0 {
@@ -1151,10 +1169,16 @@ mod tests {
         )
         .await;
 
-        let new_version =
-            upgrade_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
-                .await
-                .expect("upgrade доходит до handshake");
+        let new_version = upgrade_appliance_with_port(
+            &wsl,
+            &store,
+            &rootfs,
+            Duration::from_secs(5),
+            addr.port(),
+            false,
+        )
+        .await
+        .expect("upgrade доходит до handshake");
 
         assert_eq!(
             new_version, "0.1.0-test",
@@ -1199,9 +1223,15 @@ mod tests {
         )
         .await;
 
-        let result =
-            upgrade_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
-                .await;
+        let result = upgrade_appliance_with_port(
+            &wsl,
+            &store,
+            &rootfs,
+            Duration::from_secs(5),
+            addr.port(),
+            false,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -1228,10 +1258,16 @@ mod tests {
         )
         .await;
 
-        let new_version =
-            upgrade_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
-                .await
-                .expect("вторая попытка unregister успешна");
+        let new_version = upgrade_appliance_with_port(
+            &wsl,
+            &store,
+            &rootfs,
+            Duration::from_secs(5),
+            addr.port(),
+            false,
+        )
+        .await
+        .expect("вторая попытка unregister успешна");
 
         assert_eq!(new_version, "0.1.0-test");
         let calls = wsl.calls();
@@ -1250,7 +1286,44 @@ mod tests {
         assert_ne!(new_token, "old-token", "токен перегенерирован");
     }
 
-    /// Дистрибуция пережила обе попытки unregister: upgrade отвечает
+    /// `upgrade --force` (кнопка «Сбросить аплаенс»): WSL гасится целиком
+    /// до unregister — так снимаются блокировки VHD.
+    #[tokio::test]
+    async fn force_upgrade_shuts_down_wsl_before_unregister() {
+        let (_tmp, store, rootfs) = test_store();
+        std::fs::write(store.appliance_token_path(), "old-token\n").unwrap();
+        let wsl = FakeWsl::new(true);
+        wsl.token.set("old-token".to_string());
+        let addr = spawn_fake_agent(
+            AgentScenario::Happy {
+                answer_requests: usize::MAX,
+            },
+            wsl.token.clone(),
+        )
+        .await;
+
+        let new_version = upgrade_appliance_with_port(
+            &wsl,
+            &store,
+            &rootfs,
+            Duration::from_secs(5),
+            addr.port(),
+            true,
+        )
+        .await
+        .expect("force-upgrade доходит до handshake");
+
+        assert_eq!(new_version, "0.1.0-test");
+        let calls = wsl.calls();
+        let shutdown = position(&calls, "--shutdown");
+        let unregister = position(&calls, "--unregister");
+        assert!(
+            shutdown < unregister,
+            "wsl --shutdown до снятия регистрации: {calls:?}"
+        );
+    }
+
+    /// Дистрибуция пережила все три попытки unregister: upgrade отвечает
     /// понятной ошибкой с ручной инструкцией и НЕ удаляет локальный токен
     /// (0.2.4 удалял — дистрибутив оставалась без токена, «токен утерян»).
     #[tokio::test]
@@ -1259,11 +1332,12 @@ mod tests {
         std::fs::write(store.appliance_token_path(), "old-token\n").unwrap();
         let wsl = FakeWsl::new(true);
         wsl.unregister_failures
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+            .store(3, std::sync::atomic::Ordering::SeqCst);
 
-        let error = upgrade_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), 1)
-            .await
-            .expect_err("застрявшая дистрибуция — ошибка");
+        let error =
+            upgrade_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), 1, false)
+                .await
+                .expect_err("застрявшая дистрибуция — ошибка");
 
         assert!(
             error.to_string().contains("wsl --unregister"),

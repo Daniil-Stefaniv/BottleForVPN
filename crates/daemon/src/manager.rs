@@ -791,6 +791,35 @@ impl BottleManager {
         }
     }
 
+    /// Останавливает все активные бутылки по одной (best effort) — перед
+    /// полным сбросом аплаенса (`upgrade --force`) и при остановке демона.
+    /// Возвращает id бутылок, которые остановить не удалось.
+    pub async fn stop_all(&self) -> Vec<String> {
+        let ids: Vec<String> = self
+            .status()
+            .await
+            .into_iter()
+            .filter(|state| {
+                matches!(
+                    state.state,
+                    BottleState::Starting
+                        | BottleState::Up
+                        | BottleState::Degraded { .. }
+                        | BottleState::Stopping
+                )
+            })
+            .map(|state| state.id)
+            .collect();
+        let mut failed = Vec::new();
+        for id in ids {
+            match self.stop(&id).await {
+                Ok(CliReply::Error { .. }) | Err(_) => failed.push(id),
+                Ok(_) => {}
+            }
+        }
+        failed
+    }
+
     /// Опускает бутылку: env — `Down` агенту, задачи и слушатели — вниз;
     /// host — делегируется [`HostManager`] (спека §7.2, шаг 6).
     ///
@@ -2739,6 +2768,7 @@ mod tests {
             Some(&manager),
             None,
             None,
+            None,
             bottle_core::ipc::CliRequest::Delete {
                 id: "office-a".to_string(),
             },
@@ -2786,6 +2816,7 @@ mod tests {
             Some(&manager),
             None,
             None,
+            None,
             bottle_core::ipc::CliRequest::Delete {
                 id: "office-a".to_string(),
             },
@@ -2819,7 +2850,8 @@ mod tests {
             Some(&manager),
             None,
             None,
-            bottle_core::ipc::CliRequest::Upgrade,
+            None,
+            bottle_core::ipc::CliRequest::Upgrade { force: false },
         )
         .await;
 
@@ -2857,6 +2889,7 @@ mod tests {
             Some(&manager),
             None,
             None,
+            None,
             bottle_core::ipc::CliRequest::Stop {
                 id: "office-a".to_string(),
             },
@@ -2884,6 +2917,7 @@ mod tests {
             Some(&manager),
             None,
             None,
+            None,
             bottle_core::ipc::CliRequest::Start {
                 id: "office-a".to_string(),
                 credentials: None,
@@ -2901,6 +2935,7 @@ mod tests {
         let reply = crate::pipe::dispatch(
             &store,
             Some(&manager),
+            None,
             None,
             None,
             bottle_core::ipc::CliRequest::Show {
@@ -2922,6 +2957,7 @@ mod tests {
             Some(&manager),
             None,
             None,
+            None,
             bottle_core::ipc::CliRequest::Status,
         )
         .await;
@@ -2936,6 +2972,7 @@ mod tests {
         let reply = crate::pipe::dispatch(
             &store,
             Some(&manager),
+            None,
             None,
             None,
             bottle_core::ipc::CliRequest::Stop {
@@ -2953,6 +2990,7 @@ mod tests {
         let reply = crate::pipe::dispatch(
             &store,
             Some(&manager),
+            None,
             None,
             None,
             bottle_core::ipc::CliRequest::Status,

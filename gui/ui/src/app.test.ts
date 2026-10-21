@@ -243,6 +243,125 @@ describe("nextPollDelayMs (I4: backoff при выключенном демон�
   });
 });
 
+describe("кнопки аплаенса и остановки демона", () => {
+  // Фикстура с шапкой и doctor-экраном, где живут новые кнопки.
+  const HTML_BUTTONS = `
+  <main id="app">
+    <header id="app-header">
+      <nav id="tabs"></nav>
+      <button id="daemon-stop" type="button">Остановить всё</button>
+    </header>
+    <section id="screen-list" class="screen">
+      <span id="list-count"></span>
+      <div id="bottle-list"></div>
+      <div id="bottle-detail"></div>
+    </section>
+    <section id="screen-doctor" class="screen" hidden>
+      <p id="doctor-summary" class="muted"></p>
+      <div id="doctor-list"></div>
+      <button id="appliance-upgrade" type="button">Обновить аплаенс</button>
+      <button id="appliance-reset" type="button">Сбросить аплаенс</button>
+      <p id="logs-path" hidden></p>
+    </section>
+    <section id="daemon-panel" hidden>
+      <p id="daemon-hint"></p>
+      <button id="daemon-start">Запустить демона</button>
+      <pre id="daemon-log"></pre>
+    </section>
+    <footer id="statusbar">
+      <span id="statusbar-daemon"></span>
+      <span id="statusbar-active"></span>
+      <span id="statusbar-updated"></span>
+    </footer>
+    <div id="toast" hidden></div>
+  </main>`;
+
+  const doctorReply = {
+    DoctorReport: { items: [{ code: "wsl", status: "Ok", detail: "ок" }] },
+  };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("«Обновить аплаенс» шлёт upgrade и показывает версии тостом", async () => {
+    document.body.innerHTML = HTML_BUTTONS;
+    const invoker = stubInvoker([
+      listReply,
+      statusReply, // начальный refresh при mountApp
+      { Upgraded: { previous: "0.2.4", current: "0.2.7" } },
+      doctorReply,
+      listReply,
+      statusReply,
+    ]);
+    mountApp({ once: true });
+    // Дожидаемся начального refresh (list+status), чтобы клик не
+    // перехватил их ответы из очереди.
+    await vi.waitFor(() =>
+      expect(invoker.calls).toContainEqual(["--json", "status"]),
+    );
+    document.querySelector<HTMLButtonElement>("#appliance-upgrade")?.click();
+    await vi.waitFor(() =>
+      expect(invoker.calls).toContainEqual(["--json", "upgrade"]),
+    );
+    await vi.waitFor(() =>
+      expect(document.querySelector("#toast")?.textContent).toContain(
+        "0.2.4 → 0.2.7",
+      ),
+    );
+  });
+
+  it("«Сбросить аплаенс» без подтверждения ничего не шлёт, с подтверждением — upgrade --force", async () => {
+    document.body.innerHTML = HTML_BUTTONS;
+    const { setConfirmAction } = await import("./app");
+    const invoker = stubInvoker([listReply, statusReply]);
+    mountApp({ once: true });
+    // Дожидаемся начального refresh, чтобы клик не перехватил его ответы.
+    await vi.waitFor(() =>
+      expect(invoker.calls).toContainEqual(["--json", "status"]),
+    );
+    setConfirmAction(() => false);
+    document.querySelector<HTMLButtonElement>("#appliance-reset")?.click();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(invoker.calls).not.toContainEqual(["--json", "upgrade", "--force"]);
+
+    setConfirmAction(() => true);
+    invoker.next({ Upgraded: { previous: null, current: "0.2.7" } });
+    invoker.next(doctorReply);
+    invoker.next(listReply);
+    invoker.next(statusReply);
+    document.querySelector<HTMLButtonElement>("#appliance-reset")?.click();
+    await vi.waitFor(() =>
+      expect(invoker.calls).toContainEqual(["--json", "upgrade", "--force"]),
+    );
+  });
+
+  it("«Остановить всё» с подтверждением шлёт daemon stop", async () => {
+    document.body.innerHTML = HTML_BUTTONS;
+    const { setConfirmAction } = await import("./app");
+    setConfirmAction(() => true);
+    const invoker = stubInvoker([
+      listReply,
+      statusReply, // начальный refresh при mountApp
+      { Done: { warning: null } },
+    ]);
+    mountApp({ once: true });
+    // Дожидаемся начального refresh, чтобы клик не перехватил его ответы.
+    await vi.waitFor(() =>
+      expect(invoker.calls).toContainEqual(["--json", "status"]),
+    );
+    document.querySelector<HTMLButtonElement>("#daemon-stop")?.click();
+    await vi.waitFor(() =>
+      expect(invoker.calls).toContainEqual(["--json", "daemon", "stop"]),
+    );
+    await vi.waitFor(() =>
+      expect(document.querySelector("#toast")?.textContent).toContain(
+        "Демон останавливается",
+      ),
+    );
+  });
+});
+
 describe("refreshBottles: частичные данные (M7)", () => {
   it("отказ status не прячет список — строки без рантайма", async () => {
     document.body.innerHTML = HTML;

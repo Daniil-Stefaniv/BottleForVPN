@@ -93,7 +93,24 @@ enum Command {
         command: RoutesCommand,
     },
     /// Пере-импорт аплаенса (снос дистрибуции WSL + импорт из rootfs)
-    Upgrade,
+    Upgrade {
+        /// Полный сброс: остановить все бутылки, погасить WSL целиком
+        /// и переустановить дистрибуцию (когда обычный upgrade не помог)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Управление демоном
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+}
+
+/// Подкоманды `bottle daemon`.
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Остановить все бутылки и завершить процесс демона
+    Stop,
 }
 
 /// Подкоманды `bottle routes`.
@@ -267,7 +284,10 @@ impl Command {
             Command::Routes {
                 command: RoutesCommand::Cleanup,
             } => CliRequest::RoutesCleanup,
-            Command::Upgrade => CliRequest::Upgrade,
+            Command::Upgrade { force } => CliRequest::Upgrade { force: *force },
+            Command::Daemon {
+                command: DaemonCommand::Stop,
+            } => CliRequest::ShutdownDaemon,
             Command::Logs {
                 command: LogsCommand::Export { dest },
             } => CliRequest::LogsExport { dest: dest.clone() },
@@ -606,13 +626,20 @@ fn handle_reply(command: &Command, reply: CliReply) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        (Command::Upgrade, CliReply::Upgraded { previous, current }) => {
+        (Command::Upgrade { .. }, CliReply::Upgraded { previous, current }) => {
             match previous {
                 Some(previous) => println!(
                     "Аплаенс обновлён: версия {previous} → {current}; \
                      профили бутылок сохранены"
                 ),
                 None => println!("Аплаенс обновлён: версия {current}; профили бутылок сохранены"),
+            }
+            ExitCode::SUCCESS
+        }
+        (Command::Daemon { .. }, CliReply::Done { warning }) => {
+            println!("Демон останавливается (бутылки остановлены)");
+            if let Some(warning) = warning {
+                eprintln!("Внимание: {warning}");
             }
             ExitCode::SUCCESS
         }
@@ -895,10 +922,21 @@ mod tests {
     /// upgrade и routes cleanup разбираются и отображаются в запросы.
     #[test]
     fn parses_upgrade_and_routes_cleanup() {
-        assert!(matches!(parse(&["bottle", "upgrade"]), Command::Upgrade));
+        assert!(matches!(
+            parse(&["bottle", "upgrade"]),
+            Command::Upgrade { force: false }
+        ));
         assert_eq!(
             parse(&["bottle", "upgrade"]).to_request(),
-            CliRequest::Upgrade
+            CliRequest::Upgrade { force: false }
+        );
+        assert_eq!(
+            parse(&["bottle", "upgrade", "--force"]).to_request(),
+            CliRequest::Upgrade { force: true }
+        );
+        assert_eq!(
+            parse(&["bottle", "daemon", "stop"]).to_request(),
+            CliRequest::ShutdownDaemon
         );
         assert_eq!(
             parse(&["bottle", "routes", "cleanup"]).to_request(),
@@ -911,7 +949,7 @@ mod tests {
     fn upgraded_done_replies_are_success() {
         assert_eq!(
             handle_reply(
-                &Command::Upgrade,
+                &Command::Upgrade { force: false },
                 CliReply::Upgraded {
                     previous: Some("0.1.0".to_string()),
                     current: "0.2.0".to_string(),

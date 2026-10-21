@@ -131,7 +131,17 @@ pub enum CliRequest {
     /// Удалить бутылку (отказ, если она активна).
     Delete { id: String },
     /// Пере-импорт аплаенса из rootfs (отказ при живых бутылках).
-    Upgrade,
+    /// `force` — полный сброс: все бутылки останавливаются принудительно,
+    /// WSL гасится целиком (`wsl --shutdown`), регистрация дистрибуции
+    /// снимается с ретраями, токен пересоздаётся.
+    Upgrade {
+        /// Полный сброс (остановка бутылок и WSL).
+        #[serde(default)]
+        force: bool,
+    },
+    /// Остановить все бутылки и завершить процесс демона (кнопка
+    /// «Остановить всё» в GUI / `bottle daemon stop`).
+    ShutdownDaemon,
     /// Снять сиротские маршруты через службу (bottle routes cleanup).
     RoutesCleanup,
 }
@@ -386,7 +396,9 @@ mod tests {
             CliRequest::Delete {
                 id: "office-a".to_string(),
             },
-            CliRequest::Upgrade,
+            CliRequest::Upgrade { force: false },
+            CliRequest::Upgrade { force: true },
+            CliRequest::ShutdownDaemon,
             CliRequest::RoutesCleanup,
         ];
         for req in requests {

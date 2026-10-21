@@ -125,6 +125,7 @@ async fn handle_connection(
                 daemon.manager.as_deref(),
                 daemon.wsl.as_deref(),
                 daemon.rootfs.as_deref(),
+                Some(&shutdown),
                 req,
             ) => reply,
             () = shutdown.cancelled() => break,

@@ -61,6 +61,7 @@ pub async fn dispatch(
     manager: Option<&BottleManager>,
     wsl: Option<&dyn WslRunner>,
     rootfs: Option<&std::path::Path>,
+    shutdown: Option<&tokio_util::sync::CancellationToken>,
     req: CliRequest,
 ) -> CliReply {
     match req {
@@ -148,33 +149,53 @@ pub async fn dispatch(
                 message: MANAGER_NOT_WIRED.to_string(),
             },
         },
-        CliRequest::Upgrade => {
+        CliRequest::Upgrade { force } => {
             let Some(manager) = manager else {
                 return CliReply::Error {
                     message: MANAGER_NOT_WIRED.to_string(),
                 };
             };
-            // Живые бутылки держат сессии аплаенса: сносить дистрибуцию
-            // под ними нельзя (Review Focus #2) — проверка до всего.
-            let live: Vec<String> = manager
-                .status()
-                .await
-                .into_iter()
-                .filter(|state| {
-                    matches!(
-                        state.state,
-                        BottleState::Starting
-                            | BottleState::Up
-                            | BottleState::Degraded { .. }
-                            | BottleState::Stopping
-                    )
-                })
-                .map(|state| state.id)
-                .collect();
-            if !live.is_empty() {
-                return CliReply::Error {
-                    message: format!("остановите бутылки перед обновлением: {}", live.join(", ")),
-                };
+            if force {
+                // Полный сброс: бутылки останавливаются принудительно,
+                // дальше appliance гасит WSL целиком и пере-импортирует
+                // дистрибуцию (кнопка «Сбросить аплаенс» в GUI).
+                let failed = manager.stop_all().await;
+                if !failed.is_empty() {
+                    return CliReply::Error {
+                        message: format!(
+                            "не удалось остановить бутылки: {} — остановите их вручную и повторите",
+                            failed.join(", ")
+                        ),
+                    };
+                }
+            } else {
+                // Живые бутылки держат сессии аплаенса: сносить
+                // дистрибуцию под ними нельзя (Review Focus #2) —
+                // проверка до всего.
+                let live: Vec<String> = manager
+                    .status()
+                    .await
+                    .into_iter()
+                    .filter(|state| {
+                        matches!(
+                            state.state,
+                            BottleState::Starting
+                                | BottleState::Up
+                                | BottleState::Degraded { .. }
+                                | BottleState::Stopping
+                        )
+                    })
+                    .map(|state| state.id)
+                    .collect();
+                if !live.is_empty() {
+                    return CliReply::Error {
+                        message: format!(
+                            "остановите бутылки перед обновлением: {} \
+                             (или `bottle upgrade --force` — они будут остановлены)",
+                            live.join(", ")
+                        ),
+                    };
+                }
             }
             let (Some(wsl), Some(rootfs)) = (wsl, rootfs) else {
                 return CliReply::Error {
@@ -187,6 +208,7 @@ pub async fn dispatch(
                 store,
                 rootfs,
                 crate::manager::AGENT_CONNECT_TIMEOUT,
+                force,
             )
             .await
             {
@@ -197,6 +219,27 @@ pub async fn dispatch(
                 Err(error) => CliReply::Error {
                     message: format!("обновление аплаенса не удалось: {error}"),
                 },
+            }
+        }
+        CliRequest::ShutdownDaemon => {
+            if let Some(manager) = manager {
+                let failed = manager.stop_all().await;
+                if !failed.is_empty() {
+                    tracing::warn!(ids = ?failed, "часть бутылок не остановилась при shutdown");
+                }
+            }
+            // Отменяем serve с задержкой: кадр ответа должен уйти
+            // клиенту до остановки транспорта. Без токена (тесты) —
+            // просто отвечаем.
+            if let Some(shutdown) = shutdown {
+                let token = shutdown.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    token.cancel();
+                });
+            }
+            CliReply::Done {
+                warning: Some("демон останавливается".to_string()),
             }
         }
         CliRequest::RoutesCleanup => {
@@ -447,6 +490,7 @@ async fn handle_connection(
                 daemon.manager.as_deref(),
                 daemon.wsl.as_deref(),
                 daemon.rootfs.as_deref(),
+                Some(&shutdown),
                 req,
             ) => reply,
             () = shutdown.cancelled() => break,
@@ -590,7 +634,7 @@ endpoints = ["e.example"]
     async fn list_returns_summaries_of_valid_profiles_only() {
         let (_tmp, store) = store_with_broken_profile();
 
-        let reply = dispatch(&store, None, None, None, CliRequest::List).await;
+        let reply = dispatch(&store, None, None, None, None, CliRequest::List).await;
 
         let CliReply::List { bottles } = reply else {
             panic!("ожидали List, получили {reply:?}");
@@ -608,7 +652,7 @@ endpoints = ["e.example"]
     async fn list_over_empty_store_is_empty() {
         let (_tmp, store) = empty_store();
 
-        let reply = dispatch(&store, None, None, None, CliRequest::List).await;
+        let reply = dispatch(&store, None, None, None, None, CliRequest::List).await;
 
         assert_eq!(
             reply,
@@ -623,6 +667,7 @@ endpoints = ["e.example"]
 
         let reply = dispatch(
             &store,
+            None,
             None,
             None,
             None,
@@ -647,6 +692,7 @@ endpoints = ["e.example"]
 
         let reply = dispatch(
             &store,
+            None,
             None,
             None,
             None,
@@ -682,7 +728,7 @@ endpoints = ["e.example"]
 
         for req in commands {
             assert_eq!(
-                dispatch(&store, None, None, None, req).await,
+                dispatch(&store, None, None, None, None, req).await,
                 CliReply::Error {
                     message: MANAGER_NOT_WIRED.to_string(),
                 },
@@ -702,6 +748,7 @@ endpoints = ["e.example"]
 
         let reply = dispatch(
             &store,
+            None,
             None,
             None,
             None,
@@ -746,6 +793,7 @@ endpoints = ["e.example"]
             None,
             None,
             None,
+            None,
             CliRequest::Create {
                 profile: env_openvpn_profile("corp", src.to_str().unwrap()),
                 force: false,
@@ -786,6 +834,7 @@ endpoints = ["e.example"]
             None,
             None,
             None,
+            None,
             CliRequest::Create {
                 profile: env_openvpn_profile("corp", src.to_str().unwrap()),
                 force: false,
@@ -815,6 +864,7 @@ endpoints = ["e.example"]
             None,
             None,
             None,
+            None,
             CliRequest::Create {
                 profile: env_profile("office-a", src.to_str().unwrap()),
                 force: false,
@@ -836,6 +886,7 @@ endpoints = ["e.example"]
 
         let reply = dispatch(
             &store,
+            None,
             None,
             None,
             None,
@@ -875,6 +926,7 @@ endpoints = ["e.example"]
             None,
             None,
             None,
+            None,
             CliRequest::Create {
                 profile,
                 force: false,
@@ -904,6 +956,7 @@ endpoints = ["e.example"]
             None,
             None,
             None,
+            None,
             CliRequest::Create {
                 profile: host_profile("corp-vpn"),
                 force: false,
@@ -927,6 +980,7 @@ endpoints = ["e.example"]
 
         let reply = dispatch(
             &store,
+            None,
             None,
             None,
             None,
@@ -966,6 +1020,7 @@ endpoints = ["e.example"]
             None,
             None,
             None,
+            None,
             CliRequest::Delete {
                 id: "ghost".to_string(),
             },
@@ -981,7 +1036,7 @@ endpoints = ["e.example"]
     async fn routes_cleanup_without_service_warns() {
         let (_tmp, store) = empty_store();
 
-        let reply = dispatch(&store, None, None, None, CliRequest::RoutesCleanup).await;
+        let reply = dispatch(&store, None, None, None, None, CliRequest::RoutesCleanup).await;
 
         match reply {
             CliReply::Done {

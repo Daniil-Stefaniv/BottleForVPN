@@ -438,6 +438,80 @@ async function onCollectLogs(): Promise<void> {
   }
 }
 
+/** Подтверждение разрушительных действий; подменяется в тестах. */
+let confirmAction: (message: string) => boolean = (message) =>
+  window.confirm(message);
+
+export function setConfirmAction(fn: (message: string) => boolean): void {
+  confirmAction = fn;
+}
+
+/**
+ * «Обновить аплаенс» / «Сбросить аплаенс»: `bottle upgrade [--force]`.
+ * Сброс дополнительно останавливает все бутылки и гасит WSL целиком —
+ * спрашиваем подтверждение. По завершении обновляем диагностику.
+ */
+async function onApplianceUpgrade(force: boolean): Promise<void> {
+  if (
+    force &&
+    !confirmAction(
+      "Сброс аплаенса остановит все бутылки, перезапустит WSL " +
+        "(все его дистрибутивы) и переустановит аплаенс с нуля. Продолжить?",
+    )
+  ) {
+    return;
+  }
+  const args = force
+    ? ["--json", "upgrade", "--force"]
+    : ["--json", "upgrade"];
+  try {
+    const reply = await runBottleReply(args);
+    if ("Upgraded" in reply) {
+      const { previous, current } = reply.Upgraded;
+      showToast(
+        previous !== null
+          ? `Аплаенс обновлён: версия ${previous} → ${current}`
+          : `Аплаенс обновлён: версия ${current}`,
+        "success",
+      );
+    } else if ("Error" in reply) {
+      showToast(reply.Error.message);
+    } else {
+      showToast("Неожиданный ответ демона на upgrade");
+    }
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error));
+  }
+  await loadDoctor().catch(() => undefined);
+  await refreshBottles();
+}
+
+/**
+ * «Остановить всё»: `bottle daemon stop` — бутылки останавливаются,
+ * процесс демона завершается. Опрос состояния сам покажет панель
+ * «демон не запущен».
+ */
+async function onDaemonStop(): Promise<void> {
+  if (
+    !confirmAction(
+      "Остановить все бутылки и завершить демона? " +
+        "Запустить его снова можно кнопкой «Запустить демона».",
+    )
+  ) {
+    return;
+  }
+  try {
+    const reply = await runBottleReply(["--json", "daemon", "stop"]);
+    if ("Error" in reply) {
+      showToast(reply.Error.message);
+    } else {
+      showToast("Демон останавливается", "success");
+    }
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error));
+  }
+}
+
 /** Показ/скрытие секций формы по типу бутылки (env ↔ host). */
 function syncKindFields(): void {
   const kind = document.querySelector<HTMLSelectElement>("#f-kind")?.value;
@@ -527,6 +601,21 @@ export function mountApp(options?: { once?: boolean }): { noop: boolean } {
       if (lastLogsPath !== null && revealInDir !== null) {
         void revealInDir(lastLogsPath);
       }
+    });
+  document
+    .querySelector<HTMLButtonElement>("#appliance-upgrade")
+    ?.addEventListener("click", () => {
+      void onApplianceUpgrade(false);
+    });
+  document
+    .querySelector<HTMLButtonElement>("#appliance-reset")
+    ?.addEventListener("click", () => {
+      void onApplianceUpgrade(true);
+    });
+  document
+    .querySelector<HTMLButtonElement>("#daemon-stop")
+    ?.addEventListener("click", () => {
+      void onDaemonStop();
     });
   syncKindFields();
   void refreshBottles();

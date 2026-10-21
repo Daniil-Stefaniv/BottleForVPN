@@ -87,6 +87,24 @@ body {
 }
 
 #tabs {
+  flex: 1;
+}
+
+/* «Остановить всё» — завершение демона из шапки; намеренно заметная,
+   но не красная кнопка: действие обратимо перезапуском. */
+#daemon-stop {
+  margin-left: auto;
+  font-size: 0.8rem;
+  padding: 0.25rem 0.7rem;
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+#daemon-stop:hover {
+  background: var(--danger-bg);
+}
+
+#tabs {
   display: flex;
   gap: 2px;
 }

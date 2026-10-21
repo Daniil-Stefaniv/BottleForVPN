@@ -15,6 +15,9 @@
           <button class="tab" data-screen="create">Создать</button>
           <button class="tab" data-screen="doctor">Диагностика</button>
         </nav>
+        <button id="daemon-stop" type="button" title="Остановить все бутылки и демона">
+          Остановить всё
+        </button>
       </header>
 
       <section id="screen-list" class="screen">
@@ -154,6 +157,12 @@
             <div class="doctor-actions">
               <button id="doctor-refresh" type="button">Проверить снова</button>
               <button id="logs-export" type="button">Собрать логи</button>
+              <button id="appliance-upgrade" type="button" title="Пере-импорт аплаенса из свежего rootfs (бутылки должны быть остановлены)">
+                Обновить аплаенс
+              </button>
+              <button id="appliance-reset" type="button" title="Остановить все бутылки, перезапустить WSL и переустановить аплаенс с нуля">
+                Сбросить аплаенс
+              </button>
             </div>
           </div>
           <div id="doctor-list"></div>
