@@ -16,7 +16,7 @@ thiserror = "2"
 tracing = "0.1"
 bytes = "1"
 # RFC3339-метки событий лога (events::now_ts) без C-зависимостей.
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "macros"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 # UDS-клиент читает кадры через FramedRead (M4 Task 7).
 tokio-stream = "0.1"

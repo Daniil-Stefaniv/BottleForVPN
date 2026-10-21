@@ -32,8 +32,9 @@ pub struct Event {
     pub ts: String,
     pub level: Level,
     pub src: Src,
-    /// Код события из [`REGISTRY`].
-    pub event: &'static str,
+    /// Код события из [`REGISTRY`]. `String`, а не `&'static str`:
+    /// событие ездит по каналу GUI↔демон и десериализуется на приёме.
+    pub event: String,
     /// Описание по шаблону реестра с подставленными параметрами.
     pub desc: String,
     /// Структурные параметры; секреты запрещены (спека §6).
@@ -95,12 +96,13 @@ pub fn render(code: &str, ctx: serde_json::Map<String, serde_json::Value>) -> Op
 /// Текущая метка времени: RFC3339 UTC с миллисекундами
 /// (`2026-10-21T21:12:04.331Z`).
 pub fn now_ts() -> String {
-    let now = time::OffsetDateTime::now_utc();
-    let format = time::format_description::parse(
-        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
-    )
-    .expect("формат ts валиден");
-    now.format(&format).expect("дата форматируется")
+    const FORMAT: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        );
+    time::OffsetDateTime::now_utc()
+        .format(FORMAT)
+        .expect("дата форматируется")
 }
 
 #[cfg(test)]
@@ -127,7 +129,7 @@ mod tests {
             ts: now_ts(),
             level: Level::Info,
             src: Src::Gui,
-            event: "bottle.created",
+            event: "bottle.created".to_string(),
             desc: "Бутылка a создана".into(),
             ctx: Default::default(),
         };
