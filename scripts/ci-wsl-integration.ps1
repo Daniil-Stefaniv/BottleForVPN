@@ -103,6 +103,20 @@ function Show-DaemonLog {
     }
 }
 
+# Снимок состояния обоих дистрибутивов VM (диагностика при провале):
+# жив ли bottle-agent, кто слушает :7777 в общем network namespace,
+# адреса интерфейсов. Отвечает на главный вопрос сценария — почему
+# «агент аплаенса не ответил за 30 s».
+function Show-ApplianceState {
+    foreach ($distro in @('bottleforapps', $CiDistro)) {
+        Write-Host "----- дистрибутив ${distro}: ps / слушатели / адреса -----"
+        $ErrorActionPreference = 'Continue'
+        $probe = & wsl.exe -d $distro --exec /bin/sh -c 'ps; echo ---; ss -ltnp; echo ---; ip -o addr' 2>&1
+        $ErrorActionPreference = 'Stop'
+        Write-Host ($probe | Out-String)
+    }
+}
+
 # SOCKS5-negotiate: TCP к 127.0.0.1:$Port, метод «без аутентификации»
 # 05 01 00 → ожидаем 05 00 (та же проверка, что в юнит-тестах relay T16).
 function Invoke-Socks5Negotiate {
@@ -439,6 +453,7 @@ catch {
     Write-Host '=== СЦЕНАРИЙ ПРОВАЛЕН ==='
     & wsl.exe -l -v 2>&1 | Out-String | ForEach-Object { Write-Host $_ }
     Show-DaemonLog
+    Show-ApplianceState
     Write-Error $_
     exit 1
 }
