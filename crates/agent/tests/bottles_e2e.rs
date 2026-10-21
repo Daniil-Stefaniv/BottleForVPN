@@ -87,6 +87,8 @@ async fn bottles_up_down_full_cycle() {
 
     // Хост маршрутизирует бутылку ↔ srv: оба veth кончаются в default ns.
     sysctl("net.ipv4.ip_forward", "1");
+    // Docker на GitHub-раннерах держит политику FORWARD=DROP.
+    allow_test_forward();
     // rp_filter ослабляем до создания интерфейсов бутылки: veth-появляется
     // после `default=0` и наследует его (номер слота снаружи не виден).
     relax_rp_filter();
@@ -391,6 +393,9 @@ fn cleanup_leftovers() {
     }
     let _ = Command::new("ip").args(["netns", "del", NS_SRV]).status();
     let _ = Command::new("ip").args(["link", "del", VETH_HOST]).status();
+    // SIGKILL'нутый wireguard-go оставляет UAPI-сокет: следующий стенд
+    // с тем же именем интерфейса не должен его наследовать.
+    let _ = std::fs::remove_file("/var/run/wireguard/wgsrv.sock");
 }
 
 /// Возвращает stdout `ip netns list`.
@@ -422,6 +427,31 @@ fn run_ok(program: &str, args: &[&str]) {
 /// Выполняет `sysctl -w key=value`.
 fn sysctl(key: &str, value: &str) {
     run_ok("sysctl", &["-w", &format!("{key}={value}")]);
+}
+
+/// Точечное ACCEPT-правило FORWARD для стендовых подсетей: на
+/// GitHub-раннерах предустановлен Docker, его политика FORWARD=DROP
+/// роняет маршрутизируемый хостом трафик бутылка ↔ srv. Идемпотентно:
+/// `-C` проверяет наличие, `-I` вставляет.
+fn allow_test_forward() {
+    let rule = [
+        "FORWARD",
+        "-s",
+        "10.77.0.0/16",
+        "-d",
+        "10.77.0.0/16",
+        "-j",
+        "ACCEPT",
+    ];
+    let present = Command::new("iptables")
+        .arg("-C")
+        .args(rule)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !present {
+        let _ = Command::new("iptables").arg("-I").args(rule).status();
+    }
 }
 
 /// Ослабляет rp_filter: all + default. Путь бутылка→srv→echo асимметричен

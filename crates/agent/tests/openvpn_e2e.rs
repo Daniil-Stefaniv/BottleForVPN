@@ -91,6 +91,8 @@ async fn openvpn_static_key_tunnel_and_socks5_over_it() {
 
     // Хост маршрутизирует бутылку ↔ srv: оба veth кончаются в default ns.
     sysctl("net.ipv4.ip_forward", "1");
+    // Docker на GitHub-раннерах держит политику FORWARD=DROP.
+    allow_test_forward();
     // rp_filter ослабляем до создания интерфейсов бутылки: veth появляется
     // после `default=0` и наследует его (номер слота снаружи не виден).
     relax_rp_filter();
@@ -176,6 +178,10 @@ async fn openvpn_static_key_tunnel_and_socks5_over_it() {
             &TUN_CLI_ADDR.to_string(),
             "--secret",
             KEY_FILE,
+            // OpenVPN 2.6 + OpenSSL 3: дефолтный BF-CBC выкинут из
+            // провайдера («Cipher BF-CBC not supported»), задаём явно.
+            "--cipher",
+            "AES-256-CBC",
         ])
         // Лог openvpn наследует stdio теста — окно диагностики
         // «Initialization Sequence Completed».
@@ -264,7 +270,8 @@ fn client_config() -> String {
          remote {SRV_VETH_ADDR} {OVPN_PORT}\n\
          nobind\n\
          ifconfig {TUN_CLI_ADDR} {TUN_SRV_ADDR}\n\
-         secret {KEY_FILE}\n"
+         secret {KEY_FILE}\n\
+         cipher AES-256-CBC\n"
     )
 }
 
@@ -330,6 +337,31 @@ fn run_ok(program: &str, args: &[&str]) -> String {
 /// Выполняет `sysctl -w key=value`.
 fn sysctl(key: &str, value: &str) {
     run_ok("sysctl", &["-w", &format!("{key}={value}")]);
+}
+
+/// Точечное ACCEPT-правило FORWARD для стендовых подсетей: на
+/// GitHub-раннерах предустановлен Docker, его политика FORWARD=DROP
+/// роняет маршрутизируемый хостом трафик бутылка ↔ srv. Идемпотентно:
+/// `-C` проверяет наличие, `-I` вставляет.
+fn allow_test_forward() {
+    let rule = [
+        "FORWARD",
+        "-s",
+        "10.77.0.0/16",
+        "-d",
+        "10.77.0.0/16",
+        "-j",
+        "ACCEPT",
+    ];
+    let present = Command::new("iptables")
+        .arg("-C")
+        .args(rule)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !present {
+        let _ = Command::new("iptables").arg("-I").args(rule).status();
+    }
 }
 
 /// Ослабляет rp_filter: all + default. Путь бутылка→srv→echo асимметричен

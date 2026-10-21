@@ -6,14 +6,14 @@
 //! ```text
 //! [default ns: хост]            [ns t-wg-srv]              [ns bottle-t-wg]
 //!  p<idx> 10.77.idx.1 ←veth→    t-wg-s 10.77.253.1/30  ←veth→ b<idx> 10.77.idx.2
-//!  t-wg-h 10.77.253.2/30 ←──────┘      wgsrv 10.99.0.1        wg<idx> 10.99.0.2
+//!  t-wg-h 10.77.253.2/30 ←──────┘      wghs 10.99.0.1        wg<idx> 10.99.0.2
 //!  SOCKS5-мост 0.0.0.0:49201             echo на 10.99.0.1      relay + туннель
 //! ```
 //!
 //! Хост маршрутизирует бутылку ↔ srv (ip_forward); бутылка поднимает
 //! туннель `tunnel_up_wg` до endpoint `10.77.253.1:51820` (IP — резолв
 //! замыкается на dotted-IPv4), эхо-проверка идёт SOCKS5-CONNECT'ом
-//! через мост → relay → wg<idx> → wgsrv → echo. Запуск:
+//! через мост → relay → wg<idx> → wghs → echo. Запуск:
 //!
 //! ```sh
 //! sudo -E cargo test -p agent --test wg_handshake -- --ignored
@@ -64,7 +64,7 @@ const WG_READY_WAIT: Duration = Duration::from_secs(5);
 const WG_READY_POLL: Duration = Duration::from_millis(50);
 
 /// Полный сценарий: подъём туннеля с handshake и сквозной обмен данными
-/// SOCKS5 → relay → wg<idx> → wgsrv → echo внутри srv-namespace.
+/// SOCKS5 → relay → wg<idx> → wghs → echo внутри srv-namespace.
 #[tokio::test]
 #[ignore = "нужны root, iproute2 и wireguard (CI-джоба agent-integration)"]
 async fn wg_handshake_and_socks5_over_tunnel() {
@@ -75,6 +75,8 @@ async fn wg_handshake_and_socks5_over_tunnel() {
 
     // Хост маршрутизирует бутылку ↔ srv: оба veth кончаются в default ns.
     sysctl("net.ipv4.ip_forward", "1");
+    // Docker на GitHub-раннерах держит политику FORWARD=DROP.
+    allow_test_forward();
 
     // (1) srv-namespace + veth 10.77.253.0/30 (вручную: 253 вне слотов).
     run_ok("ip", &["netns", "add", NS_SRV]);
@@ -140,19 +142,19 @@ async fn wg_handshake_and_socks5_over_tunnel() {
     let cli_priv = wg_genkey();
     let cli_pub = wg_pubkey(&cli_priv);
 
-    // (3) Сервер WireGuard в srv: wireguard-go wgsrv + setconf через stdin.
-    // Имя wgsrv не пересекается с бутылочными wg<idx> (слот 1 → wg1):
+    // (3) Сервер WireGuard в srv: wireguard-go wghs + setconf через stdin.
+    // Имя wghs не пересекается с бутылочными wg<idx> (слот 1 → wg1):
     // UAPI-сокеты живут в общей файловой системе /var/run/wireguard.
     // WG_PROCESS_FOREGROUND=1: без неё wireguard-go демонизируется, и
     // wait_wg_ready видит «смерть» родителя («умер при старте»).
     let mut srv_wg = Command::new("ip")
-        .args(["netns", "exec", NS_SRV, "wireguard-go", "wgsrv"])
+        .args(["netns", "exec", NS_SRV, "wireguard-go", "wghs"])
         .env("WG_PROCESS_FOREGROUND", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .expect("запустить wireguard-go в srv");
-    wait_wg_ready(NS_SRV, "wgsrv", &mut srv_wg);
+    wait_wg_ready(NS_SRV, "wghs", &mut srv_wg);
     let srv_conf = format!(
         "[Interface]\n\
          PrivateKey = {srv_priv}\n\
@@ -169,14 +171,14 @@ async fn wg_handshake_and_socks5_over_tunnel() {
             NS_SRV,
             "wg",
             "setconf",
-            "wgsrv",
+            "wghs",
             "/dev/stdin",
         ],
         &srv_conf,
     );
     run_ok(
         "ip",
-        &["netns", "exec", NS_SRV, "ip", "link", "set", "wgsrv", "up"],
+        &["netns", "exec", NS_SRV, "ip", "link", "set", "wghs", "up"],
     );
     run_ok(
         "ip",
@@ -189,10 +191,10 @@ async fn wg_handshake_and_socks5_over_tunnel() {
             "add",
             &format!("{WG_SRV_ADDR}/32"),
             "dev",
-            "wgsrv",
+            "wghs",
         ],
     );
-    // Ответы echo клиенту уходят через wgsrv (AllowedIPs не создают маршруты).
+    // Ответы echo клиенту уходят через wghs (AllowedIPs не создают маршруты).
     run_ok(
         "ip",
         &[
@@ -204,7 +206,7 @@ async fn wg_handshake_and_socks5_over_tunnel() {
             "add",
             &format!("{WG_CLI_ADDR}/32"),
             "dev",
-            "wgsrv",
+            "wghs",
         ],
     );
 
@@ -238,7 +240,7 @@ async fn wg_handshake_and_socks5_over_tunnel() {
         .await
         .expect("tunnel_up_wg: handshake не состоялся за 30 с");
 
-    // (7) Сквозной путь: SOCKS5 CONNECT через мост → relay → wg<idx> → wgsrv → echo.
+    // (7) Сквозной путь: SOCKS5 CONNECT через мост → relay → wg<idx> → wghs → echo.
     socks5_connect_echo_with_retry(SOCKS5_PORT, echo_addr).await;
 
     // (8) Разбор: туннель, бутылка, srv-стенд.
@@ -275,6 +277,8 @@ fn cleanup_leftovers() {
     let _ = Command::new("ip").args(["netns", "del", NS_SRV]).status();
     let _ = Command::new("ip").args(["link", "del", VETH_HOST]).status();
     let _ = std::fs::remove_dir_all(format!("/etc/netns/bottle-{ID}"));
+    // SIGKILL'нутый wireguard-go оставляет UAPI-сокет за собой.
+    let _ = std::fs::remove_file("/var/run/wireguard/wghs.sock");
 }
 
 /// Выполняет команду, паникуя с stderr при неудаче.
@@ -294,6 +298,31 @@ fn run_ok(program: &str, args: &[&str]) {
 /// Выполняет `sysctl -w key=value`.
 fn sysctl(key: &str, value: &str) {
     run_ok("sysctl", &["-w", &format!("{key}={value}")]);
+}
+
+/// Точечное ACCEPT-правило FORWARD для стендовых подсетей: на
+/// GitHub-раннерах предустановлен Docker, его политика FORWARD=DROP
+/// роняет маршрутизируемый хостом трафик бутылка ↔ srv. Идемпотентно:
+/// `-C` проверяет наличие, `-I` вставляет.
+fn allow_test_forward() {
+    let rule = [
+        "FORWARD",
+        "-s",
+        "10.77.0.0/16",
+        "-d",
+        "10.77.0.0/16",
+        "-j",
+        "ACCEPT",
+    ];
+    let present = Command::new("iptables")
+        .arg("-C")
+        .args(rule)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !present {
+        let _ = Command::new("iptables").arg("-I").args(rule).status();
+    }
 }
 
 /// Ослабляет rp_filter на интерфейсе хоста: путь бутылка→srv→echo
