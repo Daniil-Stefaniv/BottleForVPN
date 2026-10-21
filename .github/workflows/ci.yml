@@ -96,7 +96,7 @@ jobs:
       # bottles_e2e, openvpn_e2e) — #[ignore].
       # Явный PATH: secure_path sudo сбрасывает его, и cargo из
       # ~/.cargo/bin иначе не находится («sudo: cargo: command not found»).
-      - run: sudo -E env "PATH=$PATH" cargo test -p agent -- --ignored --no-fail-fast
+      - run: sudo -E env "PATH=$PATH" cargo test -p agent --no-fail-fast -- --ignored
 
   appliance-build:
     runs-on: ubuntu-latest
