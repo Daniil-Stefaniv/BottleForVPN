@@ -1,3 +1,4 @@
+pub mod events;
 pub mod frame;
 pub mod ipc;
 #[cfg(test)]
