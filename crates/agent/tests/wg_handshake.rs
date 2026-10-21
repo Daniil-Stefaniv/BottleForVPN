@@ -279,6 +279,18 @@ fn cleanup_leftovers() {
     let _ = std::fs::remove_dir_all(format!("/etc/netns/bottle-{ID}"));
     // SIGKILL'нутый wireguard-go оставляет UAPI-сокет за собой.
     let _ = std::fs::remove_file("/var/run/wireguard/wghs.sock");
+    remove_stale_veths();
+}
+
+/// Сносит хостовые veth первых слотов, оставшиеся от аварийно
+/// завершённых соседних стендов (паника не доходит до разбора):
+/// иначе чужой p<idx> ломает `ip link add` этого теста.
+fn remove_stale_veths() {
+    for idx in 1..=4u8 {
+        let _ = Command::new("ip")
+            .args(["link", "del", &format!("p{idx}")])
+            .status();
+    }
 }
 
 /// Выполняет команду, паникуя с stderr при неудаче.

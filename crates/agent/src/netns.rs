@@ -281,6 +281,7 @@ async fn bind_bridges(
 pub fn netns_down(handle: NetnsHandle) -> Result<(), AgentError> {
     let NetnsHandle {
         ns_name,
+        slot,
         mut relay_child,
         tunnel_child,
         mut bridge_tasks,
@@ -306,7 +307,31 @@ pub fn netns_down(handle: NetnsHandle) -> Result<(), AgentError> {
 
     run_cmd("ip", &["netns", "del", &ns_name])?;
     remove_netns_etc(&ns_name);
+    let (host_veth, _) = veth_names(slot.idx);
+    wait_host_veth_gone(&host_veth);
     Ok(())
+}
+
+/// Ждёт исчезновения хостового конца veth-пары после `ip netns del`.
+/// Namespace сносится ядром асинхронно: сокеты отменённых мостов могут
+/// недолго удерживать его, и немедленный повторный up того же слота
+/// ловил бы «RTNETLINK answers: File exists». Молчаливый предел 3 с —
+/// дольше ждать бессмысленно, up сам решит по факту.
+fn wait_host_veth_gone(name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let gone = Command::new("ip")
+            .args(["link", "show", name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true);
+        if gone || std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// Пишет `/etc/netns/bottle-<id>/resolv.conf` — DNS для namespace.

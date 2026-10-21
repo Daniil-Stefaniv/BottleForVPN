@@ -300,6 +300,18 @@ fn cleanup_leftovers() {
     let _ = Command::new("ip").args(["netns", "del", NS_SRV]).status();
     let _ = Command::new("ip").args(["link", "del", VETH_HOST]).status();
     let _ = std::fs::remove_file(KEY_FILE);
+    remove_stale_veths();
+}
+
+/// Сносит хостовые veth первых слотов, оставшиеся от аварийно
+/// завершённых соседних стендов (паника не доходит до разбора):
+/// иначе чужой p<idx> ломает `ip link add` этого теста.
+fn remove_stale_veths() {
+    for idx in 1..=4u8 {
+        let _ = Command::new("ip")
+            .args(["link", "del", &format!("p{idx}")])
+            .status();
+    }
 }
 
 /// Возвращает stdout `ip netns list`.
