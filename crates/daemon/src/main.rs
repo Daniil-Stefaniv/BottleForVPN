@@ -98,8 +98,7 @@ mod ps_query;
 mod registry;
 mod session;
 mod stats;
-#[cfg_attr(not(windows), allow(dead_code))]
-mod store;
+mod paths;
 #[allow(dead_code)]
 mod svc_client;
 #[cfg(unix)]
@@ -147,7 +146,8 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Открывает хранилище и обслуживает канал управления до отмены `shutdown`.
+/// Готовит каталог данных и обслуживает канал управления до отмены
+/// `shutdown`.
 ///
 /// На Windows создаётся менеджер бутылок с реальным подключением
 /// к аплаенсу (импорт/токен/handshake — `appliance::ensure_appliance`).
@@ -161,10 +161,10 @@ pub async fn serve_daemon(
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
     // Каталог данных с правами 0700 (сторонняя учётка не читает журналы
-    // и токен аплаенса); хранилища профилей на диске в 0.3 нет — открытие
-    // Store осталось ради подготовки каталога (Task 6 заменит paths-модулем).
-    let store = store::Store::open(&data_dir)?;
-    let data_root = store.data_root().to_path_buf();
+    // и токен аплаенса); хранилища профилей на диске в 0.3 нет — на диске
+    // только служебные файлы демона (см. `paths`).
+    paths::open_data_dir(&data_dir)?;
+    let data_root = data_dir.clone();
     println!("Демон BottleForApps запущен");
     println!("Каталог данных: {}", data_root.display());
     println!("Rootfs аплаенса: {}", rootfs_tar.display());

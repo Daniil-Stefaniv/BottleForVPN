@@ -108,20 +108,11 @@ pub async fn dispatch(
                     message: MANAGER_NOT_WIRED.to_string(),
                 };
             };
-            // Токен аплаенса живёт в каталоге данных; Store здесь —
-            // доступ к нему (Task 6 заменит тонким paths-модулем).
-            let store = match crate::store::Store::open(&daemon.data_root) {
-                Ok(store) => store,
-                Err(error) => {
-                    return CliReply::Error {
-                        message: format!("каталог данных недоступен: {error}"),
-                    }
-                }
-            };
+            // Токен аплаенса живёт в каталоге данных демона (paths).
             let previous = manager.appliance_version().await;
             match crate::appliance::upgrade_appliance(
                 wsl.as_ref(),
-                &store,
+                &daemon.data_root,
                 rootfs,
                 crate::manager::AGENT_CONNECT_TIMEOUT,
                 force,

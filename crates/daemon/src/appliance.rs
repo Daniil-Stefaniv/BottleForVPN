@@ -27,7 +27,6 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 use crate::error::DaemonError;
-use crate::store::Store;
 
 /// Стандартное имя WSL-дистрибутива аплаенса (видно в `wsl -l`).
 pub const DISTRIBUTION: &str = "bottleforapps";
@@ -192,11 +191,11 @@ impl WslRunner for RealWsl {
 /// `connect_timeout` (агент стартует при первом обращении к VM).
 pub async fn ensure_appliance(
     wsl: &dyn WslRunner,
-    store: &Store,
+    data_root: &Path,
     rootfs_tar: &Path,
     connect_timeout: Duration,
 ) -> Result<ApplianceHandle, DaemonError> {
-    ensure_appliance_with_port(wsl, store, rootfs_tar, connect_timeout, AGENT_PORT).await
+    ensure_appliance_with_port(wsl, data_root, rootfs_tar, connect_timeout, AGENT_PORT).await
 }
 
 /// `bottle upgrade` (спека §11): снос дистрибуции аплаенса и
@@ -210,19 +209,19 @@ pub async fn ensure_appliance(
 /// чистой машине — просто свежий импорт.
 pub async fn upgrade_appliance(
     wsl: &dyn WslRunner,
-    store: &Store,
+    data_root: &Path,
     rootfs_tar: &Path,
     connect_timeout: Duration,
     force: bool,
 ) -> Result<String, DaemonError> {
-    upgrade_appliance_with_port(wsl, store, rootfs_tar, connect_timeout, AGENT_PORT, force).await
+    upgrade_appliance_with_port(wsl, data_root, rootfs_tar, connect_timeout, AGENT_PORT, force).await
 }
 
 /// Реализация [`upgrade_appliance`] с настраиваемым портом агента
 /// (тестовый шов — как у [`ensure_appliance_with_port`]).
 async fn upgrade_appliance_with_port(
     wsl: &dyn WslRunner,
-    store: &Store,
+    data_root: &Path,
     rootfs_tar: &Path,
     connect_timeout: Duration,
     port: u16,
@@ -244,12 +243,12 @@ async fn upgrade_appliance_with_port(
     // встретит старую дистрибуцию без токена и ответит «токен утерян»
     // (наблюдалось на inbox wsl.exe, 0.2.4).
     unregister_appliance(wsl).await?;
-    match fs::remove_file(store.appliance_token_path()) {
+    match fs::remove_file(crate::paths::appliance_token_path(data_root)) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let handle = ensure_appliance_with_port(wsl, store, rootfs_tar, connect_timeout, port).await?;
+    let handle = ensure_appliance_with_port(wsl, data_root, rootfs_tar, connect_timeout, port).await?;
     Ok(handle.appliance_version)
 }
 
@@ -295,12 +294,12 @@ async fn unregister_appliance(wsl: &dyn WslRunner) -> Result<(), DaemonError> {
 /// локального listener'а.
 async fn ensure_appliance_with_port(
     wsl: &dyn WslRunner,
-    store: &Store,
+    data_root: &Path,
     rootfs_tar: &Path,
     connect_timeout: Duration,
     port: u16,
 ) -> Result<ApplianceHandle, DaemonError> {
-    let token = provision_token(wsl, store, rootfs_tar).await?;
+    let token = provision_token(wsl, data_root, rootfs_tar).await?;
     wake(wsl).await?;
     let vm_ip = appliance_ip(wsl, connect_timeout).await?;
     let stream = connect_with_retries(vm_ip, port, connect_timeout).await?;
@@ -321,16 +320,16 @@ async fn ensure_appliance_with_port(
 /// rootfs-тар, записывает токен в VM и сохраняет локальную копию.
 async fn provision_token(
     wsl: &dyn WslRunner,
-    store: &Store,
+    data_root: &Path,
     rootfs_tar: &Path,
 ) -> Result<String, DaemonError> {
     let listing = wsl.run(&["-l", "-q"], None).await?;
     if is_installed(&listing) {
-        return local_token(wsl, store).await;
+        return local_token(wsl, data_root).await;
     }
 
     let token = generate_token()?;
-    let vm_dir = store.data_root().join(VM_DIR_NAME);
+    let vm_dir = data_root.join(VM_DIR_NAME);
     if let Err(e) = wsl
         .run(
             &[
@@ -355,7 +354,7 @@ async fn provision_token(
                 error = %e,
                 "wsl --import отказал, но дистрибутив уже существует — используем её"
             );
-            return local_token(wsl, store).await;
+            return local_token(wsl, data_root).await;
         }
         return Err(DaemonError::Appliance(format!(
             "не удалось импортировать дистрибуцию {DISTRIBUTION}: {e}. \
@@ -369,7 +368,7 @@ async fn provision_token(
     );
 
     write_token_into_vm(wsl, &token).await?;
-    crate::store::atomic_write(&store.appliance_token_path(), token.as_bytes())?;
+    crate::paths::atomic_write(&crate::paths::appliance_token_path(data_root), token.as_bytes())?;
     Ok(token)
 }
 
@@ -378,10 +377,10 @@ async fn provision_token(
 /// удалить её при неудачном unregister) — токен восстанавливается из VM,
 /// где агент хранит его в `/etc/bottle-agent/token`; если и там его нет —
 /// [`DaemonError::ApplianceTokenLost`].
-async fn local_token(wsl: &dyn WslRunner, store: &Store) -> Result<String, DaemonError> {
-    match read_local_token(store) {
+async fn local_token(wsl: &dyn WslRunner, data_root: &Path) -> Result<String, DaemonError> {
+    match read_local_token(data_root) {
         Ok(token) => Ok(token),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => read_token_from_vm(wsl, store).await,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => read_token_from_vm(wsl, data_root).await,
         Err(e) => Err(e.into()),
     }
 }
@@ -390,7 +389,7 @@ async fn local_token(wsl: &dyn WslRunner, store: &Store) -> Result<String, Daemo
 /// тот же файл, так что handshake пройдёт) и сохраняет её в хранилище.
 /// Токен читается выводом `cat` — не аргументом, чтобы не светить секрет
 /// в списке процессов хоста.
-async fn read_token_from_vm(wsl: &dyn WslRunner, store: &Store) -> Result<String, DaemonError> {
+async fn read_token_from_vm(wsl: &dyn WslRunner, data_root: &Path) -> Result<String, DaemonError> {
     let raw = wsl
         .run(
             &[
@@ -412,7 +411,7 @@ async fn read_token_from_vm(wsl: &dyn WslRunner, store: &Store) -> Result<String
         tracing::warn!("файл токена в VM пуст");
         return Err(DaemonError::ApplianceTokenLost);
     }
-    crate::store::atomic_write(&store.appliance_token_path(), token.as_bytes())?;
+    crate::paths::atomic_write(&crate::paths::appliance_token_path(data_root), token.as_bytes())?;
     tracing::info!("локальная копия токена аплаенса восстановлена из VM");
     Ok(token.to_string())
 }
@@ -421,15 +420,15 @@ async fn read_token_from_vm(wsl: &dyn WslRunner, store: &Store) -> Result<String
 ///
 /// `NotFound` передаётся наверх как есть — вызывающий превращает его
 /// в [`DaemonError::ApplianceTokenLost`].
-fn read_local_token(store: &Store) -> io::Result<String> {
-    let raw = fs::read_to_string(store.appliance_token_path())?;
+fn read_local_token(data_root: &Path) -> io::Result<String> {
+    let raw = fs::read_to_string(crate::paths::appliance_token_path(data_root))?;
     let token = raw.trim();
     if token.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "файл токена аплаенса пуст: {}",
-                store.appliance_token_path().display()
+                crate::paths::appliance_token_path(data_root).display()
             ),
         ));
     }
@@ -761,7 +760,6 @@ mod tests {
     use tokio_util::codec::FramedRead;
 
     use super::*;
-    use crate::store::Store;
 
     /// Один вызов `wsl`: аргументы и stdin.
     #[derive(Debug, Clone)]
@@ -1041,13 +1039,14 @@ mod tests {
         write_half.write_all(&buf).await.expect("отправка ответа");
     }
 
-    /// Хранилище и rootfs-тар во временном каталоге.
-    fn test_store() -> (tempfile::TempDir, Store, std::path::PathBuf) {
+    /// Каталог данных демона и rootfs-тар во временном каталоге.
+    fn test_data() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&tmp.path().join("store")).unwrap();
+        let root = tmp.path().join("data");
+        crate::paths::open_data_dir(&root).unwrap();
         let rootfs = tmp.path().join("rootfs.tar");
         std::fs::write(&rootfs, b"fake tarball").unwrap();
-        (tmp, store, rootfs)
+        (tmp, root, rootfs)
     }
 
     /// Номер первого вызова, чьи аргументы содержат `needle`.
@@ -1058,7 +1057,7 @@ mod tests {
             .unwrap_or_else(|| panic!("нет вызова с {needle:?}: {calls:?}"))
     }
 
-    /// Пишет локальный токен в хранилище и поднимает фейк-агента
+    /// Пишет локальный токен в каталог данных и поднимает фейк-агента
     /// (сценарий «дистрибутив уже импортирован»). TempDir возвращается,
     /// чтобы тест держал каталоги живыми на время проверок.
     #[allow(clippy::type_complexity)]
@@ -1067,21 +1066,21 @@ mod tests {
     ) -> (
         tempfile::TempDir,
         FakeWsl,
-        Store,
+        std::path::PathBuf,
         std::path::PathBuf,
         SocketAddr,
     ) {
-        let (tmp, store, rootfs) = test_store();
-        std::fs::write(store.appliance_token_path(), "local-token\n").unwrap();
+        let (tmp, root, rootfs) = test_data();
+        std::fs::write(crate::paths::appliance_token_path(&root), "local-token\n").unwrap();
         let wsl = FakeWsl::new(true);
         wsl.token.set("local-token".to_string());
         let addr = spawn_fake_agent(scenario, wsl.token.clone()).await;
-        (tmp, wsl, store, rootfs, addr)
+        (tmp, wsl, root, rootfs, addr)
     }
 
     #[tokio::test]
     async fn fresh_install_imports_and_provisions_token() {
-        let (_tmp, store, rootfs) = test_store();
+        let (_tmp, root, rootfs) = test_data();
         let wsl = FakeWsl::new(false);
         let addr = spawn_fake_agent(
             AgentScenario::Happy {
@@ -1092,14 +1091,14 @@ mod tests {
         .await;
 
         let handle =
-            ensure_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
+            ensure_appliance_with_port(&wsl, &root, &rootfs, Duration::from_secs(5), addr.port())
                 .await
                 .expect("свежая установка доходит до соединения");
 
         assert_eq!(handle.vm_ip, Ipv4Addr::new(127, 0, 0, 1));
 
         // Локальная копия токена: 64 hex-символа, права 0600.
-        let token_path = store.appliance_token_path();
+        let token_path = crate::paths::appliance_token_path(&root);
         let token = std::fs::read_to_string(&token_path)
             .unwrap()
             .trim()
@@ -1126,7 +1125,7 @@ mod tests {
         assert_eq!(import_args[1], DISTRIBUTION);
         assert_eq!(
             import_args[2],
-            store.data_root().join(VM_DIR_NAME).to_str().unwrap()
+            root.join(VM_DIR_NAME).to_str().unwrap()
         );
         assert_eq!(import_args[3], rootfs.to_str().unwrap());
 
@@ -1157,8 +1156,8 @@ mod tests {
     /// аплаенса возвращается; токен регенерирован (не старый).
     #[tokio::test]
     async fn upgrade_unregisters_deletes_token_and_reimports() {
-        let (_tmp, store, rootfs) = test_store();
-        std::fs::write(store.appliance_token_path(), "old-token\n").unwrap();
+        let (_tmp, root, rootfs) = test_data();
+        std::fs::write(crate::paths::appliance_token_path(&root), "old-token\n").unwrap();
         let wsl = FakeWsl::new(true);
         wsl.token.set("old-token".to_string());
         let addr = spawn_fake_agent(
@@ -1171,7 +1170,7 @@ mod tests {
 
         let new_version = upgrade_appliance_with_port(
             &wsl,
-            &store,
+            &root,
             &rootfs,
             Duration::from_secs(5),
             addr.port(),
@@ -1201,7 +1200,7 @@ mod tests {
 
         // Токен регенерирован: старый недействителен, новый совпадает
         // с копией в VM (token-regen путь).
-        let local_token = std::fs::read_to_string(store.appliance_token_path())
+        let local_token = std::fs::read_to_string(crate::paths::appliance_token_path(&root))
             .unwrap()
             .trim()
             .to_string();
@@ -1213,7 +1212,7 @@ mod tests {
     /// выполняется свежий импорт.
     #[tokio::test]
     async fn upgrade_without_existing_distribution_still_imports() {
-        let (_tmp, store, rootfs) = test_store();
+        let (_tmp, root, rootfs) = test_data();
         let wsl = FakeWsl::new(false);
         let addr = spawn_fake_agent(
             AgentScenario::Happy {
@@ -1225,7 +1224,7 @@ mod tests {
 
         let result = upgrade_appliance_with_port(
             &wsl,
-            &store,
+            &root,
             &rootfs,
             Duration::from_secs(5),
             addr.port(),
@@ -1244,8 +1243,8 @@ mod tests {
     /// и со второй попытки доводит пере-импорт до конца.
     #[tokio::test]
     async fn upgrade_retries_sticky_unregister_and_succeeds() {
-        let (_tmp, store, rootfs) = test_store();
-        std::fs::write(store.appliance_token_path(), "old-token\n").unwrap();
+        let (_tmp, root, rootfs) = test_data();
+        std::fs::write(crate::paths::appliance_token_path(&root), "old-token\n").unwrap();
         let wsl = FakeWsl::new(true);
         wsl.token.set("old-token".to_string());
         wsl.unregister_failures
@@ -1260,7 +1259,7 @@ mod tests {
 
         let new_version = upgrade_appliance_with_port(
             &wsl,
-            &store,
+            &root,
             &rootfs,
             Duration::from_secs(5),
             addr.port(),
@@ -1279,7 +1278,7 @@ mod tests {
             2,
             "unregister вызван дважды: {calls:?}"
         );
-        let new_token = std::fs::read_to_string(store.appliance_token_path())
+        let new_token = std::fs::read_to_string(crate::paths::appliance_token_path(&root))
             .unwrap()
             .trim()
             .to_string();
@@ -1290,8 +1289,8 @@ mod tests {
     /// до unregister — так снимаются блокировки VHD.
     #[tokio::test]
     async fn force_upgrade_shuts_down_wsl_before_unregister() {
-        let (_tmp, store, rootfs) = test_store();
-        std::fs::write(store.appliance_token_path(), "old-token\n").unwrap();
+        let (_tmp, root, rootfs) = test_data();
+        std::fs::write(crate::paths::appliance_token_path(&root), "old-token\n").unwrap();
         let wsl = FakeWsl::new(true);
         wsl.token.set("old-token".to_string());
         let addr = spawn_fake_agent(
@@ -1304,7 +1303,7 @@ mod tests {
 
         let new_version = upgrade_appliance_with_port(
             &wsl,
-            &store,
+            &root,
             &rootfs,
             Duration::from_secs(5),
             addr.port(),
@@ -1328,14 +1327,14 @@ mod tests {
     /// (0.2.4 удалял — дистрибутив оставалась без токена, «токен утерян»).
     #[tokio::test]
     async fn upgrade_with_stuck_distribution_fails_keeping_local_token() {
-        let (_tmp, store, rootfs) = test_store();
-        std::fs::write(store.appliance_token_path(), "old-token\n").unwrap();
+        let (_tmp, root, rootfs) = test_data();
+        std::fs::write(crate::paths::appliance_token_path(&root), "old-token\n").unwrap();
         let wsl = FakeWsl::new(true);
         wsl.unregister_failures
             .store(3, std::sync::atomic::Ordering::SeqCst);
 
         let error =
-            upgrade_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), 1, false)
+            upgrade_appliance_with_port(&wsl, &root, &rootfs, Duration::from_secs(5), 1, false)
                 .await
                 .expect_err("застрявшая дистрибуция — ошибка");
 
@@ -1344,7 +1343,7 @@ mod tests {
             "ручная инструкция в тексте: {error}"
         );
         assert_eq!(
-            std::fs::read_to_string(store.appliance_token_path())
+            std::fs::read_to_string(crate::paths::appliance_token_path(&root))
                 .unwrap()
                 .trim(),
             "old-token",
@@ -1362,7 +1361,7 @@ mod tests {
     /// копия восстанавливается.
     #[tokio::test]
     async fn lost_local_token_is_recovered_from_vm() {
-        let (_tmp, store, rootfs) = test_store();
+        let (_tmp, root, rootfs) = test_data();
         let wsl = FakeWsl::new(true);
         wsl.token.set("vm-token".to_string());
         let addr = spawn_fake_agent(
@@ -1373,13 +1372,13 @@ mod tests {
         )
         .await;
 
-        let token = provision_token(&wsl, &store, &rootfs)
+        let token = provision_token(&wsl, &root, &rootfs)
             .await
             .expect("токен восстановлен из VM");
 
         assert_eq!(token, "vm-token");
         assert_eq!(
-            std::fs::read_to_string(store.appliance_token_path())
+            std::fs::read_to_string(crate::paths::appliance_token_path(&root))
                 .unwrap()
                 .trim(),
             "vm-token",
@@ -1399,10 +1398,10 @@ mod tests {
     /// ApplianceTokenLost с советом `wsl --unregister`.
     #[tokio::test]
     async fn lost_local_token_without_vm_copy_is_token_lost() {
-        let (_tmp, store, rootfs) = test_store();
+        let (_tmp, root, rootfs) = test_data();
         let wsl = FakeWsl::new(true);
 
-        let error = provision_token(&wsl, &store, &rootfs)
+        let error = provision_token(&wsl, &root, &rootfs)
             .await
             .expect_err("токена нет нигде");
 
@@ -1411,9 +1410,9 @@ mod tests {
 
     #[tokio::test]
     async fn existing_install_reuses_local_token_without_import() {
-        let (_tmp, store, rootfs) = test_store();
+        let (_tmp, root, rootfs) = test_data();
         const LOCAL_TOKEN: &str = "deadbeefcafe0123";
-        std::fs::write(store.appliance_token_path(), format!("{LOCAL_TOKEN}\n")).unwrap();
+        std::fs::write(crate::paths::appliance_token_path(&root), format!("{LOCAL_TOKEN}\n")).unwrap();
 
         let wsl = FakeWsl::new(true);
         wsl.token.set(LOCAL_TOKEN.to_string());
@@ -1426,7 +1425,7 @@ mod tests {
         .await;
 
         let handle =
-            ensure_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
+            ensure_appliance_with_port(&wsl, &root, &rootfs, Duration::from_secs(5), addr.port())
                 .await
                 .expect("повторный запуск переиспользует дистрибутив");
 
@@ -1475,13 +1474,13 @@ mod tests {
 
     #[tokio::test]
     async fn appliance_ip_without_global_ipv4_is_clear_error() {
-        let (_tmp, store, rootfs) = test_store();
-        std::fs::write(store.appliance_token_path(), "local-token\n").unwrap();
+        let (_tmp, root, rootfs) = test_data();
+        std::fs::write(crate::paths::appliance_token_path(&root), "local-token\n").unwrap();
         let wsl = GarbageIpWsl;
 
         // connect_timeout=1с — он же дедлайн ретраев опроса адреса.
         let error =
-            ensure_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(1), AGENT_PORT)
+            ensure_appliance_with_port(&wsl, &root, &rootfs, Duration::from_secs(1), AGENT_PORT)
                 .await
                 .expect_err("нет global IPv4 — понятная ошибка");
 
@@ -1493,11 +1492,11 @@ mod tests {
 
     #[tokio::test]
     async fn installed_without_local_token_reports_lost_token() {
-        let (_tmp, store, rootfs) = test_store();
+        let (_tmp, root, rootfs) = test_data();
         let wsl = FakeWsl::new(true); // дистрибуция есть, файла токена нет
 
         let error =
-            ensure_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(1), AGENT_PORT)
+            ensure_appliance_with_port(&wsl, &root, &rootfs, Duration::from_secs(1), AGENT_PORT)
                 .await
                 .expect_err("токен утерян");
 
@@ -1510,11 +1509,11 @@ mod tests {
 
     #[tokio::test]
     async fn hello_ack_with_mismatched_version_demands_upgrade() {
-        let (_tmp, wsl, store, rootfs, addr) =
+        let (_tmp, wsl, root, rootfs, addr) =
             existing_install(AgentScenario::HelloAckVersion(99)).await;
 
         let error =
-            ensure_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
+            ensure_appliance_with_port(&wsl, &root, &rootfs, Duration::from_secs(5), addr.port())
                 .await
                 .expect_err("несовместимая версия");
 
@@ -1530,10 +1529,10 @@ mod tests {
 
     #[tokio::test]
     async fn agent_version_error_demands_upgrade() {
-        let (_tmp, wsl, store, rootfs, addr) = existing_install(AgentScenario::ErrorVersion).await;
+        let (_tmp, wsl, root, rootfs, addr) = existing_install(AgentScenario::ErrorVersion).await;
 
         let error =
-            ensure_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
+            ensure_appliance_with_port(&wsl, &root, &rootfs, Duration::from_secs(5), addr.port())
                 .await
                 .expect_err("агент отверг версию");
 
@@ -1549,10 +1548,10 @@ mod tests {
 
     #[tokio::test]
     async fn agent_auth_error_reports_lost_token() {
-        let (_tmp, wsl, store, rootfs, addr) = existing_install(AgentScenario::ErrorAuth).await;
+        let (_tmp, wsl, root, rootfs, addr) = existing_install(AgentScenario::ErrorAuth).await;
 
         let error =
-            ensure_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
+            ensure_appliance_with_port(&wsl, &root, &rootfs, Duration::from_secs(5), addr.port())
                 .await
                 .expect_err("агент отверг токен");
 
@@ -1568,11 +1567,11 @@ mod tests {
 
     #[tokio::test]
     async fn silent_agent_times_out() {
-        let (_tmp, wsl, store, rootfs, addr) = existing_install(AgentScenario::Silent).await;
+        let (_tmp, wsl, root, rootfs, addr) = existing_install(AgentScenario::Silent).await;
 
         let timeout = Duration::from_millis(300);
         let started = Instant::now();
-        let error = ensure_appliance_with_port(&wsl, &store, &rootfs, timeout, addr.port())
+        let error = ensure_appliance_with_port(&wsl, &root, &rootfs, timeout, addr.port())
             .await
             .expect_err("агент молчит");
         let elapsed = started.elapsed();
@@ -1595,11 +1594,11 @@ mod tests {
     async fn send_roundtrips_and_alive_detects_closed_connection() {
         // HelloAck + Ready + Status + Status(alive), затем соединение
         // закрывается фейк-агентом.
-        let (_tmp, wsl, store, rootfs, addr) =
+        let (_tmp, wsl, root, rootfs, addr) =
             existing_install(AgentScenario::Happy { answer_requests: 3 }).await;
 
         let mut handle =
-            ensure_appliance_with_port(&wsl, &store, &rootfs, Duration::from_secs(5), addr.port())
+            ensure_appliance_with_port(&wsl, &root, &rootfs, Duration::from_secs(5), addr.port())
                 .await
                 .expect("соединение устанавливается");
 
@@ -1745,8 +1744,8 @@ mod tests {
             }
         }
 
-        let (_tmp, store, rootfs) = test_store();
-        std::fs::write(store.appliance_token_path(), "local-token\n").unwrap();
+        let (_tmp, root, rootfs) = test_data();
+        std::fs::write(crate::paths::appliance_token_path(&root), "local-token\n").unwrap();
         let wsl = AlreadyExistsWsl {
             calls: Mutex::new(Vec::new()),
         };
@@ -1754,7 +1753,7 @@ mod tests {
         // Проверяем provision_token напрямую: важен сам факт, что
         // отказ --import при существующей дистрибуции приводит к чтению
         // локального токена, а не к ошибке с советом `wsl --unregister`.
-        let token = provision_token(&wsl, &store, &rootfs)
+        let token = provision_token(&wsl, &root, &rootfs)
             .await
             .expect("существующая дистрибуция используется, несмотря на отказ --import");
 

@@ -13,7 +13,6 @@ use bottle_core::ipc::{CheckItem, CheckStatus};
 use bottle_core::profile::BottleProfile;
 
 use crate::appliance::{WslRunner, DISTRIBUTION};
-use crate::error::DaemonError;
 use crate::manager::BottleManager;
 
 /// Итог bind-пробы фиксированного порта: (порт, свободен, владелец-
@@ -43,16 +42,12 @@ pub async fn run(
 
     let installed = matches!(wsl_list.as_deref(), Ok(listing) if is_installed(listing));
     let appliance_version = manager.appliance_version().await;
-    let profiles: Vec<(String, Result<BottleProfile, DaemonError>)> = {
-        let registry = registry.read().expect("registry poisoned");
+    let profiles: Vec<BottleProfile> = {
+        let registry = registry.read().expect("реестр профилей");
         registry
             .ids()
             .iter()
-            .filter_map(|id| {
-                registry
-                    .get(id)
-                    .map(|full| (id.clone(), Ok(full.profile)))
-            })
+            .filter_map(|id| registry.get(id).map(|full| full.profile))
             .collect()
     };
     let live_ports = live_listener_ports(manager).await;
@@ -90,14 +85,11 @@ async fn live_listener_ports(manager: &BottleManager) -> Vec<(String, Vec<u16>)>
 /// сразу освободить); порт живой бутылки демона считается занятым
 /// легально.
 async fn probe_fixed_ports(
-    profiles: &[(String, Result<BottleProfile, DaemonError>)],
+    profiles: &[BottleProfile],
     live_ports: &[(String, Vec<u16>)],
 ) -> Vec<PortProbe> {
     let mut probes = Vec::new();
-    for (_, result) in profiles {
-        let Ok(profile) = result else {
-            continue;
-        };
+    for profile in profiles {
         for port in fixed_ports(profile) {
             let free = TcpListener::bind(("127.0.0.1", port)).is_ok();
             let live_bottle = live_ports
@@ -303,27 +295,11 @@ pub fn check_agent(installed: bool, version: &Option<String>) -> CheckItem {
 
 /// Проверка профилей: все читаются → ok с количеством; битые → warn
 /// с перечнем id (бутылка не поднимется, пока профиль не поправят).
-pub fn check_profiles(profiles: &[(String, Result<BottleProfile, DaemonError>)]) -> CheckItem {
-    let broken: Vec<&str> = profiles
-        .iter()
-        .filter(|(_, result)| result.is_err())
-        .map(|(id, _)| id.as_str())
-        .collect();
-    if broken.is_empty() {
-        CheckItem {
-            code: "profiles".to_string(),
-            status: CheckStatus::Ok,
-            detail: format!("Профили читаются: {}", profiles.len()),
-        }
-    } else {
-        CheckItem {
-            code: "profiles".to_string(),
-            status: CheckStatus::Warn,
-            detail: format!(
-                "Битые профили (не поднимутся): {} — исправьте или удалите файлы в каталоге bottles",
-                broken.join(", ")
-            ),
-        }
+pub fn check_profiles(profiles: &[BottleProfile]) -> CheckItem {
+    CheckItem {
+        code: "profiles".to_string(),
+        status: CheckStatus::Ok,
+        detail: format!("Профили от GUI: {}", profiles.len()),
     }
 }
 
@@ -585,7 +561,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // profiles: пусто / все читаются / есть битые.
+    // profiles: пусто / профили от GUI (битых в реестре 0.3 нет).
     // ---------------------------------------------------------------
 
     #[test]
@@ -595,27 +571,11 @@ mod tests {
     }
 
     #[test]
-    fn profiles_all_valid_is_ok_with_count() {
+    fn profiles_from_gui_is_ok_with_count() {
         let profile = env_profile_with_ports("office-a", 1080, 33389);
-        let item = check_profiles(&[("office-a".into(), Ok(profile))]);
+        let item = check_profiles(&[profile]);
         assert_eq!(item.status, CheckStatus::Ok);
         assert!(item.detail.contains('1'));
-    }
-
-    #[test]
-    fn profiles_broken_is_warn_with_ids() {
-        let profile = env_profile_with_ports("office-a", 1080, 33389);
-        let broken: Result<BottleProfile, DaemonError> = Err(DaemonError::IdMismatch {
-            file_id: "broken".into(),
-            profile_id: "other".into(),
-        });
-        let item = check_profiles(&[("office-a".into(), Ok(profile)), ("broken".into(), broken)]);
-        assert_eq!(item.status, CheckStatus::Warn);
-        assert!(
-            item.detail.contains("broken"),
-            "битый id назван: {}",
-            item.detail
-        );
     }
 
     // ---------------------------------------------------------------

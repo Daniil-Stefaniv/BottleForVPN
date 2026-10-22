@@ -56,7 +56,7 @@ use crate::appliance::{ensure_appliance, ApplianceHandle, WslRunner};
 use crate::error::DaemonError;
 use crate::host_manager::{HostManager, HostParts, HostTiming};
 use crate::registry::SharedRegistry;
-use crate::store::{atomic_write, Store};
+use crate::paths::atomic_write;
 
 /// Нижняя граница диапазона автоподбора портов (dynamic, RFC 6335).
 pub const PORT_DYNAMIC_MIN: u16 = 49152;
@@ -128,10 +128,9 @@ impl RealAgentConnect {
 #[async_trait]
 impl AgentConnect for RealAgentConnect {
     async fn connect(&self) -> Result<ApplianceHandle, DaemonError> {
-        let store = Store::open(&self.data_root)?;
         ensure_appliance(
             self.wsl.as_ref(),
-            &store,
+            &self.data_root,
             &self.rootfs_tar,
             self.connect_timeout,
         )
