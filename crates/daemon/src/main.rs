@@ -132,9 +132,14 @@ pub async fn serve_daemon(
             rootfs_tar.clone(),
             manager::AGENT_CONNECT_TIMEOUT,
         ));
-        // Менеджер владеет своим экземпляром хранилища того же корня.
-        let manager_store = store::Store::open(store.data_root())?;
-        let manager = Arc::new(manager::BottleManager::new(manager_store, connect));
+        // Менеджер читает профили из in-memory реестра (0.3): наполняет
+        // его GUI сообщением SyncProfiles после подключения.
+        let registry = crate::registry::Registry::new_shared();
+        let manager = Arc::new(manager::BottleManager::new(
+            registry,
+            store.data_root().to_path_buf(),
+            connect,
+        ));
         // Фоновый цикл DNS-перепроверки host-бутылок (спека §7.2, шаг 5)
         // живёт до остановки демона.
         manager.spawn_host_dns_recheck(shutdown.clone());

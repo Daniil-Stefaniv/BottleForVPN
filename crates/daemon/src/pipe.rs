@@ -75,9 +75,9 @@ pub async fn dispatch(
                 None => None,
             },
         },
-        CliRequest::Start { id, credentials } => match manager {
+        CliRequest::Start { id, .. } => match manager {
             Some(manager) => manager
-                .start(&id, credentials)
+                .start(&id)
                 .await
                 .unwrap_or_else(|error| CliReply::Error {
                     message: error.to_string(),
@@ -1264,11 +1264,19 @@ endpoints = ["e.example"]
             .save(&env_profile("office-a", src.to_str().unwrap()))
             .unwrap();
 
-        // Менеджер владеет своим экземпляром хранилища того же корня
-        // (паттерн main::serve_daemon).
-        let manager_store = Store::open(store.data_root()).unwrap();
+        // Менеджер читает профили из реестра (0.3): конфиг — текстом.
+        let registry = crate::registry::Registry::new_shared();
+        registry
+            .write()
+            .expect("реестр")
+            .upsert(bottle_core::ipc::FullProfile {
+                profile: env_profile("office-a", "office-a.conf"),
+                config_text: Some("wg-secret".to_string()),
+                credentials: None,
+            });
         let manager = Arc::new(BottleManager::new(
-            manager_store,
+            registry,
+            tmp.path().join("manager-data"),
             Arc::new(SlowAgentConnect),
         ));
 

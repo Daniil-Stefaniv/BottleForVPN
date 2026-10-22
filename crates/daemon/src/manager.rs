@@ -55,6 +55,7 @@ use tokio::task::JoinSet;
 use crate::appliance::{ensure_appliance, ApplianceHandle, WslRunner};
 use crate::error::DaemonError;
 use crate::host_manager::{HostManager, HostParts, HostTiming};
+use crate::registry::SharedRegistry;
 use crate::store::{atomic_write, Store};
 
 /// Нижняя граница диапазона автоподбора портов (dynamic, RFC 6335).
@@ -328,8 +329,12 @@ struct Provisioned {
 
 /// Менеджер бутылок: старт/стоп/статус env- и host-бутылок (спека §7.1/§7.2).
 pub struct BottleManager {
-    /// Хранилище профилей (операции короткие, чтения потокобезопасны).
-    store: Store,
+    /// Реестр профилей (0.3): единственный источник профилей, текстов
+    /// конфигов и кредов — память, наполняется SyncProfiles от GUI.
+    registry: SharedRegistry,
+    /// Корень данных демона (файл поколения `generation-seed`; профили
+    /// здесь больше не живут).
+    data_root: PathBuf,
     /// Подключение к агенту аплаенса.
     connect: Arc<dyn AgentConnect>,
     /// Менеджер host-бутылок (маршрутизация по `kind`, спека §7.2);
@@ -357,11 +362,12 @@ pub struct BottleManager {
 }
 
 impl BottleManager {
-    /// Создаёт менеджера над хранилищем и подключением; host-часть —
+    /// Создаёт менеджера над реестром и подключением; host-часть —
     /// продакшн-инъекции ([`crate::host_manager::HostParts::real`]).
-    pub fn new(store: Store, connect: Arc<dyn AgentConnect>) -> Self {
+    pub fn new(registry: SharedRegistry, data_root: PathBuf, connect: Arc<dyn AgentConnect>) -> Self {
         Self::new_with_host(
-            store,
+            registry,
+            data_root,
             connect,
             HostManager::new(HostParts::real(), HostTiming::default()),
         )
@@ -369,8 +375,13 @@ impl BottleManager {
 
     /// Создаёт менеджера с явно переданным host-менеджером (инъекция
     /// для тестов и dev-сборок).
-    pub fn new_with_host(store: Store, connect: Arc<dyn AgentConnect>, host: HostManager) -> Self {
-        let boot_seed = advance_generation_seed(store.data_root()).unwrap_or_else(|error| {
+    pub fn new_with_host(
+        registry: SharedRegistry,
+        data_root: PathBuf,
+        connect: Arc<dyn AgentConnect>,
+        host: HostManager,
+    ) -> Self {
+        let boot_seed = advance_generation_seed(&data_root).unwrap_or_else(|error| {
             tracing::warn!(
                 %error,
                 "не удалось обновить файл поколения: instance без персистентности между запусками"
@@ -379,7 +390,8 @@ impl BottleManager {
         });
         let (relay_tx, relay_rx) = mpsc::unbounded_channel();
         Self {
-            store,
+            registry,
+            data_root,
             connect,
             host: Arc::new(host),
             runtime: Mutex::new(HashMap::new()),
@@ -398,6 +410,12 @@ impl BottleManager {
     pub fn with_resilience_timing(mut self, timing: ResilienceTiming) -> Self {
         self.resilience = timing;
         self
+    }
+
+    /// Корень данных демона (файл поколения, событийный лог — Task 7).
+    #[allow(dead_code)] // задействуется событийным логом (спека §6)
+    pub fn data_root(&self) -> &Path {
+        &self.data_root
     }
 
     /// Переопределяет сервер одного релея (тест смерти relay-задачи,
@@ -572,7 +590,7 @@ impl BottleManager {
                         self.health.lock().await.restoring.remove(&id);
                         continue;
                     }
-                    if let Err(error) = self.start(&id, None).await {
+                    if let Err(error) = self.start(&id).await {
                         // Профиль недоступен и т.п.: маркер failed с
                         // причиной, иначе бутылка исчезнет из status молча.
                         self.runtime.lock().await.insert(
@@ -631,26 +649,32 @@ impl BottleManager {
     ///
     /// Три фазы: (1) короткий лок — пометка `starting` со свежим номером
     /// поколения (активная бутылка — no-op по §5.2); (2) без лока — резерв
-    /// портов, чтение конфига, соединение с агентом, `Up` → `Ready` и
+    /// портов, соединение с агентом, `Up` с текстом конфига → `Ready` и
     /// задачи проброса; (3) короткий лок — запись результата (`up`/`failed`),
     /// если поколение записи всё ещё наше; иначе (выиграл `stop` или
     /// перезапуск) — полный teardown СВОИХ ресурсов, вплоть до `Down`
     /// агенту за уже отправленный `Up`.
     ///
-    /// `Err` возможен только при чтении профиля; остальные неудачи —
-    /// `Ok(CliReply::Error)` с бутылкой в состоянии `failed`.
+    /// `Err` возможен только при чтении профиля из реестра; остальные
+    /// неудачи — `Ok(CliReply::Error)` с бутылкой в состоянии `failed`.
     ///
-    /// `credentials` — логин/пароль VPN этой сессии (OpenVPN
-    /// `auth-user-pass`). Если конфиг требует авторизацию, а кредов нет,
-    /// отвечает [`CliReply::NeedCredentials`] ДО маркера `starting` —
-    /// клиент спрашивает пользователя и повторяет `Start` с кредами.
-    /// Креды нигде не сохраняются: уходят агенту в `Up` и забываются.
-    pub async fn start(
-        &self,
-        id: &str,
-        credentials: Option<VpnCredentials>,
-    ) -> Result<CliReply, DaemonError> {
-        let profile = self.store.load(id)?;
+    /// Конфиг и креды (OpenVPN `auth-user-pass`) берутся из записи
+    /// реестра: GUI хранит их в зашифрованной БД и присылает в
+    /// SyncProfiles/UpsertProfile. Если конфиг требует авторизацию, а
+    /// сохранённых кредов нет — `Ok(CliReply::Error)` ДО маркера
+    /// `starting` с подсказкой обновить их через «Логин и пароль»
+    /// (0.3: интерактивного запроса кредов у демона больше нет).
+    pub async fn start(&self, id: &str) -> Result<CliReply, DaemonError> {
+        let full = {
+            let registry = self.registry.read().expect("реестр профилей");
+            if registry.is_empty() {
+                return Err(DaemonError::NotInRegistryEmpty { id: id.to_string() });
+            }
+            registry
+                .get(id)
+                .ok_or_else(|| DaemonError::NotFound { id: id.to_string() })?
+        };
+        let profile = full.profile.clone();
         if profile.kind == BottleKind::Host {
             // Спека §7.2 (host-бутылки) — жизненный цикл в host-менеджере.
             return self.host.start(&profile).await;
@@ -661,7 +685,7 @@ impl BottleManager {
         // мгновенным exit openvpn («could not read Auth username from
         // stdin») и невнятным TUNNEL_FAILED. Битый/отсутствующий конфиг
         // здесь не разбираем — его диагностирует фаза 2, как раньше.
-        if credentials.is_none()
+        if full.credentials.is_none()
             && matches!(
                 &profile.vpn,
                 VpnConfig::Env {
@@ -670,10 +694,15 @@ impl BottleManager {
                 }
             )
         {
-            if let Ok(text) = read_config(self.store.data_root(), &profile.vpn) {
-                if bottle_core::profile::openvpn_config_needs_auth(&text) {
-                    tracing::info!(id, "конфиг требует auth-user-pass: запрошены креды");
-                    return Ok(CliReply::NeedCredentials { id: id.to_string() });
+            if let Some(text) = &full.config_text {
+                if bottle_core::profile::openvpn_config_needs_auth(text) {
+                    tracing::info!(id, "конфиг требует auth-user-pass, а сохранённых кредов нет");
+                    return Ok(CliReply::Error {
+                        message: format!(
+                            "бутылка «{id}»: нет сохранённого логина/пароля — \
+                             обновите их кнопкой «Логин и пароль»"
+                        ),
+                    });
                 }
             }
         }
@@ -714,7 +743,9 @@ impl BottleManager {
 
         // Фаза 2: длинные операции без лока; instance-поколение этого
         // старта сопровождает Up (агент сохранит его с бутылкой).
-        let outcome = self.provision(&profile, credentials, generation).await;
+        let outcome = self
+            .provision(&profile, full.config_text, full.credentials, generation)
+            .await;
 
         // Фаза 3: короткий лок. Маркер жив, только если в карте лежит
         // запись нашего поколения: stop вынимает запись, перезапуск
@@ -833,10 +864,14 @@ impl BottleManager {
         if self.host.has_active_session(id).await {
             return self.host.stop(id).await;
         }
-        if let Ok(profile) = self.store.load(id) {
-            if profile.kind == BottleKind::Host {
-                return self.host.stop(id).await;
-            }
+        let kind = self
+            .registry
+            .read()
+            .expect("реестр профилей")
+            .get(id)
+            .map(|full| full.profile.kind);
+        if kind == Some(BottleKind::Host) {
+            return self.host.stop(id).await;
         }
         // Короткий лок: активную бутылку вынуть из карты целиком.
         let runtime = {
@@ -927,14 +962,16 @@ impl BottleManager {
         *self.appliance_version.lock().await = Some(version.to_string());
     }
 
-    /// Фаза 2 `start`: резерв портов, чтение конфига, `Up` → `Ready`,
+    /// Фаза 2 `start`: резерв портов, `Up` с текстом конфига → `Ready`,
     /// задачи проброса. При ошибке всё сделанное освобождается
     /// (резерв-слушатели дропаются — порты свободны). `instance` —
     /// поколение этого старта, оно сопровождает `Up` и компенсирующий
-    /// `Down` (агент хранит его с бутылкой).
+    /// `Down` (агент хранит его с бутылкой). `config` — текст конфига
+    /// туннеля из реестра (`None` — конфиг не задан: ошибка старта).
     async fn provision(
         &self,
         profile: &BottleProfile,
+        config: Option<String>,
         credentials: Option<VpnCredentials>,
         instance: u64,
     ) -> Result<Provisioned, String> {
@@ -944,7 +981,13 @@ impl BottleManager {
         let protocol = *protocol;
 
         let selection = reserve_ports(profile)?;
-        let config = read_config(self.store.data_root(), &profile.vpn)?;
+        let config = config.ok_or_else(|| {
+            format!(
+                "бутылка «{}»: конфиг не задан — откройте бутылку на редактирование \
+                 и вставьте конфигурацию туннеля",
+                profile.id
+            )
+        })?;
 
         let mut handle = self
             .connect
@@ -1214,42 +1257,6 @@ fn set_nonblocking(listener: &StdTcpListener, port: u16) -> Result<(), String> {
         .map_err(|e| format!("порт {port}: не удалось включить неблокирующий режим: {e}"))
 }
 
-/// Читает содержимое конфига туннеля из хранилища (`bottles/<id>.conf`):
-/// агент получает текст, а не имя файла. Имя из профиля проходит барьер
-/// [`is_plain_config_filename`] ДО обращения к файловой системе.
-fn read_config(data_root: &Path, vpn: &VpnConfig) -> Result<String, String> {
-    let VpnConfig::Env { config, .. } = vpn else {
-        return Err("конфиг есть только у env-бутылок".to_string());
-    };
-    if !is_plain_config_filename(config) {
-        return Err(format!(
-            "недопустимое имя файла конфига в профиле: {config:?} \
-             (ожидается плоское имя из A-Z a-z 0-9 . _ -, например office-a.conf)"
-        ));
-    }
-    let path = data_root.join("bottles").join(config);
-    std::fs::read_to_string(&path)
-        .map_err(|error| format!("не удалось прочитать конфиг {}: {error}", path.display()))
-}
-
-/// Плоское имя файла конфига `^[A-Za-z0-9._-]+$` без разделителей пути.
-///
-/// `config` приходит из профиля на диске — рукописного toml, а не только
-/// из [`Store::save`] (который нормализует его в `<id>.conf`): без
-/// барьера `../../etc/passwd` читал бы произвольные файлы хоста и
-/// отправлял их содержимое агенту аплаенса. `.` и `..` проходят
-/// посимвольный фильтр, но отвергаются явно — это traversal-намерение
-/// (обе ссылки резолвятся в каталоги и чтением не дырявят, но барьер
-/// не должен зависеть от этого нюанса).
-fn is_plain_config_filename(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
 /// Собирает запрос `Up` из профиля, выбранного резерва портов и
 /// instance-поколения старта (агент сохранит его с бутылкой).
 fn up_args(
@@ -1364,7 +1371,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bottle_core::frame::{decode_frame, encode_frame, LengthJsonCodec};
-    use bottle_core::ipc::{BottleState, CliReply};
+    use bottle_core::ipc::{BottleState, CliReply, FullProfile};
     use bottle_core::profile::{BottleKind, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig};
     use bottle_core::protocol::{err, AgentReply, AgentRequest, UpArgs, PROTOCOL_VERSION};
     use bytes::BytesMut;
@@ -1424,6 +1431,10 @@ mod tests {
     /// в `bottles/<id>.conf` содержимым `wg-office-a`; для env-профиля
     /// путь исходника в fixture подменяется на реально созданный файл —
     /// `Store::save` читает конфиг именно как путь до исходника).
+    ///
+    /// Осталось для тестов диспетчера pipe (он ещё принимает &Store —
+    /// перестройка диспетчера отдельной задачей); менеджер бутылок
+    /// хранилища больше не видит.
     fn store_with(profile: &BottleProfile) -> (tempfile::TempDir, Store) {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("wg-office.conf");
@@ -1435,6 +1446,33 @@ mod tests {
         let store = Store::open(&tmp.path().join("store")).unwrap();
         store.save(&profile).unwrap();
         (tmp, store)
+    }
+
+    /// Реестр с одним профилем: конфиг env-профиля — текстом
+    /// (`wg-office-a`), кредов нет (0.3: профили живут в памяти демона).
+    fn registry_with(profile: &BottleProfile) -> SharedRegistry {
+        let registry = crate::registry::Registry::new_shared();
+        registry
+            .write()
+            .expect("реестр")
+            .upsert(full_profile_of(profile, None));
+        registry
+    }
+
+    /// FullProfile из BottleProfile: конфиг env — текстом, креды —
+    /// параметром (OpenVPN-тесты кладут сохранённые креды).
+    fn full_profile_of(
+        profile: &BottleProfile,
+        credentials: Option<VpnCredentials>,
+    ) -> FullProfile {
+        FullProfile {
+            profile: profile.clone(),
+            config_text: match &profile.vpn {
+                VpnConfig::Env { .. } => Some("wg-office-a".to_string()),
+                VpnConfig::Host { .. } => None,
+            },
+            credentials,
+        }
     }
 
     /// Свободный порт на `127.0.0.1` (bind `:0` → номер → drop). Крошечное
@@ -1948,26 +1986,31 @@ mod tests {
         write_half.write_all(&buf).await.expect("отправка ответа");
     }
 
-    /// Менеджер над хранилищем и фейк-агентом.
-    fn manager_with(store_root: &std::path::Path, fake: FakeAgent) -> (Arc<BottleManager>, Store) {
-        let store = Store::open(store_root).unwrap();
-        (
-            Arc::new(BottleManager::new(store, Arc::new(fake))),
-            Store::open(store_root).unwrap(),
-        )
+    /// Менеджер над реестром и фейк-агентом; `data_root` — каталог
+    /// файла поколения (generation-seed).
+    fn manager_with(
+        registry: &SharedRegistry,
+        data_root: &std::path::Path,
+        fake: FakeAgent,
+    ) -> Arc<BottleManager> {
+        Arc::new(BottleManager::new(
+            registry.clone(),
+            data_root.to_path_buf(),
+            Arc::new(fake),
+        ))
     }
 
-    /// Менеджер над хранилищем и фейк-агентом с инъекциями живучести
+    /// Менеджер над реестром и фейк-агентом с инъекциями живучести
     /// (сжатый бэкофф reconnect для таймлайнов health-цикла).
     fn manager_with_timing(
-        store_root: &std::path::Path,
+        registry: &SharedRegistry,
+        data_root: &std::path::Path,
         fake: FakeAgent,
         timing: ResilienceTiming,
-    ) -> (Arc<BottleManager>, Store) {
-        let store = Store::open(store_root).unwrap();
-        (
-            Arc::new(BottleManager::new(store, Arc::new(fake)).with_resilience_timing(timing)),
-            Store::open(store_root).unwrap(),
+    ) -> Arc<BottleManager> {
+        Arc::new(
+            BottleManager::new(registry.clone(), data_root.to_path_buf(), Arc::new(fake))
+                .with_resilience_timing(timing),
         )
     }
 
@@ -2032,11 +2075,12 @@ mod tests {
 
     #[tokio::test]
     async fn start_answers_ready_socks5_works_and_status_is_up() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "ignored-by-save.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "ignored-by-save.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _dispatch_store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
-        let reply = manager.start("office-a", None).await.expect("start ок");
+        let reply = manager.start("office-a").await.expect("start ок");
         assert_eq!(
             reply,
             CliReply::Started {
@@ -2090,7 +2134,7 @@ mod tests {
         assert_eq!(ups[0].dns, Some("10.20.30.1".parse().unwrap()));
         assert_ne!(ups[0].socks5_port, 0, "нулевые порты не отправляются");
         assert_ne!(ups[0].forwards[0].port, 0, "нулевые порты не отправляются");
-        let seed = read_generation_seed(store.data_root());
+        let seed = read_generation_seed(data.path());
         assert_eq!(
             ups[0].instance,
             seed << 20,
@@ -2098,36 +2142,39 @@ mod tests {
         );
     }
 
-    /// OpenVPN-профиль с голым `auth-user-pass`: start без кредов —
-    /// `NeedCredentials` ДО обращения к аплаенсу (ни одного Up, бутылка
-    /// не помечается failed); start с кредами — `Started`, агент получил
-    /// их в `Up`. Креды не хранятся: каждый запуск спрашивает заново.
+    /// OpenVPN-профиль с голым `auth-user-pass` (0.3): start без
+    /// сохранённых кредов — понятная ошибка ДО обращения к аплаенсу
+    /// (ни одного Up, бутылка не помечается failed) с подсказкой
+    /// «Логин и пароль»; креды лежат в реестре (их прислал GUI из
+    /// зашифрованной БД) — старт обычный, Up несёт логин/пароль и
+    /// текст конфига из реестра.
     #[tokio::test]
-    async fn openvpn_auth_user_pass_requires_credentials_per_start() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("yorus.conf");
-        std::fs::write(&src, "client\nauth-user-pass\nremote vpn.example 443\n").unwrap();
-        let mut profile = env_profile("yorus-new", src.to_str().unwrap());
+    async fn openvpn_auth_user_pass_uses_registry_credentials() {
+        const CONFIG: &str = "client\nauth-user-pass\nremote vpn.example 443\n";
+        let data = tempfile::tempdir().unwrap();
+        let mut profile = env_profile("yorus-new", "yorus.conf");
         profile.vpn = VpnConfig::Env {
             protocol: TunnelProtocol::OpenVpn,
-            config: src.to_string_lossy().into_owned(),
+            config: "yorus.conf".to_string(),
         };
-        let store = Store::open(&tmp.path().join("store")).unwrap();
-        store.save(&profile).unwrap();
+        let registry = crate::registry::Registry::new_shared();
+        registry.write().expect("реестр").upsert(FullProfile {
+            profile: profile.clone(),
+            config_text: Some(CONFIG.to_string()),
+            credentials: None,
+        });
 
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
-        // Без кредов: запрос кредов, аплаенс не дёргается.
-        let reply = manager
-            .start("yorus-new", None)
-            .await
-            .expect("ответ, не сбой");
-        assert_eq!(
-            reply,
-            CliReply::NeedCredentials {
-                id: "yorus-new".into()
-            }
+        // Без сохранённых кредов: ошибка с подсказкой, аплаенс не дёргается.
+        let reply = manager.start("yorus-new").await.expect("ответ, не сбой");
+        let CliReply::Error { message } = reply else {
+            panic!("ожидали Error, получили {reply:?}");
+        };
+        assert!(
+            message.contains("Логин и пароль"),
+            "подсказка обновить креды: {message}"
         );
         assert!(
             fake.journal.ups().is_empty(),
@@ -2138,17 +2185,17 @@ mod tests {
             "бутылка не помечается failed/starting"
         );
 
-        // С кредами: обычный старт, Up несёт логин/пароль.
-        let reply = manager
-            .start(
-                "yorus-new",
-                Some(VpnCredentials {
-                    username: "user@corp".to_string(),
-                    password: "s3cret".to_string(),
-                }),
-            )
-            .await
-            .expect("start с кредами ок");
+        // GUI обновил креды (UpsertProfile): обычный старт, Up несёт
+        // логин/пароль и текст конфига из реестра.
+        registry.write().expect("реестр").upsert(FullProfile {
+            profile,
+            config_text: Some(CONFIG.to_string()),
+            credentials: Some(VpnCredentials {
+                username: "user@corp".to_string(),
+                password: "s3cret".to_string(),
+            }),
+        });
+        let reply = manager.start("yorus-new").await.expect("start с кредами ок");
         assert_eq!(
             reply,
             CliReply::Started {
@@ -2157,6 +2204,7 @@ mod tests {
         );
         let ups = fake.journal.ups();
         assert_eq!(ups.len(), 1);
+        assert_eq!(ups[0].config, CONFIG, "конфиг передан текстом из реестра");
         assert_eq!(ups[0].username.as_deref(), Some("user@corp"));
         assert_eq!(ups[0].password.as_deref(), Some("s3cret"));
     }
@@ -2165,21 +2213,23 @@ mod tests {
     /// требует: start идёт сразу.
     #[tokio::test]
     async fn openvpn_auth_file_form_starts_without_credentials() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("ovpn.conf");
-        std::fs::write(&src, "client\nauth-user-pass /etc/secret.txt\n").unwrap();
-        let mut profile = env_profile("ovpn-file", src.to_str().unwrap());
+        let data = tempfile::tempdir().unwrap();
+        let mut profile = env_profile("ovpn-file", "ovpn.conf");
         profile.vpn = VpnConfig::Env {
             protocol: TunnelProtocol::OpenVpn,
-            config: src.to_string_lossy().into_owned(),
+            config: "ovpn.conf".to_string(),
         };
-        let store = Store::open(&tmp.path().join("store")).unwrap();
-        store.save(&profile).unwrap();
+        let registry = crate::registry::Registry::new_shared();
+        registry.write().expect("реестр").upsert(FullProfile {
+            profile,
+            config_text: Some("client\nauth-user-pass /etc/secret.txt\n".to_string()),
+            credentials: None,
+        });
 
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
-        let reply = manager.start("ovpn-file", None).await.expect("start ок");
+        let reply = manager.start("ovpn-file").await.expect("start ок");
         assert_eq!(
             reply,
             CliReply::Started {
@@ -2190,15 +2240,51 @@ mod tests {
         assert_eq!(fake.journal.ups()[0].username, None);
     }
 
+    /// Пустой реестр (демон ещё не получил SyncProfiles от GUI): start
+    /// любого id — ошибка, называющая id и ждущий SyncProfiles реестр.
+    #[tokio::test]
+    async fn start_unknown_id_after_empty_sync_is_not_found() {
+        let data = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::new_shared();
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let manager = manager_with(&registry, data.path(), fake);
+
+        let error = manager.start("ghost").await.expect_err("пустой реестр — ошибка");
+        let text = error.to_string();
+        assert!(text.contains("ghost"), "назван id: {text}");
+        assert!(
+            text.contains("SyncProfiles"),
+            "названа причина пустого реестра: {text}"
+        );
+        assert!(
+            manager.status().await.is_empty(),
+            "бутылка не появляется в статусе"
+        );
+    }
+
+    /// Непустой реестр без запрошенного id — обычный «профиль не найден»
+    /// (пустой реестр имеет свою, более говорящую ошибку).
+    #[tokio::test]
+    async fn start_unknown_id_in_nonempty_registry_is_plain_not_found() {
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let manager = manager_with(&registry, data.path(), fake);
+
+        let error = manager.start("ghost").await.expect_err("нет такого id");
+        assert_eq!(error.to_string(), "профиль не найден: ghost");
+    }
+
     #[tokio::test]
     async fn second_start_on_up_is_noop_with_single_bottle() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
-        manager.start("office-a", None).await.expect("первый start");
+        manager.start("office-a").await.expect("первый start");
         let reply = manager
-            .start("office-a", None)
+            .start("office-a")
             .await
             .expect("повторный start без ошибки");
         assert_eq!(
@@ -2219,12 +2305,13 @@ mod tests {
 
     #[tokio::test]
     async fn port_busy_reselects_ports_and_retries_up_once() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::PortBusyOnce).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
         let reply = manager
-            .start("office-a", None)
+            .start("office-a")
             .await
             .expect("start после ретрая");
         assert_eq!(
@@ -2260,14 +2347,15 @@ mod tests {
         // Фиксированный SOCKS5, проброс остаётся динамическим.
         profile.expose.socks5 = fixed_socks5;
 
-        let (_tmp, store) = store_with(&profile);
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&profile);
         let fake = FakeAgent::spawn(UpBehavior::PortBusyOnce).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
         // Первый Up — PORT_BUSY; повтор сохраняет фиксированный порт
         // (без повторного bind) и перевыбирает динамический.
         let reply = manager
-            .start("fixed-a", None)
+            .start("fixed-a")
             .await
             .expect("start после ретрая");
         assert_eq!(
@@ -2310,12 +2398,13 @@ mod tests {
         let mut profile = env_profile("fixed-b", "wg.conf");
         profile.expose.socks5 = fixed_socks5;
 
-        let (_tmp, store) = store_with(&profile);
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&profile);
         let fake = FakeAgent::spawn(UpBehavior::PortBusyAlways).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
         let reply = manager
-            .start("fixed-b", None)
+            .start("fixed-b")
             .await
             .expect("ответ, не сбой");
         let CliReply::Error { message } = reply else {
@@ -2354,12 +2443,13 @@ mod tests {
     #[tokio::test]
     async fn tunnel_failure_marks_bottle_failed_and_frees_ports() {
         const REASON: &str = "туннель не поднялся: handshake timeout";
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::TunnelFailed(REASON.to_string())).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
         let reply = manager
-            .start("office-a", None)
+            .start("office-a")
             .await
             .expect("start отвечает ошибкой");
         let CliReply::Error { message } = reply else {
@@ -2393,9 +2483,10 @@ mod tests {
 
     #[tokio::test]
     async fn stop_sends_down_closes_listeners_and_clears_status() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
         // Stop незапущенной бутылки — no-op с предупреждением (§5.2).
         let reply = manager.stop("office-a").await.expect("stop без паники");
@@ -2407,7 +2498,7 @@ mod tests {
             }
         );
 
-        manager.start("office-a", None).await.expect("start");
+        manager.start("office-a").await.expect("start");
         let socks5 = manager.status().await[0].socks5.expect("порт назначен");
 
         let reply = manager.stop("office-a").await.expect("stop ок");
@@ -2436,11 +2527,12 @@ mod tests {
 
     #[tokio::test]
     async fn stale_instance_down_spares_live_bottle_and_is_tolerated() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
-        manager.start("office-a", None).await.expect("start"); // поколение 0
+        manager.start("office-a").await.expect("start"); // поколение 0
         let socks5 = manager.status().await[0].socks5.expect("порт назначен");
 
         // Down чужого поколения: агент отвечает STALE_INSTANCE — для
@@ -2483,21 +2575,22 @@ mod tests {
 
     #[tokio::test]
     async fn restart_during_start_leaves_single_live_bottle() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         // Первый Up застревает в агенте на 300 мс — окно для stop+restart.
         let fake = FakeAgent::spawn(UpBehavior::DelayedFirstUp(Duration::from_millis(300))).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
         let first = {
             let manager = Arc::clone(&manager);
-            tokio::spawn(async move { manager.start("office-a", None).await })
+            tokio::spawn(async move { manager.start("office-a").await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await; // start1 уже в фазе Up
         manager
             .stop("office-a")
             .await
             .expect("stop во время старта");
-        let reply = manager.start("office-a", None).await.expect("restart");
+        let reply = manager.start("office-a").await.expect("restart");
         assert_eq!(
             reply,
             CliReply::Started {
@@ -2568,7 +2661,8 @@ mod tests {
     /// старт — снова `ALREADY_UP`).
     #[tokio::test]
     async fn restart_race_loser_down_clears_ghost_bottle() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         // Первый Up держит гейт 300 мс («долгий handshake туннеля»):
         // Up победителя встаёт в очередь и приходит к барьеру ПОСЛЕ
         // регистрации проигравшего → ALREADY_UP.
@@ -2576,11 +2670,11 @@ mod tests {
             300,
         )))
         .await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
         let first = {
             let manager = Arc::clone(&manager);
-            tokio::spawn(async move { manager.start("office-a", None).await })
+            tokio::spawn(async move { manager.start("office-a").await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await; // start1 в фазе Up
         manager
@@ -2588,7 +2682,7 @@ mod tests {
             .await
             .expect("stop во время старта (Down ещё NOT_FOUND)");
         let reply = manager
-            .start("office-a", None)
+            .start("office-a")
             .await
             .expect("restart отвечает");
         let CliReply::Error { message } = reply else {
@@ -2619,7 +2713,7 @@ mod tests {
         // Призрака нет — следующий старт проходит (никакого вечного
         // цикла ALREADY_UP) и бутылка реально работает.
         let reply = manager
-            .start("office-a", None)
+            .start("office-a")
             .await
             .expect("start после уборки призрака");
         assert_eq!(
@@ -2643,13 +2737,14 @@ mod tests {
 
     #[tokio::test]
     async fn stop_during_start_tears_down_and_sends_down() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::DelayedFirstUp(Duration::from_millis(300))).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
         let first = {
             let manager = Arc::clone(&manager);
-            tokio::spawn(async move { manager.start("office-a", None).await })
+            tokio::spawn(async move { manager.start("office-a").await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
         let reply = manager
@@ -2700,12 +2795,13 @@ mod tests {
     /// без UAC-fallback). Проверка идёт раньше любых эффектов.
     #[tokio::test]
     async fn host_profile_start_without_svc_answers_installation_message() {
-        let (_tmp, store) = store_with(&host_profile("corp-vpn"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&host_profile("corp-vpn"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
         let reply = manager
-            .start("corp-vpn", None)
+            .start("corp-vpn")
             .await
             .expect("ответ, не сбой");
         let CliReply::Error { message } = reply else {
@@ -2725,22 +2821,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_config_file_fails_the_bottle_with_clear_reason() {
-        let (tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+    async fn missing_config_text_fails_the_bottle_with_clear_reason() {
+        // 0.3: конфиг — текст в реестре; `None` (GUI прислал профиль без
+        // конфига) — старт с понятной причиной, бутылка failed.
+        let data = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::new_shared();
+        registry.write().expect("реестр").upsert(FullProfile {
+            profile: env_profile("office-a", "wg.conf"),
+            config_text: None,
+            credentials: None,
+        });
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
-        std::fs::remove_file(tmp.path().join("store/bottles/office-a.conf")).unwrap();
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
         let reply = manager
-            .start("office-a", None)
+            .start("office-a")
             .await
             .expect("ответ, не сбой");
         let CliReply::Error { message } = reply else {
             panic!("ожидали Error, получили {reply:?}");
         };
         assert!(
-            message.contains("office-a.conf"),
-            "в сообщении имя конфига: {message}"
+            message.contains("конфиг не задан"),
+            "причина — отсутствие конфига: {message}"
+        );
+        assert!(
+            message.contains("office-a"),
+            "назван id бутылки: {message}"
         );
 
         let bottles = manager.status().await;
@@ -2756,10 +2863,11 @@ mod tests {
     #[tokio::test]
     async fn dispatch_delete_of_active_bottle_is_refused() {
         let (tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, store) = manager_with(store.data_root(), fake);
+        let manager = manager_with(&registry, store.data_root(), fake);
         manager
-            .start("office-a", None)
+            .start("office-a")
             .await
             .expect("бутылка поднята");
 
@@ -2795,13 +2903,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_delete_of_failed_bottle_succeeds() {
         let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::TunnelFailed(
             "туннель не поднялся: handshake timeout".to_string(),
         ))
         .await;
-        let (manager, store) = manager_with(store.data_root(), fake);
+        let manager = manager_with(&registry, store.data_root(), fake);
         let reply = manager
-            .start("office-a", None)
+            .start("office-a")
             .await
             .expect("ответ, не сбой");
         assert!(matches!(reply, CliReply::Error { .. }), "start провалился");
@@ -2838,10 +2947,11 @@ mod tests {
     #[tokio::test]
     async fn dispatch_upgrade_with_live_bottle_is_refused() {
         let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, store) = manager_with(store.data_root(), fake);
+        let manager = manager_with(&registry, store.data_root(), fake);
         manager
-            .start("office-a", None)
+            .start("office-a")
             .await
             .expect("бутылка поднята");
 
@@ -2869,10 +2979,11 @@ mod tests {
     #[tokio::test]
     async fn dispatch_stop_of_stopped_bottle_is_noop_with_warning() {
         let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, store) = manager_with(store.data_root(), fake);
+        let manager = manager_with(&registry, store.data_root(), fake);
         manager
-            .start("office-a", None)
+            .start("office-a")
             .await
             .expect("бутылка поднята");
         let first = manager.stop("office-a").await.expect("первый stop");
@@ -2908,8 +3019,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_wires_start_stop_status_and_show_runtime_to_manager() {
         let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, store) = manager_with(store.data_root(), fake);
+        let manager = manager_with(&registry, store.data_root(), fake);
 
         // Start через диспетчер.
         let reply = crate::pipe::dispatch(
@@ -3032,13 +3144,14 @@ mod tests {
     /// instance-диапазоны двух запусков не пересекаются (разные seed).
     #[tokio::test]
     async fn generation_seed_persists_and_boot_instances_are_disjoint() {
-        let (tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
 
         // Первый запуск: файл создан, instance = seed << 20 | 0.
         let fake1 = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (boot1, _s1) = manager_with(store.data_root(), fake1.clone());
-        boot1.start("office-a", None).await.expect("start boot1");
-        let seed1 = read_generation_seed(store.data_root());
+        let boot1 = manager_with(&registry, data.path(), fake1.clone());
+        boot1.start("office-a").await.expect("start boot1");
+        let seed1 = read_generation_seed(data.path());
         let instance1 = fake1.journal.ups()[0].instance;
         assert_eq!(instance1, seed1 << 20, "младшие 20 бит — счётчик с нуля");
         drop(boot1);
@@ -3046,13 +3159,13 @@ mod tests {
         // Второй запуск над тем же каталогом: seed прочитан и продвинут
         // (даже если оба менеджера созданы в одну миллисекунду).
         let fake2 = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (boot2, _s2) = manager_with(store.data_root(), fake2.clone());
-        let seed2 = read_generation_seed(store.data_root());
+        let boot2 = manager_with(&registry, data.path(), fake2.clone());
+        let seed2 = read_generation_seed(data.path());
         assert!(
             seed2 > seed1,
             "seed второго запуска больше: {seed2} vs {seed1}"
         );
-        boot2.start("office-a", None).await.expect("start boot2");
+        boot2.start("office-a").await.expect("start boot2");
         let instance2 = fake2.journal.ups()[0].instance;
         assert_eq!(instance2, seed2 << 20);
         assert_ne!(
@@ -3064,8 +3177,7 @@ mod tests {
 
         // Файл на месте и содержит десятичное u64 (формат переживает
         // перезапуск демона).
-        let _ = tmp; // держим каталог живым
-        let text = std::fs::read_to_string(store.data_root().join("generation-seed")).unwrap();
+        let text = std::fs::read_to_string(data.path().join("generation-seed")).unwrap();
         assert_eq!(text.trim().parse::<u64>().unwrap(), seed2);
     }
 
@@ -3073,20 +3185,21 @@ mod tests {
     /// номер, общий префикс seed).
     #[tokio::test]
     async fn instances_rise_monotonically_within_boot() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _s) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
-        manager.start("office-a", None).await.expect("start 1");
+        manager.start("office-a").await.expect("start 1");
         manager.stop("office-a").await.expect("stop 1");
-        manager.start("office-a", None).await.expect("start 2");
+        manager.start("office-a").await.expect("start 2");
         manager.stop("office-a").await.expect("stop 2");
-        manager.start("office-a", None).await.expect("start 3");
+        manager.start("office-a").await.expect("start 3");
 
         let instances: Vec<u64> = fake.journal.ups().iter().map(|up| up.instance).collect();
         assert_eq!(instances.len(), 3);
         assert!(instances[0] < instances[1] && instances[1] < instances[2]);
-        let seed = read_generation_seed(store.data_root());
+        let seed = read_generation_seed(data.path());
         for instance in instances {
             assert_eq!(instance >> 20, seed, "префикс запуска общий");
         }
@@ -3114,16 +3227,17 @@ mod tests {
     /// проходит, старые слушатели закрыты.
     #[tokio::test]
     async fn agent_death_degrades_env_bottle_and_recovery_restores_it() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
         let no_backoff = ResilienceTiming {
             reconnect_backoff: vec![Duration::from_millis(0)],
         };
-        let (manager, _s) = manager_with_timing(store.data_root(), fake.clone(), no_backoff);
+        let manager = manager_with_timing(&registry, data.path(), fake.clone(), no_backoff);
         let shutdown = tokio_util::sync::CancellationToken::new();
         manager.spawn_health_loop(shutdown.clone(), Duration::from_millis(25));
 
-        manager.start("office-a", None).await.expect("start");
+        manager.start("office-a").await.expect("start");
         let first = wait_state(&manager, "office-a", is_up, "первичный подъём").await;
         let socks5_first = first.socks5.expect("порт назначен");
         let instance_first = fake.journal.ups()[0].instance;
@@ -3200,11 +3314,12 @@ mod tests {
     /// агенте: бутылка остаётся up, Up не дублируются.
     #[tokio::test]
     async fn health_pass_with_alive_agent_keeps_bottle_up() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _s) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
-        manager.start("office-a", None).await.expect("start");
+        manager.start("office-a").await.expect("start");
         for _ in 0..3 {
             manager.health_pass().await;
         }
@@ -3227,10 +3342,11 @@ mod tests {
     /// пользователя попадает точно между stop и start восстановления.
     #[tokio::test]
     async fn user_stop_during_recovery_window_prevents_repost() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
-        manager.start("office-a", None).await.expect("поднята");
+        let manager = manager_with(&registry, data.path(), fake.clone());
+        manager.start("office-a").await.expect("поднята");
 
         // Смерть агента → деградация; воскрешение с зажатым Down-гейтом.
         fake.kill();
@@ -3288,9 +3404,10 @@ mod tests {
     /// бутылкой агент опрашивается.
     #[tokio::test]
     async fn health_pass_skips_agent_probe_without_active_env_bottles() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let (manager, _store) = manager_with(store.data_root(), fake.clone());
+        let manager = manager_with(&registry, data.path(), fake.clone());
 
         // Ни одной бутылки: три прохода — ноль проб агента.
         for _ in 0..3 {
@@ -3303,7 +3420,7 @@ mod tests {
         );
 
         // Живая бутылка: проба обязательна.
-        manager.start("office-a", None).await.expect("поднята");
+        manager.start("office-a").await.expect("поднята");
         fake.journal.reset_probes();
         manager.health_pass().await;
         assert!(
@@ -3314,11 +3431,11 @@ mod tests {
 
     #[tokio::test]
     async fn relay_task_death_degrades_bottle_with_reason() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let data = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let store_root = store.data_root().to_path_buf();
         let manager = Arc::new(
-            BottleManager::new(Store::open(&store_root).unwrap(), Arc::new(fake.clone()))
+            BottleManager::new(registry, data.path().to_path_buf(), Arc::new(fake.clone()))
                 .with_relay_serve(Arc::new(|_listener, _target| {
                     // Фейк-релей: акцепт-цикл падает сразу (модель смерти
                     // слушателя); исходный слушатель жив в рантайме.
@@ -3328,7 +3445,7 @@ mod tests {
                 })),
         );
 
-        manager.start("office-a", None).await.expect("start");
+        manager.start("office-a").await.expect("start");
 
         // Задача умерла сразу после старта; health-цикл (сжатый период)
         // подбирает доклад и помечает бутылку деградированной.
@@ -3352,43 +3469,4 @@ mod tests {
         assert!(fake.journal.downs().is_empty());
     }
 
-    /// `read_config` принимает плоское имя конфига в профиле
-    /// (`Store::save` нормализует его в `<id>.conf`).
-    #[test]
-    fn read_config_accepts_plain_filename() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bottles = tmp.path().join("bottles");
-        std::fs::create_dir_all(&bottles).unwrap();
-        std::fs::write(bottles.join("office-a.conf"), "wg-office-a").unwrap();
-
-        let vpn = VpnConfig::Env {
-            protocol: TunnelProtocol::WireGuard,
-            config: "office-a.conf".to_string(),
-        };
-        assert_eq!(
-            read_config(tmp.path(), &vpn).expect("плоское имя читается"),
-            "wg-office-a"
-        );
-    }
-
-    /// Имя конфига из профиля валидируется `^[A-Za-z0-9._-]+$` до
-    /// каких-либо обращений к файловой системе: профиль — рукописный
-    /// toml на диске, и без барьера `../..` читал бы произвольные файлы
-    /// хоста и отправлял их содержимое в аплаенс (ledger-минор T16).
-    #[test]
-    fn read_config_rejects_traversal_and_absolute_names() {
-        // «..» и «.» проходят посимвольный фильтр, но являются
-        // traversal-намерением — отвергаются явно.
-        for name in ["../../etc/passwd", "/abs/path", "..", "."] {
-            let vpn = VpnConfig::Env {
-                protocol: TunnelProtocol::WireGuard,
-                config: name.to_string(),
-            };
-            let err = read_config(Path::new("/data"), &vpn).expect_err("имя должно быть отклонено");
-            assert!(
-                err.contains("недопустимое имя файла конфига"),
-                "отказ обязан называть барьер, для {name:?}: {err}"
-            );
-        }
-    }
 }

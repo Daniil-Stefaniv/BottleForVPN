@@ -1582,7 +1582,7 @@ mod tests {
     use super::*;
     use crate::error::DaemonError;
     use crate::manager::BottleManager;
-    use crate::store::Store;
+    use bottle_core::ipc::FullProfile;
     use crate::svc_client::SvcTransport;
 
     // ------------------------------------------------------------------
@@ -1874,6 +1874,15 @@ mod tests {
                 dns: None,
                 launch: None,
             },
+        }
+    }
+
+    /// Host-профиль в обёртке реестра (0.3: конфигов/кредов у host нет).
+    fn host_full_profile(id: &str, endpoint: &str) -> FullProfile {
+        FullProfile {
+            profile: host_profile(id, endpoint),
+            config_text: None,
+            credentials: None,
         }
     }
 
@@ -2530,17 +2539,23 @@ mod tests {
     #[tokio::test]
     async fn manager_routes_host_lifecycle() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&tmp.path().join("store")).unwrap();
-        store
-            .save(&host_profile("corp", "vpn.example.com"))
-            .unwrap();
+        let registry = crate::registry::Registry::new_shared();
+        registry
+            .write()
+            .expect("реестр")
+            .upsert(host_full_profile("corp", "vpn.example.com"));
 
         let setup = test_host(true, vec![adapter("CorpVPN", 42, true)]);
         let TestSetup { host, .. } = setup;
-        let manager = BottleManager::new_with_host(store, Arc::new(FailingAgentConnect), host);
+        let manager = BottleManager::new_with_host(
+            registry,
+            tmp.path().to_path_buf(),
+            Arc::new(FailingAgentConnect),
+            host,
+        );
 
         let reply = manager
-            .start("corp", None)
+            .start("corp")
             .await
             .expect("start через менеджера");
         assert_eq!(reply, CliReply::Started { id: "corp".into() });
@@ -2744,24 +2759,24 @@ mod tests {
         } = setup;
 
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&tmp.path().join("store")).unwrap();
-        store
-            .save(&host_profile("corp", "vpn.example.com"))
-            .unwrap();
-        store
-            .save(&host_profile("partner", "partner.example.com"))
-            .unwrap();
+        let registry = crate::registry::Registry::new_shared();
+        {
+            let mut registry = registry.write().expect("реестр");
+            registry.upsert(host_full_profile("corp", "vpn.example.com"));
+            registry.upsert(host_full_profile("partner", "partner.example.com"));
+        }
         let manager = BottleManager::new_with_host(
-            Store::open(store.data_root()).unwrap(),
+            registry,
+            tmp.path().to_path_buf(),
             Arc::new(FailingAgentConnect),
             host,
         );
 
-        manager.start("corp", None).await.expect("первая бутылка");
+        manager.start("corp").await.expect("первая бутылка");
         // Вторая бутылка резолвится в другой адрес (B).
         resolver.set(vec![ip("198.51.100.20")]);
         manager
-            .start("partner", None)
+            .start("partner")
             .await
             .expect("вторая бутылка");
         let corp_socks5 = manager
@@ -2830,20 +2845,23 @@ mod tests {
         let TestSetup { host, ops, .. } = setup;
 
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&tmp.path().join("store")).unwrap();
-        store
-            .save(&host_profile("corp", "vpn.example.com"))
-            .unwrap();
+        let registry = crate::registry::Registry::new_shared();
+        registry
+            .write()
+            .expect("реестр")
+            .upsert(host_full_profile("corp", "vpn.example.com"));
         let manager = BottleManager::new_with_host(
-            Store::open(store.data_root()).unwrap(),
+            registry.clone(),
+            tmp.path().to_path_buf(),
             Arc::new(FailingAgentConnect),
             host,
         );
-        manager.start("corp", None).await.expect("start");
+        manager.start("corp").await.expect("start");
 
-        // Профиль удалён (load → NotFound): раньше stop уходил в env-ветку
-        // «не запущена»; теперь сессия разбирается по runtime-состоянию.
-        std::fs::remove_file(store.data_root().join("bottles/corp.toml")).unwrap();
+        // Профиль удалён из реестра (GUI прислал RemoveProfile): раньше
+        // stop уходил в env-ветку «не запущена»; сессия разбирается по
+        // runtime-состоянию.
+        assert!(registry.write().expect("реестр").remove("corp"));
 
         let reply = manager.stop("corp").await.expect("stop без сбоя");
         assert_eq!(
