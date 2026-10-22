@@ -60,10 +60,59 @@ struct TrayState {
     enabled: bool,
 }
 
+/// Текст подтверждения выхода из трея («Завершить»): без активных
+/// бутылок — короткий вопрос; с активными — перечисление id, они будут
+/// остановлены вместе с демоном (0.3: «Завершить» гасит и GUI, и демона).
+pub fn quit_confirm_text(active: &[String]) -> String {
+    const QUESTION: &str = "Завершить Погребок и остановить демона?";
+    if active.is_empty() {
+        QUESTION.to_string()
+    } else {
+        format!("{QUESTION}\nАктивные бутылки будут остановлены: {}.", active.join(", "))
+    }
+}
+
+/// Текст диалога подтверждения выхода (TS передаёт id активных бутылок).
+#[tauri::command]
+fn quit_confirm(active: Vec<String>) -> String {
+    quit_confirm_text(&active)
+}
+
+/// Подтверждённый выход: шлёт демону `Shutdown` (стоп бутылок → выход)
+/// и завершает GUI. Демон недоступен/не наш — просто выходим.
+#[tauri::command]
+async fn confirm_quit(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DaemonHandle>,
+) -> Result<(), String> {
+    const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    let token = state.token().to_string();
+    let _ = tokio::time::timeout(QUIT_TIMEOUT, async {
+        if let Some(client) = daemon_client::DaemonClient::new() {
+            if client.connect(&token).await.is_ok() {
+                let _ = client.request(bottle_core::ipc::GuiRequest::Shutdown).await;
+            }
+        }
+    })
+    .await;
+    app.exit(0);
+    Ok(())
+}
+
 fn main() {
     // Фича-флаг --no-tray: GUI без tray (закрытие окна = выход).
     let with_tray = !std::env::args().any(|arg| arg == "--no-tray");
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // Второй запуск: показываем и фокусируем окно первого
+            // экземпляра (оно могло быть свёрнуто в трей).
+            use tauri::Manager as _;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(DaemonHandle::default())
@@ -73,7 +122,9 @@ fn main() {
             start_daemon,
             daemon_status,
             update_tray,
-            tray_enabled
+            tray_enabled,
+            quit_confirm,
+            confirm_quit
         ])
         .setup(move |app| {
             if with_tray {
@@ -84,4 +135,27 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("не удалось запустить окно BottleForApps");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Без активных бутылок — короткий вопрос (бриф Step 1).
+    #[test]
+    fn quit_confirm_without_active_is_short() {
+        let text = quit_confirm_text(&[]);
+        assert!(text.contains("Завершить Погребок"), "{text}");
+        assert!(!text.contains("будут остановлены"), "{text}");
+    }
+
+    /// С активными — их id перечислены и предупреждены об остановке.
+    #[test]
+    fn quit_confirm_lists_active_bottles() {
+        let text = quit_confirm_text(&["office-a".to_string(), "client-b".to_string()]);
+        assert!(text.contains("Завершить Погребок"), "{text}");
+        assert!(text.contains("office-a"), "{text}");
+        assert!(text.contains("client-b"), "{text}");
+        assert!(text.contains("будут остановлены"), "{text}");
+    }
 }

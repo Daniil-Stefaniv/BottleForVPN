@@ -6,9 +6,11 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
+import { ask, open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
+  activeBottleIds,
   mountApp,
   performBottleAction,
   setConfigFileDialog,
@@ -56,11 +58,35 @@ if (trayEnabled) {
   setRowsNotifier(initTray((id, action) => {
     void performBottleAction(id, action);
   }));
-  // Закрытие окна сворачивает в tray (выход — через меню «Выход»).
+  // Закрытие окна сворачивает в tray (выход — через меню «Завершить»).
   const window = getCurrentWindow();
   await window.onCloseRequested(async (event) => {
     event.preventDefault();
     await window.hide();
+  });
+
+  // «Завершить» в трее (0.3): подтверждение да/нет; «да» — Shutdown
+  // демону и выход GUI (демон и GUI умирают вместе).
+  let quitInProgress = false;
+  await listen("quit-requested", async () => {
+    if (quitInProgress) return;
+    quitInProgress = true;
+    try {
+      const text = await invoke<string>("quit_confirm", {
+        active: activeBottleIds(),
+      });
+      const yes = await ask(text, {
+        title: "Погребок",
+        kind: "warning",
+        okLabel: "Завершить",
+        cancelLabel: "Отмена",
+      });
+      if (yes) {
+        await invoke("confirm_quit");
+      }
+    } finally {
+      quitInProgress = false;
+    }
   });
 }
 

@@ -1,7 +1,9 @@
-//! Tray-меню GUI (M4 Task 5): «Показать окно», до 8 бутылок со старт/
-//! стопом (+ «…» если больше), «Выход» — выход из GUI, демон живёт
-//! дальше (документировано). Список обновляется из TS командой
-//! `update_tray`, действия меню возвращаются ивентом `tray-action`.
+//! Tray-меню GUI: «Показать окно», до 8 бутылок со старт/стопом
+//! (+ «…» если больше), «Завершить» — полный выход (0.3): GUI эмитит
+//! `quit-requested`, фронтенд спрашивает подтверждение и вызывает
+//! `confirm_quit` (Shutdown демону → exit). Список обновляется из TS
+//! командой `update_tray`, действия меню возвращаются ивентом
+//! `tray-action`.
 
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
@@ -102,7 +104,7 @@ fn build_menu<R: Runtime>(
     }
     builder = builder
         .separator()
-        .item(&MenuItemBuilder::with_id("exit", "Выход").build(app)?);
+        .item(&MenuItemBuilder::with_id("exit", "Завершить").build(app)?);
     // Заглушка раздела «Правка» macOS не нужна: PredefinedMenuItem не
     // используем кроме как для корректных сепараторов.
     let _ = PredefinedMenuItem::separator(app);
@@ -110,8 +112,8 @@ fn build_menu<R: Runtime>(
 }
 
 /// Превращает id пункта меню в действие: show — окно показывается здесь
-/// же (без прав у TS); exit — выход из GUI (демон живёт); прочее —
-/// ивент `tray-action` в TS.
+/// же (без прав у TS); exit — ивент `quit-requested` фронтенду (0.3:
+/// подтверждение и Shutdown демона — там); прочее — ивент `tray-action`.
 fn emit_menu_action<R: Runtime>(app: &AppHandle<R>, id: &str) {
     match id {
         "show" => {
@@ -120,7 +122,11 @@ fn emit_menu_action<R: Runtime>(app: &AppHandle<R>, id: &str) {
                 let _ = window.set_focus();
             }
         }
-        "exit" => app.exit(0),
+        "exit" => {
+            if let Err(error) = app.emit("quit-requested", ()) {
+                eprintln!("не удалось отправить quit-requested: {error}");
+            }
+        }
         _ => {
             let action = match id.split_once(':') {
                 Some(("start", bottle)) => TrayAction::Start {

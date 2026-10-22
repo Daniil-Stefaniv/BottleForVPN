@@ -173,6 +173,15 @@ function renderAll(rows: BottleRow[]): void {
 let rowsCache: BottleRow[] = [];
 
 /**
+ * Id активных бутылок (starting/up/degraded/stopping держат ресурсы) —
+ * для текста подтверждения выхода из трея (0.3).
+ */
+export function activeBottleIds(): string[] {
+  const ACTIVE = new Set(["starting", "up", "degraded", "stopping"]);
+  return rowsCache.filter((row) => ACTIVE.has(row.state)).map((row) => row.id);
+}
+
+/**
  * Однократное обновление списка: `--json list` + `--json status` →
  * merge → точечный рендер. Ошибка «демон не запущен» — панель с
  * инструкцией; прочие ошибки — тост. Возвращает строки (пусто при
