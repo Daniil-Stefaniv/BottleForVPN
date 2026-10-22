@@ -100,6 +100,126 @@ fn gui_log_recent(state: tauri::State<'_, gui_log::GuiLog>) -> Vec<bottle_core::
     state.recent()
 }
 
+// ---------------------------------------------------------------------------
+// Хранилище (экран блокировки, Task 14): без пароля GUI не пускает дальше.
+// ---------------------------------------------------------------------------
+
+/// Состояние хранилища: разблокированный Vault и счётчик неудачных
+/// попыток (для `db.unlock_failed {n}`).
+#[derive(Default)]
+struct VaultState {
+    vault: std::sync::Mutex<Option<db::Vault>>,
+    unlock_attempts: std::sync::Mutex<u32>,
+}
+
+/// Путь к файлу хранилища (`<data>/pogrebok.db`).
+fn vault_path() -> Result<std::path::PathBuf, String> {
+    bottle_core::ipc::default_data_dir()
+        .map(|dir| dir.join(db::VAULT_FILE_NAME))
+        .ok_or_else(|| "каталог данных недоступен".to_string())
+}
+
+/// Статус хранилища для экрана блокировки: файла нет — первый запуск;
+/// есть — требуется пароль. `legacy_profiles` — число TOML-профилей
+/// 0.2.x, доступных для импорта (0 — не предлагать миграцию).
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum VaultStatus {
+    Absent { legacy_profiles: usize },
+    Locked { legacy_profiles: usize },
+}
+
+#[tauri::command]
+fn vault_status() -> Result<VaultStatus, String> {
+    let legacy = db::migrate::detect_legacy().unwrap_or(0);
+    if db::Vault::exists(&vault_path()?) {
+        Ok(VaultStatus::Locked {
+            legacy_profiles: legacy,
+        })
+    } else {
+        Ok(VaultStatus::Absent {
+            legacy_profiles: legacy,
+        })
+    }
+}
+
+/// Создаёт хранилище (первый запуск) и сразу «разблокирует» его.
+#[tauri::command]
+fn create_vault(
+    vault: tauri::State<'_, VaultState>,
+    log: tauri::State<'_, gui_log::GuiLog>,
+    password: &str,
+) -> Result<(), String> {
+    let created = db::Vault::create(&vault_path()?, password)?;
+    *vault.vault.lock().expect("vault не отравлен") = Some(created);
+    let _ = log.emit("db.unlocked", Default::default());
+    Ok(())
+}
+
+/// Разблокирует хранилище паролем. Возврат: `None` — успех,
+/// `Some("wrong_password")` — неверный пароль (GUI показывает ошибку
+/// под полем, не пуская дальше); повреждённая/занятая БД — Err.
+#[tauri::command]
+fn unlock_vault(
+    vault: tauri::State<'_, VaultState>,
+    log: tauri::State<'_, gui_log::GuiLog>,
+    password: &str,
+) -> Result<Option<String>, String> {
+    match db::Vault::unlock(&vault_path()?, password) {
+        Ok(opened) => {
+            *vault.vault.lock().expect("vault не отравлен") = Some(opened);
+            let _ = log.emit("db.unlocked", Default::default());
+            Ok(None)
+        }
+        Err(db::UnlockError::WrongPassword) => {
+            let mut attempts = vault.unlock_attempts.lock().expect("счётчик не отравлен");
+            *attempts += 1;
+            let mut ctx = serde_json::Map::new();
+            ctx.insert("n".to_string(), (*attempts).into());
+            let _ = log.emit("db.unlock_failed", ctx);
+            Ok(Some("wrong_password".to_string()))
+        }
+        Err(db::UnlockError::Corrupt(detail)) => {
+            let mut ctx = serde_json::Map::new();
+            ctx.insert("detail".to_string(), detail.clone().into());
+            let _ = log.emit("db.corrupt", ctx);
+            Err(detail)
+        }
+        Err(db::UnlockError::Busy) => {
+            Err("хранилище занято другим процессом — закройте второй Погребок".to_string())
+        }
+    }
+}
+
+/// Полный сброс хранилища (диалог «Забыли пароль?»): удаляет файл БД,
+/// GUI возвращается на экран создания. Данные теряются безвозвратно.
+#[tauri::command]
+fn reset_vault(vault: tauri::State<'_, VaultState>) -> Result<(), String> {
+    *vault.vault.lock().expect("vault не отравлен") = None; // закрыть БД до удаления
+    db::migrate::reset_vault(&vault_path()?)
+}
+
+/// Отчёт об импорте профилей 0.2.x (кнопка «Импортировать»).
+#[derive(serde::Serialize)]
+struct ImportOutcome {
+    imported: Vec<String>,
+    skipped: Vec<(String, String)>,
+}
+
+/// Импортирует профили 0.2.x в разблокированное хранилище.
+#[tauri::command]
+fn legacy_import(vault: tauri::State<'_, VaultState>) -> Result<ImportOutcome, String> {
+    let guard = vault.vault.lock().expect("vault не отравлен");
+    let vault = guard
+        .as_ref()
+        .ok_or_else(|| "хранилище не разблокировано".to_string())?;
+    let report = db::migrate::import_legacy(vault)?;
+    Ok(ImportOutcome {
+        imported: report.imported,
+        skipped: report.skipped,
+    })
+}
+
 /// Подтверждённый выход: шлёт демону `Shutdown` (стоп бутылок → выход)
 /// и завершает GUI. Демон недоступен/не наш — просто выходим.
 #[tauri::command]
@@ -139,6 +259,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .manage(DaemonHandle::default())
         .manage(TrayState { enabled: with_tray })
+        .manage(VaultState::default())
         // Журнал GUI: файл не открылся — работаем с буфером в памяти.
         .manage(
             gui_log::GuiLog::logs_dir()
@@ -154,7 +275,12 @@ fn main() {
             quit_confirm,
             confirm_quit,
             log_event,
-            gui_log_recent
+            gui_log_recent,
+            vault_status,
+            create_vault,
+            unlock_vault,
+            reset_vault,
+            legacy_import
         ])
         .setup(move |app| {
             if with_tray {

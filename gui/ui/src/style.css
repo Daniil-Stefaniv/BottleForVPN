@@ -753,3 +753,137 @@ button.copy {
   background: var(--state-up);
   color: #fff;
 }
+
+/* ── Экран блокировки (0.3, макет lock-and-modals) ────────────── */
+#lock-root {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: var(--bg, #101014);
+}
+
+.lock {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  box-sizing: border-box;
+}
+
+.lock-card {
+  width: 300px;
+  max-width: 92vw;
+  background: var(--panel, #1e1e28);
+  border: 1px solid var(--border, #2a2a35);
+  border-radius: 12px;
+  padding: 1.4rem 1.3rem;
+  text-align: center;
+  box-shadow: 0 18px 50px rgb(0 0 0 / 0.45);
+}
+
+.lock-card .logo {
+  width: 52px;
+  height: 52px;
+  margin: 0 auto 0.6rem;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #3d5285, #7c5cbf);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+}
+
+.lock-card .lock-title {
+  margin: 0.15rem 0;
+  font-size: 1.05rem;
+}
+
+.lock-card .sub {
+  font-size: 0.78rem;
+  color: var(--muted, #8a8a96);
+  margin-bottom: 0.9rem;
+}
+
+.lock-card .sub.warn {
+  text-align: left;
+  line-height: 1.45;
+  color: var(--danger, #f87171);
+}
+
+.lock-card .inp {
+  width: 100%;
+  box-sizing: border-box;
+  border-radius: 6px;
+  padding: 0.55rem 0.7rem;
+  margin-bottom: 0.5rem;
+  text-align: left;
+}
+
+.lock-card .inp.err {
+  border-color: var(--danger, #f87171);
+}
+
+.lock-card .errmsg {
+  color: var(--danger, #f87171);
+  font-size: 0.75rem;
+  text-align: left;
+  margin: -0.2rem 0 0.5rem;
+}
+
+.lock-card .go-btn {
+  width: 100%;
+  border: none;
+  background: var(--accent, #2b3a67);
+  color: var(--accent-fg, #cdd8ff);
+  border-radius: 6px;
+  padding: 0.55rem 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.lock-card .go-btn:hover {
+  filter: brightness(1.12);
+}
+
+.lock-card .go-btn[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.lock-card .go-btn.danger {
+  background: var(--danger-bg, #3a1620);
+  color: var(--danger, #f87171);
+  border: 1px solid var(--danger, #f87171);
+}
+
+.lock-card .link {
+  display: block;
+  width: 100%;
+  margin-top: 0.8rem;
+  border: none;
+  background: none;
+  font-size: 0.75rem;
+  color: var(--muted, #8a8a96);
+  cursor: pointer;
+}
+
+.lock-card .link:hover {
+  color: var(--fg, #c9c9d4);
+}
+
+.lock-card .meter {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border, #2a2a35);
+  margin: -0.1rem 0 0.6rem;
+  overflow: hidden;
+}
+
+.lock-card .meter i {
+  display: block;
+  height: 100%;
+  width: 0;
+  transition: width 0.15s ease;
+}

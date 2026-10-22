@@ -20,6 +20,8 @@ import {
 } from "./app";
 import { setBottleInvoker } from "./ipc";
 import type { BottleOutput } from "./ipc";
+import { renderLock } from "./lock";
+import type { ImportOutcome, LockStatus } from "./lock";
 import { initTray } from "./tray";
 
 setBottleInvoker(async (args) => {
@@ -90,4 +92,18 @@ if (trayEnabled) {
   });
 }
 
-mountApp();
+// Экран блокировки (0.3, пункт 7): без мастер-пароля GUI не пускает
+// дальше — приложение монтируется только после разблокировки хранилища.
+const lockStatus = await invoke<LockStatus>("vault_status");
+const lockRoot = document.getElementById("lock-root")!;
+renderLock(lockRoot, {
+  status: lockStatus,
+  api: {
+    createVault: (password) => invoke("create_vault", { password }),
+    unlockVault: (password) =>
+      invoke<string | null>("unlock_vault", { password }),
+    resetVault: () => invoke("reset_vault"),
+    legacyImport: () => invoke<ImportOutcome>("legacy_import"),
+  },
+  onUnlocked: () => mountApp(),
+});
