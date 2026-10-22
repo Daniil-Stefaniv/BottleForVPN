@@ -10,6 +10,7 @@
 
 mod bottle;
 mod daemon;
+mod db;
 mod tray;
 
 use daemon::DaemonHandle;

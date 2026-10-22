@@ -18,6 +18,9 @@ tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Хранилище GUI (0.3): SQLCipher со статической линковкой — ничего
+# ставить на машину пользователя не нужно (спека §4).
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
 
 [profile.release]
