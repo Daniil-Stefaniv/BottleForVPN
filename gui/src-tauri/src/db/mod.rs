@@ -16,6 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
+pub mod bottles;
+
 /// Имя файла хранилища.
 pub const VAULT_FILE_NAME: &str = "pogrebok.db";
 
