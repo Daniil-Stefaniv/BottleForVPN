@@ -326,6 +326,7 @@ name = "bottle-gui"
 version = "0.2.7"
 dependencies = [
  "bottle-core",
+ "dirs 5.0.1",
  "libc",
  "rusqlite",
  "serde",

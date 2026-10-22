@@ -1,0 +1,12 @@
+id = "corp-host"
+name = "Корп хост"
+kind = "host"
+
+[vpn]
+client = "C:\\Program Files\\Vendor\\vpn.exe"
+args = "connect office"
+endpoints = ["vpn.example.com"]
+interface = "Ethernet 3"
+
+[expose]
+socks5 = 0

@@ -24,6 +24,8 @@ rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"]
 # Профили бутылок — те же serde-структуры, что у демона (спека §4:
 # параллельной модели не плодим).
 bottle-core = { path = "../../crates/core" }
+# Каталог профилей 0.2.x для миграции (%LOCALAPPDATA%\BottleForApps\bottles).
+dirs = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
 
 [profile.release]
