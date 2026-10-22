@@ -1371,7 +1371,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bottle_core::frame::{decode_frame, encode_frame, LengthJsonCodec};
-    use bottle_core::ipc::{BottleState, CliReply, FullProfile};
+    use bottle_core::ipc::{BottleState, CliReply, FullProfile, GuiReply, GuiRequest};
     use bottle_core::profile::{BottleKind, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig};
     use bottle_core::protocol::{err, AgentReply, AgentRequest, UpArgs, PROTOCOL_VERSION};
     use bytes::BytesMut;
@@ -1425,27 +1425,6 @@ mod tests {
                 launch: None,
             },
         }
-    }
-
-    /// Хранилище с одним сохранённым профилем (save копирует конфиг
-    /// в `bottles/<id>.conf` содержимым `wg-office-a`; для env-профиля
-    /// путь исходника в fixture подменяется на реально созданный файл —
-    /// `Store::save` читает конфиг именно как путь до исходника).
-    ///
-    /// Осталось для тестов диспетчера pipe (он ещё принимает &Store —
-    /// перестройка диспетчера отдельной задачей); менеджер бутылок
-    /// хранилища больше не видит.
-    fn store_with(profile: &BottleProfile) -> (tempfile::TempDir, Store) {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("wg-office.conf");
-        std::fs::write(&src, "wg-office-a").unwrap();
-        let mut profile = profile.clone();
-        if let VpnConfig::Env { config, .. } = &mut profile.vpn {
-            *config = src.to_string_lossy().into_owned();
-        }
-        let store = Store::open(&tmp.path().join("store")).unwrap();
-        store.save(&profile).unwrap();
-        (tmp, store)
     }
 
     /// Реестр с одним профилем: конфиг env-профиля — текстом
@@ -2858,32 +2837,35 @@ mod tests {
         );
     }
 
-    /// Удаление активной бутылки через диспетчер — отказ с подсказкой
-    /// остановить; файлы профиля остаются на месте.
+    /// Удаление активной бутылки через GUI-диспетчер — отказ с подсказкой
+    /// остановить; профиль остаётся в реестре.
     #[tokio::test]
-    async fn dispatch_delete_of_active_bottle_is_refused() {
-        let (tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+    async fn gui_remove_of_active_bottle_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
         let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let manager = manager_with(&registry, store.data_root(), fake);
+        let manager = manager_with(&registry, tmp.path(), fake);
         manager
             .start("office-a")
             .await
             .expect("бутылка поднята");
+        let daemon = crate::test_daemon(tmp.path(), "tok", Some(manager));
+        daemon
+            .registry
+            .write()
+            .expect("реестр")
+            .upsert(full_profile_of(&env_profile("office-a", "wg.conf"), None));
 
-        let reply = crate::pipe::dispatch(
-            &store,
-            Some(&manager),
+        let reply = crate::session::gui_dispatch(
+            &daemon,
             None,
-            None,
-            None,
-            bottle_core::ipc::CliRequest::Delete {
+            GuiRequest::RemoveProfile {
                 id: "office-a".to_string(),
             },
         )
         .await;
 
-        let CliReply::Error { message } = reply else {
+        let GuiReply::Error { message } = reply else {
             panic!("ожидали Error, получили {reply:?}");
         };
         assert!(
@@ -2891,24 +2873,28 @@ mod tests {
             "подсказка остановки: {message}"
         );
         assert!(
-            tmp.path().join("store/bottles/office-a.toml").exists(),
+            daemon
+                .registry
+                .read()
+                .expect("реестр")
+                .get("office-a")
+                .is_some(),
             "профиль не тронут"
         );
     }
 
     /// Провалившаяся бутылка (Failed) удаляется без остановки:
     /// Failed-запись — не активная сессия (namespace разобран при
-    /// неудаче старта), «остановите бутылку» для неё — дед-энд
-    /// (finding 1 финального ревью: stop на Failed — no-op).
+    /// неудаче старта), «остановите бутылку» для неё — дед-энд.
     #[tokio::test]
-    async fn dispatch_delete_of_failed_bottle_succeeds() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+    async fn gui_remove_of_failed_bottle_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
         let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::TunnelFailed(
             "туннель не поднялся: handshake timeout".to_string(),
         ))
         .await;
-        let manager = manager_with(&registry, store.data_root(), fake);
+        let manager = manager_with(&registry, tmp.path(), fake);
         let reply = manager
             .start("office-a")
             .await
@@ -2919,47 +2905,47 @@ mod tests {
             .await
             .iter()
             .any(|state| matches!(state.state, BottleState::Failed { .. })));
+        let daemon = crate::test_daemon(tmp.path(), "tok", Some(manager));
+        daemon
+            .registry
+            .write()
+            .expect("реестр")
+            .upsert(full_profile_of(&env_profile("office-a", "wg.conf"), None));
 
-        let reply = crate::pipe::dispatch(
-            &store,
-            Some(&manager),
+        let reply = crate::session::gui_dispatch(
+            &daemon,
             None,
-            None,
-            None,
-            bottle_core::ipc::CliRequest::Delete {
+            GuiRequest::RemoveProfile {
                 id: "office-a".to_string(),
             },
         )
         .await;
 
-        assert_eq!(
-            reply,
-            CliReply::Deleted {
-                id: "office-a".into(),
-                warning: None
-            },
-            "Failed-бутылка удаляема без stop"
-        );
+        assert_eq!(reply, GuiReply::Ok, "Failed-бутылка удаляема без stop");
+        assert!(daemon
+            .registry
+            .read()
+            .expect("реестр")
+            .get("office-a")
+            .is_none());
     }
 
     /// Upgrade при живой бутылке — отказ (Review Focus M3 #2): сносить
     /// дистрибуцию под работающими бутылками нельзя.
     #[tokio::test]
     async fn dispatch_upgrade_with_live_bottle_is_refused() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+        let tmp = tempfile::tempdir().unwrap();
         let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let manager = manager_with(&registry, store.data_root(), fake);
+        let manager = manager_with(&registry, tmp.path(), fake);
         manager
             .start("office-a")
             .await
             .expect("бутылка поднята");
+        let daemon = crate::test_daemon(tmp.path(), "tok", Some(manager));
 
         let reply = crate::pipe::dispatch(
-            &store,
-            Some(&manager),
-            None,
-            None,
+            &daemon,
             None,
             bottle_core::ipc::CliRequest::Upgrade { force: false },
         )
@@ -2977,11 +2963,11 @@ mod tests {
     /// Повторный stop уже остановленной — no-op с предупреждением,
     /// не ошибка (спека §5.2).
     #[tokio::test]
-    async fn dispatch_stop_of_stopped_bottle_is_noop_with_warning() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+    async fn stop_of_stopped_bottle_is_noop_with_warning() {
+        let tmp = tempfile::tempdir().unwrap();
         let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let manager = manager_with(&registry, store.data_root(), fake);
+        let manager = manager_with(&registry, tmp.path(), fake);
         manager
             .start("office-a")
             .await
@@ -2995,17 +2981,7 @@ mod tests {
             }
         );
 
-        let reply = crate::pipe::dispatch(
-            &store,
-            Some(&manager),
-            None,
-            None,
-            None,
-            bottle_core::ipc::CliRequest::Stop {
-                id: "office-a".to_string(),
-            },
-        )
-        .await;
+        let reply = manager.stop("office-a").await.expect("второй stop");
 
         assert_eq!(
             reply,
@@ -3017,98 +2993,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_wires_start_stop_status_and_show_runtime_to_manager() {
-        let (_tmp, store) = store_with(&env_profile("office-a", "wg.conf"));
+    async fn gui_dispatch_wires_start_and_stop_to_manager() {
+        let tmp = tempfile::tempdir().unwrap();
         let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
-        let manager = manager_with(&registry, store.data_root(), fake);
+        let manager = manager_with(&registry, tmp.path(), fake);
+        let daemon = crate::test_daemon(tmp.path(), "tok", Some(manager));
 
-        // Start через диспетчер.
-        let reply = crate::pipe::dispatch(
-            &store,
-            Some(&manager),
+        // Start через GUI-диспетчер.
+        let reply = crate::session::gui_dispatch(
+            &daemon,
             None,
-            None,
-            None,
-            bottle_core::ipc::CliRequest::Start {
-                id: "office-a".to_string(),
-                credentials: None,
-            },
-        )
-        .await;
-        assert_eq!(
-            reply,
-            CliReply::Started {
-                id: "office-a".into()
-            }
-        );
-
-        // Show видит рантайм поднятой бутылки.
-        let reply = crate::pipe::dispatch(
-            &store,
-            Some(&manager),
-            None,
-            None,
-            None,
-            bottle_core::ipc::CliRequest::Show {
+            GuiRequest::StartBottle {
                 id: "office-a".to_string(),
             },
         )
         .await;
-        let CliReply::Show { profile, runtime } = reply else {
-            panic!("ожидали Show, получили {reply:?}");
-        };
-        assert!(profile.is_some());
-        let runtime = runtime.expect("рантайм поднятой бутылки");
-        assert_eq!(runtime.id, "office-a");
-        assert!(matches!(runtime.state, BottleState::Up));
+        assert_eq!(reply, GuiReply::Ok);
 
-        // Status показывает бутылку.
-        let reply = crate::pipe::dispatch(
-            &store,
-            Some(&manager),
-            None,
-            None,
-            None,
-            bottle_core::ipc::CliRequest::Status,
-        )
-        .await;
-        assert_eq!(
-            reply,
-            CliReply::Status {
-                bottles: vec![runtime.clone()]
-            }
-        );
+        // Менеджер видит поднятую бутылку.
+        let status = daemon.manager.as_ref().expect("менеджер").status().await;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].id, "office-a");
+        assert!(matches!(status[0].state, BottleState::Up));
 
         // Stop и очистка статуса.
-        let reply = crate::pipe::dispatch(
-            &store,
-            Some(&manager),
+        let reply = crate::session::gui_dispatch(
+            &daemon,
             None,
-            None,
-            None,
-            bottle_core::ipc::CliRequest::Stop {
+            GuiRequest::StopBottle {
                 id: "office-a".to_string(),
             },
         )
         .await;
-        assert_eq!(
-            reply,
-            CliReply::Stopped {
-                id: "office-a".into(),
-                warning: None
-            }
-        );
-        let reply = crate::pipe::dispatch(
-            &store,
-            Some(&manager),
-            None,
-            None,
-            None,
-            bottle_core::ipc::CliRequest::Status,
-        )
-        .await;
-        assert_eq!(reply, CliReply::Status { bottles: vec![] });
+        assert_eq!(reply, GuiReply::Ok);
+        assert!(daemon
+            .manager
+            .as_ref()
+            .expect("менеджер")
+            .status()
+            .await
+            .is_empty());
     }
 
     // ------------------------------------------------------------------

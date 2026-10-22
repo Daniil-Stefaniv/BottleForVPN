@@ -15,22 +15,57 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-/// Целостное состояние демона, обслуживаемое каналом управления.
+/// Целостное состояние демона (0.3), обслуживаемое каналом управления.
 ///
-/// `manager` — менеджер бутылок (реальные Start/Stop/Status); `None`
-/// остаётся тестам и dev-сборкам без аплаенса. `wsl` — исполнитель
-/// команд WSL (диагностика `doctor`); `None` — там же, где нет
-/// менеджера.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// `manager` — менеджер бутылок (реальные Start/Stop); `None` остаётся
+/// тестам и dev-сборкам без аплаенса. `wsl` — исполнитель команд WSL
+/// (диагностика `doctor`); `None` — там же, где нет менеджера.
+/// Профили живут только в `registry` (память; наполняет GUI сообщением
+/// SyncProfiles) — дискового хранилища профилей у демона нет.
 pub struct Daemon {
-    /// Хранилище профилей бутылок.
-    pub store: store::Store,
+    /// Реестр профилей, конфигов и кредов (спека §2).
+    pub registry: registry::SharedRegistry,
     /// Менеджер жизненного цикла бутылок.
     pub manager: Option<Arc<manager::BottleManager>>,
     /// Исполнитель команд WSL (`wsl.exe`).
     pub wsl: Option<Arc<dyn appliance::WslRunner>>,
-    /// Тарболл rootfs для пере-импорта аплаенса (`bottle upgrade`).
+    /// Тарболл rootfs для пере-импорта аплаенса (`upgrade`).
     pub rootfs: Option<PathBuf>,
+    /// Токен авторизации GUI (аргумент `--gui-token`).
+    pub gui_token: String,
+    /// Шина событий для подписчиков (`Subscribe`).
+    pub events: tokio::sync::broadcast::Sender<bottle_core::ipc::DaemonEvent>,
+    /// Момент старта (монотонные часы; аптайм).
+    pub started_at: std::time::Instant,
+    /// Момент старта на стенных часах (RFC3339, для Stats).
+    pub started_ts: String,
+    /// Корень данных (журналы, generation-seed, токен аплаенса).
+    pub data_root: PathBuf,
+    /// Сэмплер RSS/CPU процесса (Stats, дельта между вызовами).
+    pub sampler: stats::ProcessSampler,
+}
+
+/// Демон для тестов: пустой реестр, заданный токен, менеджер —
+/// параметром; wsl/rootfs отсутствуют.
+#[cfg(test)]
+pub(crate) fn test_daemon(
+    root: &Path,
+    token: &str,
+    manager: Option<Arc<manager::BottleManager>>,
+) -> Arc<Daemon> {
+    let (events, _) = tokio::sync::broadcast::channel(64);
+    Arc::new(Daemon {
+        registry: registry::Registry::new_shared(),
+        manager,
+        wsl: None,
+        rootfs: None,
+        gui_token: token.to_string(),
+        events,
+        started_at: std::time::Instant::now(),
+        started_ts: bottle_core::events::now_ts(),
+        data_root: root.to_path_buf(),
+        sampler: stats::ProcessSampler::new(),
+    })
 }
 
 // На не-windows диспетчер вызывается только тестами (транспорт — named
@@ -61,6 +96,8 @@ mod pipe;
 mod ps_query;
 #[allow(dead_code)]
 mod registry;
+mod session;
+mod stats;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod store;
 #[allow(dead_code)]
@@ -77,7 +114,9 @@ async fn main() -> ExitCode {
         Ok(args) => args,
         Err(message) => {
             eprintln!("bottled: {message}");
-            eprintln!("использование: bottled [--data-dir <PATH>] [--rootfs <PATH>]");
+            eprintln!(
+                "использование: bottled --gui-token <64 hex> [--data-dir <PATH>] [--rootfs <PATH>]"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -99,7 +138,7 @@ async fn main() -> ExitCode {
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
     let rootfs = resolve_rootfs(args.rootfs, &args.data_dir, exe_dir.as_deref());
-    if let Err(error) = serve_daemon(args.data_dir, rootfs, shutdown_on_ctrl_c()).await {
+    if let Err(error) = serve_daemon(args.data_dir, rootfs, args.gui_token, shutdown_on_ctrl_c()).await {
         tracing::error!(%error, "bottled завершился с ошибкой");
         eprintln!("bottled: {error}");
         return ExitCode::FAILURE;
@@ -112,15 +151,26 @@ async fn main() -> ExitCode {
 ///
 /// На Windows создаётся менеджер бутылок с реальным подключением
 /// к аплаенсу (импорт/токен/handshake — `appliance::ensure_appliance`).
+///
+/// `gui_token` — токен авторизации GUI (спека §5): демон 0.3 запускает
+/// только GUI, токен передаётся аргументом `--gui-token`.
 pub async fn serve_daemon(
     data_dir: PathBuf,
     rootfs_tar: PathBuf,
+    gui_token: String,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
+    // Каталог данных с правами 0700 (сторонняя учётка не читает журналы
+    // и токен аплаенса); хранилища профилей на диске в 0.3 нет — открытие
+    // Store осталось ради подготовки каталога (Task 6 заменит paths-модулем).
     let store = store::Store::open(&data_dir)?;
+    let data_root = store.data_root().to_path_buf();
     println!("Демон BottleForApps запущен");
-    println!("Каталог данных: {}", store.data_root().display());
+    println!("Каталог данных: {}", data_root.display());
     println!("Rootfs аплаенса: {}", rootfs_tar.display());
+
+    let registry = crate::registry::Registry::new_shared();
+    let (events, _) = tokio::sync::broadcast::channel(256);
 
     #[cfg(windows)]
     {
@@ -134,10 +184,9 @@ pub async fn serve_daemon(
         ));
         // Менеджер читает профили из in-memory реестра (0.3): наполняет
         // его GUI сообщением SyncProfiles после подключения.
-        let registry = crate::registry::Registry::new_shared();
         let manager = Arc::new(manager::BottleManager::new(
-            registry,
-            store.data_root().to_path_buf(),
+            registry.clone(),
+            data_root.clone(),
             connect,
         ));
         // Фоновый цикл DNS-перепроверки host-бутылок (спека §7.2, шаг 5)
@@ -147,10 +196,16 @@ pub async fn serve_daemon(
         // авто-восстановление env-бутылок, живость host-интерфейсов.
         manager.spawn_health_loop(shutdown.clone(), manager::HEALTH_CHECK_PERIOD);
         let daemon = Arc::new(Daemon {
-            store,
+            registry,
             manager: Some(manager),
             wsl: Some(wsl),
             rootfs: Some(rootfs_tar),
+            gui_token,
+            events,
+            started_at: std::time::Instant::now(),
+            started_ts: bottle_core::events::now_ts(),
+            data_root,
+            sampler: stats::ProcessSampler::new(),
         });
         pipe::serve(bottle_core::ipc::DAEMON_PIPE, daemon, shutdown).await
     }
@@ -161,13 +216,19 @@ pub async fn serve_daemon(
         // протокол и диспетчер те же, что у named pipe Windows. Менеджер
         // бутылок на macOS подключается в Task 10 (VzRunner); до него
         // диспетчер честно отвечает переходной ошибкой.
-        let socket = bottle_core::ipc::daemon_socket_path(store.data_root());
+        let socket = bottle_core::ipc::daemon_socket_path(&data_root);
         println!("Канал управления: {}", socket.display());
         let daemon = Arc::new(Daemon {
-            store,
+            registry,
             manager: None,
             wsl: None,
             rootfs: None,
+            gui_token,
+            events,
+            started_at: std::time::Instant::now(),
+            started_ts: bottle_core::events::now_ts(),
+            data_root,
+            sampler: stats::ProcessSampler::new(),
         });
         uds::serve(&socket, daemon, shutdown).await
     }
@@ -175,6 +236,7 @@ pub async fn serve_daemon(
     #[cfg(not(any(windows, unix)))]
     {
         // Транспорта нет: dev-запуск проверяет старт и остановку.
+        let _ = (registry, events, gui_token);
         println!("Канал управления недоступен на этой платформе; ожидаю Ctrl+C");
         shutdown.cancelled().await;
         Ok(())
@@ -183,26 +245,31 @@ pub async fn serve_daemon(
 
 /// Аргументы командной строки демона.
 struct CliArgs {
-    /// Каталог данных (хранилище профилей, токен аплаенса).
+    /// Каталог данных (журналы, токен аплаенса).
     data_dir: PathBuf,
     /// Явный тарболл rootfs (`--rootfs`); `None` — разрешается
     /// [`resolve_rootfs`] (данные → каталог exe).
     rootfs: Option<PathBuf>,
+    /// Токен авторизации GUI (`--gui-token`, 64 hex): демон 0.3
+    /// запускает только GUI, без токена управление закрыто (спека §5).
+    gui_token: String,
 }
 
 /// Имя файла rootfs внутри `<data_dir>/appliance/` (кладётся установщиком).
 const ROOTFS_FILE_NAME: &str = "bottleforapps-rootfs.tar.gz";
 
-/// Разбирает аргументы командной строки: `--data-dir <PATH>` / `--rootfs
-/// <PATH>` (также формы через `=`). Без `--data-dir` — каталог данных по
-/// умолчанию; без `--rootfs` — `<data_dir>/appliance/<ROOTFS_FILE_NAME>`
-/// (dev-запуски передают `--rootfs` явно).
+/// Разбирает аргументы командной строки: `--gui-token <64 hex>` /
+/// `--data-dir <PATH>` / `--rootfs <PATH>` (также формы через `=`).
+/// Токен обязателен (демон 0.3 спавнится из GUI); без `--data-dir` —
+/// каталог данных по умолчанию; без `--rootfs` —
+/// `<data_dir>/appliance/<ROOTFS_FILE_NAME>` (dev-запуски передают
+/// `--rootfs` явно).
 fn parse_cli_args<I>(args: I) -> Result<CliArgs, String>
 where
     I: Iterator<Item = OsString>,
 {
     let flag_value = |args: &mut I, flag: &str| -> Result<OsString, String> {
-        args.next().ok_or_else(|| format!("для {flag} нужен путь"))
+        args.next().ok_or_else(|| format!("для {flag} нужно значение"))
     };
     let strip = |arg: &OsString, flag: &str| -> Option<OsString> {
         arg.to_str()
@@ -212,6 +279,7 @@ where
 
     let mut data_dir = None;
     let mut rootfs = None;
+    let mut gui_token = None;
     let mut args = args;
     while let Some(arg) = args.next() {
         if arg.as_os_str() == OsStr::new("--data-dir") {
@@ -222,6 +290,10 @@ where
             rootfs = Some(PathBuf::from(flag_value(&mut args, "--rootfs")?));
         } else if let Some(value) = strip(&arg, "--rootfs=") {
             rootfs = Some(PathBuf::from(value));
+        } else if arg.as_os_str() == OsStr::new("--gui-token") {
+            gui_token = Some(flag_value(&mut args, "--gui-token")?);
+        } else if let Some(value) = strip(&arg, "--gui-token=") {
+            gui_token = Some(value);
         } else {
             return Err(format!("неизвестный аргумент: {}", arg.to_string_lossy()));
         }
@@ -230,7 +302,23 @@ where
     let data_dir = data_dir.or_else(default_data_dir).ok_or_else(|| {
         "не удалось определить локальный каталог данных; укажите --data-dir <PATH>".to_string()
     })?;
-    Ok(CliArgs { data_dir, rootfs })
+    let gui_token = gui_token
+        .ok_or_else(|| "нужен --gui-token <64 hex> (демон запускается из приложения)".to_string())?
+        .to_str()
+        .ok_or_else(|| "токен GUI — не UTF-8".to_string())?
+        .to_string();
+    if gui_token.len() != 64
+        || !gui_token
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err("токен GUI — 64 шестнадцатеричных символа в нижнем регистре".to_string());
+    }
+    Ok(CliArgs {
+        data_dir,
+        rootfs,
+        gui_token,
+    })
 }
 
 /// Каталог данных по умолчанию: `<локальный каталог данных>/BottleForApps`.
@@ -286,6 +374,8 @@ fn init_tracing() {
 mod tests {
     use super::*;
 
+    const TOKEN: &str = "ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23";
+
     fn args(list: &[&str]) -> std::vec::IntoIter<OsString> {
         list.iter()
             .map(|s| OsString::from(*s))
@@ -296,13 +386,13 @@ mod tests {
     #[test]
     fn data_dir_accepts_space_and_equals_forms() {
         assert_eq!(
-            parse_cli_args(args(&["--data-dir", "/tmp/bfa"]))
+            parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir", "/tmp/bfa"]))
                 .unwrap()
                 .data_dir,
             PathBuf::from("/tmp/bfa")
         );
         assert_eq!(
-            parse_cli_args(args(&["--data-dir=/tmp/bfa2"]))
+            parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir=/tmp/bfa2"]))
                 .unwrap()
                 .data_dir,
             PathBuf::from("/tmp/bfa2")
@@ -313,6 +403,8 @@ mod tests {
     fn rootfs_accepts_space_and_equals_forms() {
         assert_eq!(
             parse_cli_args(args(&[
+                "--gui-token",
+                TOKEN,
                 "--data-dir",
                 "/tmp/bfa",
                 "--rootfs",
@@ -323,7 +415,7 @@ mod tests {
             Some(PathBuf::from("/tmp/rootfs.tar.gz"))
         );
         assert_eq!(
-            parse_cli_args(args(&["--data-dir", "/tmp/bfa", "--rootfs=/tmp/r.tar"]))
+            parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir", "/tmp/bfa", "--rootfs=/tmp/r.tar"]))
                 .unwrap()
                 .rootfs,
             Some(PathBuf::from("/tmp/r.tar"))
@@ -334,22 +426,47 @@ mod tests {
     /// [`resolve_rootfs`] разбирается с данными/exe-каталогом.
     #[test]
     fn rootfs_absent_is_none_after_parse() {
-        let parsed = parse_cli_args(args(&["--data-dir", "/tmp/bfa"])).unwrap();
+        let parsed = parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir", "/tmp/bfa"])).unwrap();
         assert_eq!(parsed.rootfs, None);
     }
 
     #[test]
     fn flags_without_value_are_error() {
-        assert!(parse_cli_args(args(&["--data-dir"])).is_err());
+        assert!(parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir"])).is_err());
         assert!(
-            parse_cli_args(args(&["--data-dir", "/tmp/bfa", "--rootfs"])).is_err(),
+            parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir", "/tmp/bfa", "--rootfs"]))
+                .is_err(),
             "для --rootfs нужен путь"
         );
     }
 
     #[test]
     fn unknown_argument_is_error() {
-        assert!(parse_cli_args(args(&["--verbose"])).is_err());
+        assert!(parse_cli_args(args(&["--gui-token", TOKEN, "--verbose"])).is_err());
+    }
+
+    /// Токен GUI обязателен (демон 0.3 спавнится из приложения);
+    /// форма — 64 hex в нижнем регистре.
+    #[test]
+    fn gui_token_is_required_and_validated() {
+        assert!(
+            parse_cli_args(args(&["--data-dir", "/tmp/bfa"])).is_err(),
+            "без токена запуск запрещён"
+        );
+        let parsed = parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir", "/tmp/bfa"]))
+            .expect("валидный токен принят");
+        assert_eq!(parsed.gui_token, TOKEN);
+        // Форма через `=`.
+        let parsed =
+            parse_cli_args(args(&["--gui-token=ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23"]))
+                .expect("форма через =");
+        assert_eq!(parsed.gui_token, TOKEN);
+        for bad in ["короткий", &TOKEN.to_uppercase(), &TOKEN[..63], &format!("{TOKEN}0")] {
+            assert!(
+                parse_cli_args(args(&["--gui-token", bad])).is_err(),
+                "невалидный токен отклонён: {bad}"
+            );
+        }
     }
 
     /// Резолвер rootfs (рулинг M3): явный `--rootfs` → `<data>/appliance`
@@ -425,8 +542,8 @@ mod tests {
     }
 
     #[test]
-    fn no_args_fall_back_to_default_data_dir() {
-        let parsed = parse_cli_args(args(&[]))
+    fn no_data_dir_falls_back_to_default() {
+        let parsed = parse_cli_args(args(&["--gui-token", TOKEN]))
             .expect("локальный каталог данных определён в тестовом окружении");
         assert!(parsed.data_dir.ends_with("BottleForApps"));
     }

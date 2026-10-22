@@ -17,8 +17,9 @@ async-trait = "0.1"
 # Токен аплаенса: 32 случайных байта (на unix — getentropy/urandom,
 # на Windows — RtlGenRandom; общий паттерн с agent/token.rs).
 getrandom = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

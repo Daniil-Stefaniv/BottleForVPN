@@ -15,7 +15,6 @@ use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
 use crate::manager::BottleManager;
-use crate::store::Store;
 
 /// Каталог журналов службы внутри ZIP (второй источник журналов).
 const SVC_LOGS_PREFIX: &str = "svc";
@@ -25,12 +24,13 @@ const SVC_LOGS_PREFIX: &str = "svc";
 /// `system.txt`. `dest` — путь пользователя или имя по умолчанию в
 /// каталоге данных. Возвращает путь к созданному архиву.
 pub async fn export_logs(
-    store: &Store,
+    data_root: &Path,
+    profiles: &[BottleProfile],
     manager: Option<&BottleManager>,
     dest: Option<PathBuf>,
 ) -> Result<PathBuf, io::Error> {
-    let dest = dest.unwrap_or_else(|| default_dest(store.data_root(), SystemTime::now()));
-    let daemon_logs = store.data_root().join("logs");
+    let dest = dest.unwrap_or_else(|| default_dest(data_root, SystemTime::now()));
+    let daemon_logs = data_root.join("logs");
     let runtime = match manager {
         Some(manager) => manager.status().await,
         None => Vec::new(),
@@ -50,7 +50,7 @@ pub async fn export_logs(
     }
 
     zip.start_file("system.txt", options)?;
-    zip.write_all(system_txt(store, appliance_version.as_deref(), &runtime).as_bytes())?;
+    zip.write_all(system_txt(profiles, appliance_version.as_deref(), &runtime).as_bytes())?;
     zip.finish()?;
     Ok(dest)
 }
@@ -123,7 +123,7 @@ fn timestamp(now: SystemTime) -> String {
 /// бутылок, профили. Содержимое конфигов не включается (секреты,
 /// спека §10): env-профиль представлен метаданными, имя файла
 /// конфига — не секрет.
-fn system_txt(store: &Store, appliance_version: Option<&str>, runtime: &[RuntimeState]) -> String {
+fn system_txt(profiles: &[BottleProfile], appliance_version: Option<&str>, runtime: &[RuntimeState]) -> String {
     let mut out = String::new();
     out.push_str("BottleForApps — сводка системы\n");
     out.push_str(&format!("Версия демона: {}\n", env!("CARGO_PKG_VERSION")));
@@ -148,11 +148,8 @@ fn system_txt(store: &Store, appliance_version: Option<&str>, runtime: &[Runtime
         ));
     }
     out.push_str("\nПрофили:\n");
-    for (id, result) in store.list() {
-        match result {
-            Ok(profile) => out.push_str(&format!("  {}\n", profile_line(&profile))),
-            Err(error) => out.push_str(&format!("  {id}: битый профиль ({error})\n")),
-        }
+    for profile in profiles {
+        out.push_str(&format!("  {}\n", profile_line(profile)));
     }
     out
 }
@@ -197,7 +194,6 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
-    use crate::store::Store;
     use bottle_core::ipc::BottleState;
     use bottle_core::profile::{BottleKind, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig};
 
@@ -223,15 +219,16 @@ mod tests {
         }
     }
 
-    /// Хранилище в tempdir с одним env-профилем; исходник конфига
-    /// содержит маркер секрета.
-    fn store_with_env_profile() -> (tempfile::TempDir, Store) {
+    /// Tempdir с каталогом данных `data/` и одним env-профилем;
+    /// исходник конфига содержит маркер секрета.
+    fn env_fixture() -> (tempfile::TempDir, PathBuf, Vec<BottleProfile>) {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("wg-office.conf");
         fs::write(&src, "WG-SECRET-XYZ").unwrap();
-        let store = Store::open(&tmp.path().join("data")).unwrap();
-        store.save(&env_profile("office-a", &src)).unwrap();
-        (tmp, store)
+        let data_root = tmp.path().join("data");
+        fs::create_dir_all(&data_root).unwrap();
+        let profiles = vec![env_profile("office-a", &src)];
+        (tmp, data_root, profiles)
     }
 
     fn zip_entry_names(path: &Path) -> Vec<String> {
@@ -272,7 +269,7 @@ mod tests {
     /// спека §10) не попадает.
     #[test]
     fn system_txt_lists_versions_and_profiles_without_config_secrets() {
-        let (_tmp, store) = store_with_env_profile();
+        let (_tmp, _data_root, profiles) = env_fixture();
 
         let runtime = bottle_core::ipc::RuntimeState {
             id: "office-a".to_string(),
@@ -283,7 +280,7 @@ mod tests {
                 target: "10.20.30.15:3389".to_string(),
             }],
         };
-        let text = system_txt(&store, None, std::slice::from_ref(&runtime));
+        let text = system_txt(&profiles, None, std::slice::from_ref(&runtime));
 
         assert!(text.contains("office-a"), "профиль перечислен: {text}");
         assert!(text.contains("WireGuard"), "протокол профиля: {text}");
@@ -298,13 +295,13 @@ mod tests {
     /// и system.txt.
     #[tokio::test]
     async fn export_zip_contains_daemon_logs_and_system_txt() {
-        let (tmp, store) = store_with_env_profile();
-        let logs_dir = store.data_root().join("logs");
+        let (tmp, data_root, profiles) = env_fixture();
+        let logs_dir = data_root.join("logs");
         fs::create_dir_all(&logs_dir).unwrap();
         fs::write(logs_dir.join("bottled.1970-01-01"), "строка журнала").unwrap();
 
         let dest = tmp.path().join("export.zip");
-        let result = export_logs(&store, None, Some(dest.clone())).await;
+        let result = export_logs(&data_root, &profiles, None, Some(dest.clone())).await;
 
         let path = result.expect("экспорт без службы и менеджера успешен");
         assert_eq!(path, dest, "использован путь пользователя");
@@ -326,10 +323,10 @@ mod tests {
     /// Экспорт без каталога журналов не падает: ZIP с одной сводкой.
     #[tokio::test]
     async fn export_without_log_dirs_creates_zip_with_system_txt_only() {
-        let (tmp, store) = store_with_env_profile();
+        let (tmp, data_root, profiles) = env_fixture();
 
         let dest = tmp.path().join("export.zip");
-        export_logs(&store, None, Some(dest.clone()))
+        export_logs(&data_root, &profiles, None, Some(dest.clone()))
             .await
             .expect("отсутствие журналов — не ошибка");
 
@@ -340,12 +337,14 @@ mod tests {
     /// Экспорт без пути кладёт ZIP рядом с данными с отметкой времени.
     #[tokio::test]
     async fn export_without_dest_uses_default_name_in_data_root() {
-        let (_tmp, store) = store_with_env_profile();
+        let (_tmp, data_root, profiles) = env_fixture();
 
-        let path = export_logs(&store, None, None).await.expect("экспорт");
+        let path = export_logs(&data_root, &profiles, None, None)
+            .await
+            .expect("экспорт");
 
         assert!(
-            path.starts_with(store.data_root()),
+            path.starts_with(&data_root),
             "ZIP в каталоге данных: {}",
             path.display()
         );

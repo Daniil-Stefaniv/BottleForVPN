@@ -15,7 +15,6 @@ use bottle_core::profile::BottleProfile;
 use crate::appliance::{WslRunner, DISTRIBUTION};
 use crate::error::DaemonError;
 use crate::manager::BottleManager;
-use crate::store::Store;
 
 /// Итог bind-пробы фиксированного порта: (порт, свободен, владелец-
 /// бутылка если порт занят живым слушателем демона).
@@ -30,7 +29,11 @@ pub struct PortProbe {
 
 /// Собирает отчёт doctor: WSL (`--status`, `-l -q`, `.wslconfig`),
 /// аплаенс, служба маршрутов, агент, профили, фиксированные порты.
-pub async fn run(wsl: &dyn WslRunner, store: &Store, manager: &BottleManager) -> Vec<CheckItem> {
+pub async fn run(
+    wsl: &dyn WslRunner,
+    registry: &crate::registry::SharedRegistry,
+    manager: &BottleManager,
+) -> Vec<CheckItem> {
     let wsl_status = wsl.run(&["--status"], None).await;
     let wsl_list = wsl.run(&["-l", "-q"], None).await;
     let wsl_version = wsl.run(&["--version"], None).await;
@@ -40,7 +43,18 @@ pub async fn run(wsl: &dyn WslRunner, store: &Store, manager: &BottleManager) ->
 
     let installed = matches!(wsl_list.as_deref(), Ok(listing) if is_installed(listing));
     let appliance_version = manager.appliance_version().await;
-    let profiles = store.list();
+    let profiles: Vec<(String, Result<BottleProfile, DaemonError>)> = {
+        let registry = registry.read().expect("registry poisoned");
+        registry
+            .ids()
+            .iter()
+            .filter_map(|id| {
+                registry
+                    .get(id)
+                    .map(|full| (id.clone(), Ok(full.profile)))
+            })
+            .collect()
+    };
     let live_ports = live_listener_ports(manager).await;
 
     let mut items = check_wsl(&wsl_status, &wsl_list, &wslconfig);

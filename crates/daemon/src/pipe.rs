@@ -1,21 +1,21 @@
-//! Канал управления демона: диспетчер команд CLI и named-pipe транспорт.
+//! Legacy-диспетчер команд CLI и named-pipe транспорт демона.
 //!
-//! [`dispatch`] — чистая функция над хранилищем, исполняется на любой
-//! платформе и покрывается unit-тестами. Транспорт (Windows named pipe
-//! `\\.\pipe\bottled`, [`serve`]) обслуживает клиентов параллельно:
-//! принятое соединение уходит в свою задачу `tokio::spawn`, а цикл
-//! сразу пересоздаёт экземпляр канала для следующих подключений.
-//! Одновременно обслуживается столько клиентов, сколько живых
-//! экземпляров канала; долгий `start` одного клиента не блокирует
-//! ответы остальным (T13).
+//! Протокол 0.3 (GUI↔демон) разбирает [`crate::session`]; сюда попадают
+//! кадры старого [`CliRequest`], которые шлёт CLI `bottle`. В 0.3
+//! команды управления бутылками (`List`/`Show`/`Start`/`Stop`/`Status`/
+//! `Create`/`Delete`) удалены — диспетчер отвечает понятным надгробием;
+//! служебные команды (`Doctor`/`LogsExport`/`Upgrade`/`RoutesCleanup`/
+//! `ShutdownDaemon`) продолжают работать до сокращения CLI.
+//!
+//! Транспорт (Windows named pipe `\\.\pipe\bottled`, [`serve`])
+//! обслуживает клиентов параллельно: принятое соединение уходит в свою
+//! задачу `tokio::spawn`, а цикл сразу пересоздаёт экземпляр канала для
+//! следующих подключений. Одновременно обслуживается столько клиентов,
+//! сколько живых экземпляров канала (T13).
 
-use bottle_core::ipc::{BottleState, BottleSummary, CliReply, CliRequest};
-use bottle_core::profile::BottleProfile;
+use bottle_core::ipc::{BottleState, CliReply, CliRequest};
 
-use crate::appliance::WslRunner;
-use crate::error::DaemonError;
-use crate::manager::BottleManager;
-use crate::store::Store;
+use crate::Daemon;
 
 #[cfg(windows)]
 use std::io;
@@ -23,134 +23,48 @@ use std::io;
 use std::sync::Arc;
 
 #[cfg(windows)]
-use bottle_core::frame::LengthJsonCodec;
-#[cfg(windows)]
-use bytes::BytesMut;
-#[cfg(windows)]
-use tokio::io::{split, AsyncWriteExt};
-#[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 #[cfg(windows)]
 use tokio::task::JoinSet;
 #[cfg(windows)]
-use tokio_stream::StreamExt;
-#[cfg(windows)]
-use tokio_util::codec::{Encoder, FramedRead};
-#[cfg(windows)]
 use tokio_util::sync::CancellationToken;
 
-#[cfg(windows)]
-use crate::Daemon;
-
-/// Переходный ответ на команды управления, когда менеджер бутылок не
-/// подключён (только тесты и dev-сборки без аплаенса).
+/// Переходный ответ, когда менеджер бутылок не подключён (только тесты
+/// и dev-сборки без аплаенса).
 const MANAGER_NOT_WIRED: &str = "менеджер бутылок не подключён";
 
-/// Диспетчер команд CLI: `List`/`Show` читают хранилище `store`,
-/// `Start`/`Stop`/`Status` и рантайм `Show` обслуживает менеджер бутылок
-/// (если подключён).
-///
-/// Побочные эффекты — только чтение хранилища, вызовы менеджера и
-/// warn-логи; битые профили в `List` пропускаются с warn-логом. `Show`
-/// на отсутствующем/битом профиле отвечает `profile: None` (клиент
-/// показывает «не найден»); рантайм берётся из `manager.status`.
-// Вызывается windows-транспортом; на остальных платформах — только тестами.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Надгробие команд управления бутылками (0.3: они переехали в GUI —
+/// GUI хранит профили в своей БД и синхронизирует реестр демона).
+const REMOVED_IN_03: &str =
+    "команда удалена в 0.3: управление бутылками — в приложении «Погребок»";
+
+/// Диспетчер legacy-команд CLI: служебные команды исполняются,
+/// команды управления бутылками отвечают [`REMOVED_IN_03`].
 pub async fn dispatch(
-    store: &Store,
-    manager: Option<&BottleManager>,
-    wsl: Option<&dyn WslRunner>,
-    rootfs: Option<&std::path::Path>,
+    daemon: &Daemon,
     shutdown: Option<&tokio_util::sync::CancellationToken>,
     req: CliRequest,
 ) -> CliReply {
     match req {
-        CliRequest::List => CliReply::List {
-            bottles: list_summaries(store),
+        CliRequest::List
+        | CliRequest::Show { .. }
+        | CliRequest::Start { .. }
+        | CliRequest::Stop { .. }
+        | CliRequest::Status
+        | CliRequest::Create { .. }
+        | CliRequest::Delete { .. } => CliReply::Error {
+            message: REMOVED_IN_03.to_string(),
         },
-        CliRequest::Show { id } => CliReply::Show {
-            profile: show_profile(store, &id),
-            runtime: match manager {
-                Some(manager) => manager.status().await.into_iter().find(|rt| rt.id == id),
-                None => None,
-            },
-        },
-        CliRequest::Start { id, .. } => match manager {
-            Some(manager) => manager
-                .start(&id)
-                .await
-                .unwrap_or_else(|error| CliReply::Error {
-                    message: error.to_string(),
-                }),
-            None => CliReply::Error {
-                message: MANAGER_NOT_WIRED.to_string(),
-            },
-        },
-        CliRequest::Stop { id } => match manager {
-            Some(manager) => manager
-                .stop(&id)
-                .await
-                .unwrap_or_else(|error| CliReply::Error {
-                    message: error.to_string(),
-                }),
-            None => CliReply::Error {
-                message: MANAGER_NOT_WIRED.to_string(),
-            },
-        },
-        CliRequest::Status => match manager {
-            Some(manager) => CliReply::Status {
-                bottles: manager.status().await,
-            },
-            None => CliReply::Error {
-                message: MANAGER_NOT_WIRED.to_string(),
-            },
-        },
-        CliRequest::Create { profile, force } => create_bottle(store, &profile, force).await,
-        CliRequest::Delete { id } => {
-            // Активную бутылку удалять нельзя (start держит слушатели
-            // и сессию аплаенса); без менеджера активных нет.
-            // Активна = держит слушатели/сессию (Starting/Up/Degraded/
-            // Stopping). Failed — не активная: namespace разобран при
-            // неудаче старта, а stop на Failed — no-op; требовать
-            // остановки означало бы неудаляемую бутылку (finding 1
-            // финального ревью M3).
-            let active = match manager {
-                Some(manager) => manager
-                    .status()
-                    .await
-                    .into_iter()
-                    .any(|state| state.id == id && is_active_state(&state.state)),
-                None => false,
-            };
-            if active {
-                return CliReply::Error {
-                    message: format!(
-                        "бутылка {id} активна — остановите её перед удалением (bottle stop {id})"
-                    ),
-                };
-            }
-            match store.delete(&id) {
-                Ok(conf_existed) => CliReply::Deleted {
-                    id,
-                    warning: (!conf_existed).then(|| {
-                        "файл конфигурации VPN отсутствовал (удалён только профиль)".to_string()
-                    }),
-                },
-                Err(error) => CliReply::Error {
-                    message: error.to_string(),
-                },
-            }
-        }
-        CliRequest::Doctor => match (manager, wsl) {
+        CliRequest::Doctor => match (&daemon.manager, &daemon.wsl) {
             (Some(manager), Some(wsl)) => CliReply::DoctorReport {
-                items: crate::doctor::run(wsl, store, manager).await,
+                items: crate::doctor::run(wsl.as_ref(), &daemon.registry, manager).await,
             },
             _ => CliReply::Error {
                 message: MANAGER_NOT_WIRED.to_string(),
             },
         },
         CliRequest::Upgrade { force } => {
-            let Some(manager) = manager else {
+            let Some(manager) = &daemon.manager else {
                 return CliReply::Error {
                     message: MANAGER_NOT_WIRED.to_string(),
                 };
@@ -176,15 +90,7 @@ pub async fn dispatch(
                     .status()
                     .await
                     .into_iter()
-                    .filter(|state| {
-                        matches!(
-                            state.state,
-                            BottleState::Starting
-                                | BottleState::Up
-                                | BottleState::Degraded { .. }
-                                | BottleState::Stopping
-                        )
-                    })
+                    .filter(|state| is_active_state(&state.state))
                     .map(|state| state.id)
                     .collect();
                 if !live.is_empty() {
@@ -197,15 +103,25 @@ pub async fn dispatch(
                     };
                 }
             }
-            let (Some(wsl), Some(rootfs)) = (wsl, rootfs) else {
+            let (Some(wsl), Some(rootfs)) = (&daemon.wsl, &daemon.rootfs) else {
                 return CliReply::Error {
                     message: MANAGER_NOT_WIRED.to_string(),
                 };
             };
+            // Токен аплаенса живёт в каталоге данных; Store здесь —
+            // доступ к нему (Task 6 заменит тонким paths-модулем).
+            let store = match crate::store::Store::open(&daemon.data_root) {
+                Ok(store) => store,
+                Err(error) => {
+                    return CliReply::Error {
+                        message: format!("каталог данных недоступен: {error}"),
+                    }
+                }
+            };
             let previous = manager.appliance_version().await;
             match crate::appliance::upgrade_appliance(
-                wsl,
-                store,
+                wsl.as_ref(),
+                &store,
                 rootfs,
                 crate::manager::AGENT_CONNECT_TIMEOUT,
                 force,
@@ -222,7 +138,7 @@ pub async fn dispatch(
             }
         }
         CliRequest::ShutdownDaemon => {
-            if let Some(manager) = manager {
+            if let Some(manager) = &daemon.manager {
                 let failed = manager.stop_all().await;
                 if !failed.is_empty() {
                     tracing::warn!(ids = ?failed, "часть бутылок не остановилась при shutdown");
@@ -258,7 +174,22 @@ pub async fn dispatch(
             }
         }
         CliRequest::LogsExport { dest } => {
-            match crate::export::export_logs(store, manager, dest).await {
+            let profiles = {
+                let registry = daemon.registry.read().expect("реестр профилей");
+                registry
+                    .ids()
+                    .into_iter()
+                    .filter_map(|id| registry.get(&id).map(|full| full.profile))
+                    .collect::<Vec<_>>()
+            };
+            match crate::export::export_logs(
+                &daemon.data_root,
+                &profiles,
+                daemon.manager.as_deref(),
+                dest,
+            )
+            .await
+            {
                 Ok(path) => CliReply::Path(path.to_string_lossy().into_owned()),
                 Err(error) => {
                     tracing::warn!(%error, "экспорт журналов не удался");
@@ -271,28 +202,9 @@ pub async fn dispatch(
     }
 }
 
-/// Собирает строки ответа `List` из [`Store::list`] (сортировка по id —
-/// на стороне хранилища). Битые профили пропускаются с warn-логом.
-fn list_summaries(store: &Store) -> Vec<BottleSummary> {
-    let mut bottles = Vec::new();
-    for (id, result) in store.list() {
-        match result {
-            Ok(profile) => bottles.push(BottleSummary {
-                id: profile.id,
-                name: profile.name,
-                kind: profile.kind,
-                // Список не опрашивает менеджер: состояние знает Show/Status.
-                state: None,
-            }),
-            Err(error) => tracing::warn!(%id, %error, "битый профиль пропущен в списке"),
-        }
-    }
-    bottles
-}
-
 /// Активное состояние бутылки (держит слушатели/сессию аплаенса);
 /// Failed и Stopped — нет.
-fn is_active_state(state: &BottleState) -> bool {
+pub(crate) fn is_active_state(state: &BottleState) -> bool {
     matches!(
         state,
         BottleState::Starting
@@ -302,111 +214,6 @@ fn is_active_state(state: &BottleState) -> bool {
     )
 }
 
-/// Создание бутылки: валидация профиля → отказ при занятом id без
-/// `force` → сохранение (копия конфига — семантика `Store::save`).
-/// Ошибки валидации переводятся в понятные русские тексты create.
-async fn create_bottle(store: &Store, profile: &BottleProfile, force: bool) -> CliReply {
-    use bottle_core::profile::{validate_profile, ProfileError};
-    // D2 (M4): механика host-бутылок целиком про таблицу маршрутов
-    // Windows; на macOS/Unix — отказ на создании, а не заглушка в start.
-    #[cfg(not(windows))]
-    {
-        if matches!(profile.kind, bottle_core::profile::BottleKind::Host) {
-            return CliReply::Error {
-                message:
-                    "host-бутылки поддерживаются только на Windows (механика точечных маршрутов); на этой платформе доступны env-бутылки"
-                        .to_string(),
-            };
-        }
-    }
-    if let Err(error) = validate_profile(profile) {
-        return CliReply::Error {
-            message: match error {
-                ProfileError::MissingField => concat!(
-                    "не заполнены обязательные поля: для env — protocol и config, ",
-                    "для host — vpn (клиент) и минимум один endpoint"
-                )
-                .to_string(),
-                ProfileError::InvalidId => format!(
-                    "некорректный id «{}»: строчные буквы, цифры и дефисы",
-                    profile.id
-                ),
-                other => format!("профиль не прошёл валидацию: {other}"),
-            },
-        };
-    }
-    if !force && store.load(&profile.id).is_ok() {
-        return CliReply::Error {
-            message: format!(
-                "бутылка {} уже существует; используйте --force для перезаписи \
-                 (профиль и конфиг будут заменены)",
-                profile.id
-            ),
-        };
-    }
-    // OpenVPN-конфиг делается самодостаточным до сохранения: внешние
-    // файлы (ca/cert/key/tls-auth…) инлайнятся в хранимую копию — они не
-    // копируются в хранилище, и openvpn в аплаенсе умирал с невнятным
-    // «процесс завершился до создания tun0» (наблюдалось в 0.2.5).
-    // `auth-user-pass <файл>` приводится к голой форме — креды не
-    // хранятся, они запрашиваются при каждом старте.
-    if let bottle_core::profile::VpnConfig::Env {
-        protocol: bottle_core::profile::TunnelProtocol::OpenVpn,
-        config,
-    } = &profile.vpn
-    {
-        let source = std::path::Path::new(config.as_str());
-        let text = match std::fs::read_to_string(source) {
-            Ok(text) => text,
-            Err(error) => {
-                return CliReply::Error {
-                    message: format!("не удалось прочитать конфиг {config}: {error}"),
-                }
-            }
-        };
-        let base = source.parent().unwrap_or(std::path::Path::new("."));
-        let inlined = match bottle_core::profile::inline_openvpn_config(&text, base) {
-            Ok(inlined) => inlined,
-            Err(error) => {
-                return CliReply::Error {
-                    message: format!("конфиг OpenVPN: {error}"),
-                }
-            }
-        };
-        return match store.save_with_config_text(profile, &inlined) {
-            Ok(()) => CliReply::Created {
-                id: profile.id.clone(),
-            },
-            Err(error) => CliReply::Error {
-                message: error.to_string(),
-            },
-        };
-    }
-    match store.save(profile) {
-        Ok(()) => CliReply::Created {
-            id: profile.id.clone(),
-        },
-        Err(error) => CliReply::Error {
-            message: error.to_string(),
-        },
-    }
-}
-
-/// Профиль для ответа `Show`: `None` при любой ошибке чтения.
-///
-/// `NotFound` — ожидаемая ситуация (молча); прочие ошибки (доступ, диск)
-/// дополнительно логируются, чтобы не прятать проблемы за «не найден».
-fn show_profile(store: &Store, id: &str) -> Option<BottleProfile> {
-    match store.load(id) {
-        Ok(profile) => Some(profile),
-        Err(DaemonError::NotFound { .. }) => None,
-        Err(error) => {
-            tracing::warn!(%id, %error, "профиль не читается");
-            None
-        }
-    }
-}
-
 /// Обслуживает named pipe `pipe_name` параллельно: принятое соединение
 /// уходит в свою задачу, цикл немедленно создаёт следующий экземпляр
 /// канала — до отмены `shutdown`.
@@ -414,14 +221,11 @@ fn show_profile(store: &Store, id: &str) -> Option<BottleProfile> {
 /// Это named pipe, а не сокет: параллельные клиенты требуют нескольких
 /// экземпляров канала (один клиент занимает экземпляр на всё время
 /// соединения), поэтому цикл держит один «ожидающий подключение»
-/// экземпляр, а принятые живут в своих задачах. Состояние демона
-/// потокобезопасно: [`Store`] — stateless-обёртка над файлами,
-/// [`BottleManager`] держит runtime-карту под мьютексами с короткими
-/// критическими секциями без `await` (контракт конкурентности в его
-/// модуле). Ошибки отдельных соединений логируются и не останавливают
-/// сервер; наружу уходит только отказ создать экземпляр канала или сбой
-/// ожидания подключения. Отмена `shutdown` завершает акцепт-цикл
-/// и все задачи соединений (каждая следит за тем же токеном).
+/// экземпляр, а принятые живут в своих задачах. Ошибки отдельных
+/// соединений логируются и не останавливают сервер; наружу уходит
+/// только отказ создать экземпляр канала или сбой ожидания подключения.
+/// Отмена `shutdown` завершает акцепт-цикл и все задачи соединений
+/// (каждая следит за тем же токеном).
 #[cfg(windows)]
 pub async fn serve(
     pipe_name: &str,
@@ -450,482 +254,68 @@ pub async fn serve(
     }
 }
 
-/// Обслуживает одно подключение CLI: кадры запросов → ответы диспетчера.
-///
-/// Живёт в своей задаче со своим экземпляром канала (см. [`serve`]):
-/// параллельные соединения не ждут друг друга. Завершается при
-/// отключении клиента, некорректном кадре или отмене `shutdown`
-/// (в том числе посреди исполнения запроса — на остановке демона);
-/// после обмена экземпляр канала отключается от клиента.
+/// Обслуживает одно подключение: протокол сессии единый с UDS
+/// ([`crate::session`]). Живёт в своей задаче со своим экземпляром
+/// канала (см. [`serve`]): параллельные соединения не ждут друг друга.
 #[cfg(windows)]
 async fn handle_connection(
     pipe: NamedPipeServer,
     daemon: Arc<Daemon>,
     shutdown: CancellationToken,
 ) {
-    let (read_half, mut write_half) = split(pipe);
-    let mut reader = FramedRead::new(read_half, LengthJsonCodec::<CliRequest>::new());
-    let mut reply_codec = LengthJsonCodec::<CliReply>::new();
-
-    loop {
-        let req = tokio::select! {
-            maybe = reader.next() => match maybe {
-                Some(Ok(req)) => req,
-                Some(Err(e)) => {
-                    tracing::warn!(error = %e, "некорректный кадр от CLI, соединение закрывается");
-                    break;
-                }
-                // Клиент отключился.
-                None => break,
-            },
-            () = shutdown.cancelled() => break,
-        };
-
-        // Исполнение тоже отменяемо: остановка демона не ждёт долгих
-        // команд (start с handshake туннеля); незавершённые операции
-        // менеджера разбираются штатными путями его контракта.
-        let reply = tokio::select! {
-            reply = dispatch(
-                &daemon.store,
-                daemon.manager.as_deref(),
-                daemon.wsl.as_deref(),
-                daemon.rootfs.as_deref(),
-                Some(&shutdown),
-                req,
-            ) => reply,
-            () = shutdown.cancelled() => break,
-        };
-        if let Err(e) = send_reply(&mut write_half, &mut reply_codec, reply).await {
-            tracing::warn!(error = %e, "не удалось отправить ответ CLI");
-            break;
-        }
-    }
-
-    let read_half = reader.into_inner();
-    // unsplit возвращает исходный канал напрямую (половины из одного split).
-    let pipe = read_half.unsplit(write_half);
-    if let Err(e) = pipe.disconnect() {
-        tracing::warn!(error = %e, "disconnect экземпляра канала не удался");
-    }
-}
-
-/// Кодирует и отправляет ответ CLI.
-///
-/// Используется fallible-путь `Encoder` (а не паникующий `encode_frame`).
-#[cfg(windows)]
-async fn send_reply<W>(
-    write_half: &mut W,
-    codec: &mut LengthJsonCodec<CliReply>,
-    reply: CliReply,
-) -> io::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let mut buf = BytesMut::new();
-    codec.encode(reply, &mut buf).map_err(io::Error::other)?;
-    write_half.write_all(&buf).await
+    crate::session::handle_connection(pipe, daemon, shutdown).await;
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
-    use bottle_core::profile::{BottleKind, ExposeConfig, ForwardSpec, TunnelProtocol, VpnConfig};
+    #[cfg(windows)]
+    use bottle_core::ipc::GuiRequest;
 
-    /// Env-профиль с исходным конфигом `config` (до нормализации save).
-    fn env_profile(id: &str, config: &str) -> BottleProfile {
-        BottleProfile {
-            id: id.to_string(),
-            name: format!("Бутылка {id}"),
-            kind: BottleKind::Env,
-            vpn: VpnConfig::Env {
-                protocol: TunnelProtocol::WireGuard,
-                config: config.to_string(),
+    /// Надгробия (0.3): legacy-команды управления бутылками отвечают
+    /// понятным отказом, а не паникой или молчанием.
+    #[tokio::test]
+    async fn legacy_management_commands_answer_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = crate::test_daemon(tmp.path(), "tok", None);
+        let tombstoned = [
+            CliRequest::List,
+            CliRequest::Show { id: "a".into() },
+            CliRequest::Start {
+                id: "a".into(),
+                credentials: None,
             },
-            expose: ExposeConfig {
-                socks5: 0,
-                forwards: vec![ForwardSpec {
-                    listen: 0,
-                    target: "10.20.30.15:3389".to_string(),
-                }],
-                dns: Some("10.20.30.1".parse().unwrap()),
-                launch: Some("mstsc".to_string()),
-            },
+            CliRequest::Stop { id: "a".into() },
+            CliRequest::Status,
+            CliRequest::Delete { id: "a".into() },
+        ];
+        for req in tombstoned {
+            let reply = dispatch(&daemon, None, req.clone()).await;
+            let CliReply::Error { message } = reply else {
+                panic!("ожидали tombstone-Error на {req:?}, получили {reply:?}");
+            };
+            assert!(message.contains("0.3"), "{message}");
+            assert!(message.contains("Погребок"), "{message}");
         }
-    }
 
-    /// Env-профиль OpenVPN (конфиг ссылается на внешние файлы).
-    fn env_openvpn_profile(id: &str, config: &str) -> BottleProfile {
-        let mut profile = env_profile(id, config);
-        profile.vpn = VpnConfig::Env {
-            protocol: TunnelProtocol::OpenVpn,
-            config: config.to_string(),
-        };
-        profile
-    }
-
-    /// Host-профиль (не требует файла конфига в хранилище).
-    fn host_profile(id: &str) -> BottleProfile {
-        BottleProfile {
-            id: id.to_string(),
-            name: format!("Хост {id}"),
-            kind: BottleKind::Host,
-            vpn: VpnConfig::Host {
-                client: r"C:\Program Files\Vendor\vpn.exe".to_string(),
-                args: Some("connect office".to_string()),
-                endpoints: vec!["vpn.example.com".to_string()],
-                interface: Some("Vendor Adapter".to_string()),
+        // Create — тоже надгробие (с профилем внутри варианта).
+        let profile = bottle_core::profile::BottleProfile {
+            id: "a".to_string(),
+            name: "A".to_string(),
+            kind: bottle_core::profile::BottleKind::Env,
+            vpn: bottle_core::profile::VpnConfig::Env {
+                protocol: bottle_core::profile::TunnelProtocol::WireGuard,
+                config: "a.conf".to_string(),
             },
-            expose: ExposeConfig {
-                socks5: 1080,
-                forwards: Vec::new(),
+            expose: bottle_core::profile::ExposeConfig {
+                socks5: 0,
+                forwards: vec![],
                 dns: None,
                 launch: None,
             },
-        }
-    }
-
-    /// Хранилище с двумя валидными профилями и одним битым
-    /// (id внутри файла не совпадает с именем файла).
-    fn store_with_broken_profile() -> (tempfile::TempDir, Store) {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("wg-office.conf");
-        fs::write(&src, "wg-secret").unwrap();
-        let root = tmp.path().join("store");
-        let store = Store::open(&root).unwrap();
-        store
-            .save(&env_profile("office-a", src.to_str().unwrap()))
-            .unwrap();
-        store.save(&host_profile("corp-vpn")).unwrap();
-        fs::write(
-            root.join("bottles").join("broken.toml"),
-            r#"
-id = "other"
-name = "Чужой"
-kind = "host"
-
-[vpn]
-client = "vpn.exe"
-endpoints = ["e.example"]
-"#,
-        )
-        .unwrap();
-        (tmp, store)
-    }
-
-    /// Пустое хранилище (для команд, не читающих профили).
-    fn empty_store() -> (tempfile::TempDir, Store) {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&tmp.path().join("store")).unwrap();
-        (tmp, store)
-    }
-
-    fn summary(id: &str, name: &str, kind: BottleKind) -> BottleSummary {
-        BottleSummary {
-            id: id.to_string(),
-            name: name.to_string(),
-            kind,
-            state: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn list_returns_summaries_of_valid_profiles_only() {
-        let (_tmp, store) = store_with_broken_profile();
-
-        let reply = dispatch(&store, None, None, None, None, CliRequest::List).await;
-
-        let CliReply::List { bottles } = reply else {
-            panic!("ожидали List, получили {reply:?}");
         };
-        assert_eq!(
-            bottles,
-            vec![
-                summary("corp-vpn", "Хост corp-vpn", BottleKind::Host),
-                summary("office-a", "Бутылка office-a", BottleKind::Env),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn list_over_empty_store_is_empty() {
-        let (_tmp, store) = empty_store();
-
-        let reply = dispatch(&store, None, None, None, None, CliRequest::List).await;
-
-        assert_eq!(
-            reply,
-            CliReply::List { bottles: vec![] },
-            "пустое хранилище — пустой список, не ошибка"
-        );
-    }
-
-    #[tokio::test]
-    async fn show_returns_profile_without_runtime() {
-        let (_tmp, store) = store_with_broken_profile();
-
         let reply = dispatch(
-            &store,
-            None,
-            None,
-            None,
-            None,
-            CliRequest::Show {
-                id: "corp-vpn".to_string(),
-            },
-        )
-        .await;
-
-        assert_eq!(
-            reply,
-            CliReply::Show {
-                profile: Some(host_profile("corp-vpn")),
-                runtime: None,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn show_missing_profile_answers_empty_show() {
-        let (_tmp, store) = store_with_broken_profile();
-
-        let reply = dispatch(
-            &store,
-            None,
-            None,
-            None,
-            None,
-            CliRequest::Show {
-                id: "ghost".to_string(),
-            },
-        )
-        .await;
-
-        assert_eq!(
-            reply,
-            CliReply::Show {
-                profile: None,
-                runtime: None,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn start_stop_status_answer_transitional_error() {
-        let (_tmp, store) = empty_store();
-        let commands = vec![
-            CliRequest::Start {
-                id: "office-a".to_string(),
-                credentials: None,
-            },
-            CliRequest::Stop {
-                id: "office-a".to_string(),
-            },
-            CliRequest::Status,
-            CliRequest::Doctor,
-        ];
-
-        for req in commands {
-            assert_eq!(
-                dispatch(&store, None, None, None, None, req).await,
-                CliReply::Error {
-                    message: MANAGER_NOT_WIRED.to_string(),
-                },
-                "без менеджера команды управления отвечают переходной ошибкой"
-            );
-        }
-    }
-
-    /// Создание env-бутылки: конфиг скопирован, профиль записан.
-    #[tokio::test]
-    async fn create_env_copies_config_and_writes_profile() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("wg-office.conf");
-        fs::write(&src, "wg-secret").unwrap();
-        let root = tmp.path().join("store");
-        let store = Store::open(&root).unwrap();
-
-        let reply = dispatch(
-            &store,
-            None,
-            None,
-            None,
-            None,
-            CliRequest::Create {
-                profile: env_profile("office-a", src.to_str().unwrap()),
-                force: false,
-            },
-        )
-        .await;
-
-        assert_eq!(
-            reply,
-            CliReply::Created {
-                id: "office-a".into()
-            }
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("bottles").join("office-a.conf")).unwrap(),
-            "wg-secret"
-        );
-        assert!(root.join("bottles").join("office-a.toml").exists());
-    }
-
-    /// OpenVPN create: внешние файлы (ca, tls-auth) инлайнятся в хранимую
-    /// копию конфига; `auth-user-pass <файл>` приводится к голой форме.
-    #[tokio::test]
-    async fn create_openvpn_inlines_referenced_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("ca.crt"), "CA-PEM\n").unwrap();
-        fs::write(tmp.path().join("login.txt"), "user\npass\n").unwrap();
-        let src = tmp.path().join("corp.ovpn");
-        fs::write(
-            &src,
-            "client\nremote vpn.example 443\nca ca.crt\nauth-user-pass login.txt\n",
-        )
-        .unwrap();
-        let root = tmp.path().join("store");
-        let store = Store::open(&root).unwrap();
-
-        let reply = dispatch(
-            &store,
-            None,
-            None,
-            None,
-            None,
-            CliRequest::Create {
-                profile: env_openvpn_profile("corp", src.to_str().unwrap()),
-                force: false,
-            },
-        )
-        .await;
-
-        assert_eq!(reply, CliReply::Created { id: "corp".into() });
-        let stored = fs::read_to_string(root.join("bottles").join("corp.conf")).unwrap();
-        assert!(
-            stored.contains("<ca>\nCA-PEM\n</ca>"),
-            "ca инлайнится: {stored}"
-        );
-        assert!(
-            stored.contains("auth-user-pass\n"),
-            "креды из файла не хранятся — голая форма: {stored}"
-        );
-        assert!(
-            !stored.contains("login.txt"),
-            "ссылка на файл кредов убрана"
-        );
-        // Хранимый конфиг с голой формой требует креды при старте.
-        assert!(bottle_core::profile::openvpn_config_needs_auth(&stored));
-    }
-
-    /// OpenVPN create: отсутствующий файл директивы — понятная ошибка
-    /// сразу, а не смерть openvpn в аплаенсе.
-    #[tokio::test]
-    async fn create_openvpn_missing_referenced_file_is_clear_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("corp.ovpn");
-        fs::write(&src, "client\nca missing-ca.crt\n").unwrap();
-        let root = tmp.path().join("store");
-        let store = Store::open(&root).unwrap();
-
-        let reply = dispatch(
-            &store,
-            None,
-            None,
-            None,
-            None,
-            CliRequest::Create {
-                profile: env_openvpn_profile("corp", src.to_str().unwrap()),
-                force: false,
-            },
-        )
-        .await;
-
-        let CliReply::Error { message } = reply else {
-            panic!("ожидалась ошибка: {reply:?}");
-        };
-        assert!(message.contains("missing-ca.crt"), "имя файла: {message}");
-        assert!(
-            store.load("corp").is_err(),
-            "профиль не сохраняется при битом конфиге"
-        );
-    }
-
-    /// Занятый id — отказ без --force (Review Focus M3 #5): профиль и
-    /// конфиг пользователя не перезатираются.
-    #[tokio::test]
-    async fn create_taken_id_is_refused_without_force() {
-        let (_tmp, store) = store_with_broken_profile();
-        let src = store.data_root().join("bottles").join("office-a.conf");
-
-        let reply = dispatch(
-            &store,
-            None,
-            None,
-            None,
-            None,
-            CliRequest::Create {
-                profile: env_profile("office-a", src.to_str().unwrap()),
-                force: false,
-            },
-        )
-        .await;
-
-        let CliReply::Error { message } = reply else {
-            panic!("ожидали Error, получили {reply:?}");
-        };
-        assert!(message.contains("--force"), "подсказка --force: {message}");
-    }
-
-    /// Создание с --force перезаписывает существующий профиль.
-    #[tokio::test]
-    async fn create_with_force_overwrites() {
-        let (_tmp, store) = store_with_broken_profile();
-        let src = store.data_root().join("bottles").join("office-a.conf");
-
-        let reply = dispatch(
-            &store,
-            None,
-            None,
-            None,
-            None,
-            CliRequest::Create {
-                profile: env_profile("office-a", src.to_str().unwrap()),
-                force: true,
-            },
-        )
-        .await;
-
-        assert_eq!(
-            reply,
-            CliReply::Created {
-                id: "office-a".into()
-            }
-        );
-    }
-
-    /// host без endpoint'ов — ошибка валидации при создании
-    /// (проверка валидации достижима на Windows; на macOS любой host
-    /// раньше отклоняется правилом D2 — см. тест ниже).
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn create_host_without_endpoints_is_rejected() {
-        let (_tmp, store) = empty_store();
-        let mut profile = host_profile("corp-vpn");
-        if let VpnConfig::Host { endpoints, .. } = &mut profile.vpn {
-            endpoints.clear();
-        }
-        assert!(
-            bottle_core::profile::validate_profile(&profile).is_err(),
-            "профиль невалиден"
-        );
-
-        let reply = dispatch(
-            &store,
-            None,
-            None,
-            None,
+            &daemon,
             None,
             CliRequest::Create {
                 profile,
@@ -933,110 +323,17 @@ endpoints = ["e.example"]
             },
         )
         .await;
-
-        let CliReply::Error { message } = reply else {
-            panic!("ожидали Error, получили {reply:?}");
-        };
-        assert!(
-            message.contains("endpoint") || message.contains("поле"),
-            "понятная ошибка: {message}"
-        );
-    }
-
-    /// D2 (M4): host-бутылки — Windows-эксклюзив; на macOS создание
-    /// host-профиля отказывает с понятным текстом, а не заглушкой
-    /// где-то в глубине start.
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn create_host_on_non_windows_is_refused_with_explanation() {
-        let (_tmp, store) = empty_store();
-
-        let reply = dispatch(
-            &store,
-            None,
-            None,
-            None,
-            None,
-            CliRequest::Create {
-                profile: host_profile("corp-vpn"),
-                force: false,
-            },
-        )
-        .await;
-
-        let CliReply::Error { message } = reply else {
-            panic!("ожидали Error, получили {reply:?}");
-        };
-        assert!(
-            message.contains("host-бутылки поддерживаются только на Windows"),
-            "текст D2: {message}"
-        );
-    }
-
-    /// Удаление остановленной бутылки: файлы снесены.
-    #[tokio::test]
-    async fn delete_stopped_removes_files() {
-        let (_tmp, store) = store_with_broken_profile();
-
-        let reply = dispatch(
-            &store,
-            None,
-            None,
-            None,
-            None,
-            CliRequest::Delete {
-                id: "office-a".to_string(),
-            },
-        )
-        .await;
-
-        assert_eq!(
-            reply,
-            CliReply::Deleted {
-                id: "office-a".into(),
-                warning: None
-            }
-        );
-        assert!(!store
-            .data_root()
-            .join("bottles")
-            .join("office-a.toml")
-            .exists());
-        assert!(!store
-            .data_root()
-            .join("bottles")
-            .join("office-a.conf")
-            .exists());
-    }
-
-    /// Удаление отсутствующего профиля — отказ, не Created-подобный
-    /// молчаливый успех.
-    #[tokio::test]
-    async fn delete_missing_profile_is_error() {
-        let (_tmp, store) = empty_store();
-
-        let reply = dispatch(
-            &store,
-            None,
-            None,
-            None,
-            None,
-            CliRequest::Delete {
-                id: "ghost".to_string(),
-            },
-        )
-        .await;
-
         assert!(matches!(reply, CliReply::Error { .. }));
     }
 
-    /// Routes cleanup без установленной службы — Done с предупреждением,
-    /// не ошибка (portable-режим; на не-windows канала службы нет).
+    /// Сервисные команды живут: routes cleanup без службы — Done с
+    /// предупреждением, не tombstone.
     #[tokio::test]
     async fn routes_cleanup_without_service_warns() {
-        let (_tmp, store) = empty_store();
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = crate::test_daemon(tmp.path(), "tok", None);
 
-        let reply = dispatch(&store, None, None, None, None, CliRequest::RoutesCleanup).await;
+        let reply = dispatch(&daemon, None, CliRequest::RoutesCleanup).await;
 
         match reply {
             CliReply::Done {
@@ -1082,25 +379,27 @@ endpoints = ["e.example"]
         panic!("канал {pipe_name} не стал доступен за 5 секунд");
     }
 
-    /// Обмен «запрос → ответ» через клиентский конец канала.
+    /// Обмен «запрос → ответ» кадрами Value (нейтральный формат сессии
+    /// 0.3: один канал несёт и GuiRequest/GuiReply, и legacy-кадры).
     #[cfg(windows)]
     async fn exchange(
         client: &mut tokio::net::windows::named_pipe::NamedPipeClient,
-        req: CliRequest,
-    ) -> CliReply {
+        req: &impl serde::Serialize,
+    ) -> serde_json::Value {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio_util::codec::Decoder;
+        use tokio_util::codec::{Decoder, Encoder};
 
-        client
-            .write_all(&bottle_core::frame::encode_frame(&req))
-            .await
-            .expect("запрос отправлен");
+        let mut codec = bottle_core::frame::LengthJsonCodec::<serde_json::Value>::new();
+        let mut buf = bytes::BytesMut::new();
+        codec
+            .encode(serde_json::to_value(req).expect("запрос в Value"), &mut buf)
+            .expect("запрос кодируется");
+        client.write_all(&buf).await.expect("запрос отправлен");
 
-        let mut codec = super::LengthJsonCodec::<CliReply>::new();
+        let mut read_codec = bottle_core::frame::LengthJsonCodec::<serde_json::Value>::new();
         let mut buf = bytes::BytesMut::new();
         loop {
-            if let Some(reply) = codec.decode(&mut buf).expect("ответ разбирается")
-            {
+            if let Some(reply) = read_codec.decode(&mut buf).expect("ответ разбирается") {
                 return reply;
             }
             let mut chunk = [0u8; 4096];
@@ -1110,105 +409,107 @@ endpoints = ["e.example"]
         }
     }
 
+    /// Env-профиль для windows-тестов транспорта.
+    #[cfg(windows)]
+    fn env_profile(id: &str, config: &str) -> bottle_core::profile::BottleProfile {
+        use bottle_core::profile::*;
+        BottleProfile {
+            id: id.to_string(),
+            name: format!("Бутылка {id}"),
+            kind: BottleKind::Env,
+            vpn: VpnConfig::Env {
+                protocol: TunnelProtocol::WireGuard,
+                config: config.to_string(),
+            },
+            expose: ExposeConfig {
+                socks5: 0,
+                forwards: vec![ForwardSpec {
+                    listen: 0,
+                    target: "10.20.30.15:3389".to_string(),
+                }],
+                dns: Some("10.20.30.1".parse().unwrap()),
+                launch: Some("mstsc".to_string()),
+            },
+        }
+    }
+
+    /// Протокол 0.3 поверх named pipe: auth-гейт (Hello), затем
+    /// SyncProfiles; legacy List — надгробие.
     #[cfg(windows)]
     #[tokio::test]
-    async fn pipe_serves_list_show_and_missing_profile() {
+    async fn pipe_serves_gui_protocol_and_legacy_tombstone() {
         use tokio_util::sync::CancellationToken;
 
-        let (_tmp, store) = store_with_broken_profile();
-        let pipe_name = unique_pipe_name("basic");
+        let tmp = tempfile::tempdir().unwrap();
+        let pipe_name = unique_pipe_name("gui");
         let shutdown = CancellationToken::new();
-        let daemon = Arc::new(crate::Daemon {
-            store,
-            manager: None,
-            wsl: None,
-            rootfs: None,
-        });
+        let daemon = crate::test_daemon(tmp.path(), "tok1", None);
         let (server_pipe_name, server_shutdown) = (pipe_name.clone(), shutdown.clone());
         let server =
             tokio::spawn(async move { serve(&server_pipe_name, daemon, server_shutdown).await });
 
         let mut client = connect_client(&pipe_name).await;
 
-        // List: два валидных профиля, битый пропущен, состояние неизвестно.
-        let reply = exchange(&mut client, CliRequest::List).await;
-        let CliReply::List { bottles } = reply else {
-            panic!("ожидали List, получили {reply:?}");
-        };
-        assert_eq!(
-            bottles.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
-            ["corp-vpn", "office-a"]
-        );
+        // До Hello управление закрыто.
+        let reply = exchange(&mut client, &GuiRequest::Stats).await;
+        let reply: bottle_core::ipc::GuiReply =
+            serde_json::from_value(reply).expect("GuiReply");
         assert!(
-            bottles.iter().all(|b| b.state.is_none()),
-            "список не опрашивает менеджер"
+            matches!(&reply, bottle_core::ipc::GuiReply::Error { message } if message.starts_with("AUTH")),
+            "до Hello — AUTH: {reply:?}"
         );
 
-        // Show существующего: профиль с диска, рантайма нет.
+        // Hello с верным токеном → Ok; SyncProfiles принимается.
         let reply = exchange(
             &mut client,
-            CliRequest::Show {
-                id: "corp-vpn".to_string(),
+            &GuiRequest::Hello {
+                token: "tok1".to_string(),
             },
         )
         .await;
-        assert_eq!(
-            reply,
-            CliReply::Show {
-                profile: Some(host_profile("corp-vpn")),
-                runtime: None,
-            }
-        );
+        let reply: bottle_core::ipc::GuiReply =
+            serde_json::from_value(reply).expect("GuiReply");
+        assert_eq!(reply, bottle_core::ipc::GuiReply::Ok);
 
-        // Show отсутствующего: пустой ответ, не ошибка.
-        let reply = exchange(
-            &mut client,
-            CliRequest::Show {
-                id: "ghost".to_string(),
-            },
-        )
-        .await;
-        assert_eq!(
-            reply,
-            CliReply::Show {
-                profile: None,
-                runtime: None,
-            }
+        let reply = exchange(&mut client, &GuiRequest::SyncProfiles { profiles: vec![] }).await;
+        let reply: bottle_core::ipc::GuiReply =
+            serde_json::from_value(reply).expect("GuiReply");
+        assert_eq!(reply, bottle_core::ipc::GuiReply::Ok);
+
+        // Legacy List — надгробие.
+        let reply = exchange(&mut client, &CliRequest::List).await;
+        let reply: CliReply = serde_json::from_value(reply).expect("CliReply");
+        assert!(
+            matches!(&reply, CliReply::Error { message } if message.contains("0.3")),
+            "List — надгробие: {reply:?}"
         );
 
         shutdown.cancel();
         server.await.unwrap().expect("serve завершился без ошибки");
     }
 
+    /// Последовательные клиенты: каждый получает свой экземпляр канала.
     #[cfg(windows)]
     #[tokio::test]
     async fn pipe_serves_sequential_clients() {
         use tokio_util::sync::CancellationToken;
 
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&tmp.path().join("store")).unwrap();
-        store.save(&host_profile("solo")).unwrap();
-
         let pipe_name = unique_pipe_name("seq");
         let shutdown = CancellationToken::new();
-        let daemon = Arc::new(crate::Daemon {
-            store,
-            manager: None,
-            wsl: None,
-            rootfs: None,
-        });
+        let daemon = crate::test_daemon(tmp.path(), "tok1", None);
         let (server_pipe_name, server_shutdown) = (pipe_name.clone(), shutdown.clone());
         let server =
             tokio::spawn(async move { serve(&server_pipe_name, daemon, server_shutdown).await });
 
         for round in 0..2 {
             let mut client = connect_client(&pipe_name).await;
-            let reply = exchange(&mut client, CliRequest::List).await;
-            let CliReply::List { bottles } = reply else {
-                panic!("ожидали List, получили {reply:?}");
-            };
-            assert_eq!(bottles.len(), 1, "раунд {round}: один профиль");
-            assert_eq!(bottles[0].id, "solo");
+            let reply = exchange(&mut client, &CliRequest::List).await;
+            let reply: CliReply = serde_json::from_value(reply).expect("CliReply");
+            assert!(
+                matches!(&reply, CliReply::Error { message } if message.contains("0.3")),
+                "раунд {round}: tombstone List"
+            );
             // Клиент отключается в конце итерации; его экземпляр канала
             // уходит с задачей, следующий клиент берёт свежий ожидающий
             // экземпляр (connect_client пережидает стык).
@@ -1220,10 +521,10 @@ endpoints = ["e.example"]
 
     /// T13: параллельное обслуживание — два ОДНОВРЕМЕННЫХ клиента.
     ///
-    /// Первый держит длинный `start` (фейк-менеджер с задержкой подключения
-    /// к аплаенсу 2 с), второй за это время получает ответ `List`: таймаут
-    /// ассерта меньше задержки, поэтому последовательное обслуживание
-    /// (ответ второму только после первого) тест проваливает.
+    /// Первый держит длинный `StartBottle` (фейк-менеджер с задержкой
+    /// подключения к аплаенсу 2 с), второй за это время получает ответ
+    /// на legacy List (мгновенное надгробие): таймаут ассерта меньше
+    /// задержки, поэтому последовательное обслуживание тест проваливает.
     #[cfg(windows)]
     #[tokio::test]
     async fn pipe_answers_second_client_while_start_is_in_flight() {
@@ -1232,6 +533,7 @@ endpoints = ["e.example"]
         use tokio_util::sync::CancellationToken;
 
         use crate::appliance::ApplianceHandle;
+        use crate::error::DaemonError;
         use crate::manager::{AgentConnect, BottleManager};
 
         const AGENT_DELAY: Duration = Duration::from_secs(2);
@@ -1257,14 +559,6 @@ endpoints = ["e.example"]
         }
 
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&tmp.path().join("store")).unwrap();
-        let src = tmp.path().join("wg-office.conf");
-        fs::write(&src, "wg-secret").unwrap();
-        store
-            .save(&env_profile("office-a", src.to_str().unwrap()))
-            .unwrap();
-
-        // Менеджер читает профили из реестра (0.3): конфиг — текстом.
         let registry = crate::registry::Registry::new_shared();
         registry
             .write()
@@ -1275,66 +569,67 @@ endpoints = ["e.example"]
                 credentials: None,
             });
         let manager = Arc::new(BottleManager::new(
-            registry,
+            registry.clone(),
             tmp.path().join("manager-data"),
             Arc::new(SlowAgentConnect),
         ));
+        let daemon = crate::test_daemon(tmp.path(), "tok1", Some(manager));
+        // Реестр демона — тот же, что у менеджера (в бою их наполняет
+        // один SyncProfiles).
+        daemon
+            .registry
+            .write()
+            .expect("реестр")
+            .upsert(bottle_core::ipc::FullProfile {
+                profile: env_profile("office-a", "office-a.conf"),
+                config_text: Some("wg-secret".to_string()),
+                credentials: None,
+            });
 
         let pipe_name = unique_pipe_name("par");
         let shutdown = CancellationToken::new();
-        let daemon = Arc::new(crate::Daemon {
-            store,
-            manager: Some(manager),
-            wsl: None,
-            rootfs: None,
-        });
         let (server_pipe_name, server_shutdown) = (pipe_name.clone(), shutdown.clone());
         let server =
             tokio::spawn(async move { serve(&server_pipe_name, daemon, server_shutdown).await });
 
-        // Первый клиент отправляет start и держит соединение открытым,
-        // пока ответ не придёт (задача, не await).
-        let mut slow_client = connect_client(&pipe_name).await;
-        let slow_reply = tokio::spawn(async move {
+        // Первый клиент: Hello + StartBottle (висит в connect AGENT_DELAY).
+        let mut first = connect_client(&pipe_name).await;
+        let reply = exchange(
+            &mut first,
+            &GuiRequest::Hello {
+                token: "tok1".to_string(),
+            },
+        )
+        .await;
+        let reply: bottle_core::ipc::GuiReply =
+            serde_json::from_value(reply).expect("GuiReply");
+        assert_eq!(reply, bottle_core::ipc::GuiReply::Ok);
+        let start = tokio::spawn(async move {
             exchange(
-                &mut slow_client,
-                CliRequest::Start {
+                &mut first,
+                &GuiRequest::StartBottle {
                     id: "office-a".to_string(),
-                    credentials: None,
                 },
             )
-            .await
+            .await;
         });
-        // Даём серверу войти в диспетчер (до задержки фейк-агента).
-        tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Второй клиент: List отвечает, НЕ дожидаясь чужого start.
-        let mut fast_client = connect_client(&pipe_name).await;
-        let reply = tokio::time::timeout(
-            SECOND_CLIENT_TIMEOUT,
-            exchange(&mut fast_client, CliRequest::List),
-        )
-        .await
-        .expect("List не должен ждать чужой start (параллельные клиенты)");
-        let CliReply::List { bottles } = reply else {
-            panic!("ожидали List, получили {reply:?}");
-        };
-        assert_eq!(
-            bottles.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
-            ["office-a"]
-        );
-        drop(fast_client);
-
-        // Первый клиент в итоге получает ошибку (после задержки фейка).
-        let slow_reply = tokio::time::timeout(AGENT_DELAY * 5, slow_reply)
+        // Второй клиент получает ответ за время «зависшего» первого.
+        let second = tokio::spawn({
+            let pipe_name = pipe_name.clone();
+            async move {
+                let mut client = connect_client(&pipe_name).await;
+                exchange(&mut client, &CliRequest::List).await
+            }
+        });
+        let reply = tokio::time::timeout(SECOND_CLIENT_TIMEOUT, second)
             .await
-            .expect("start отвечает после задержки фейк-агента (сервер не потерял соединение)")
-            .expect("задача slow-клиента не паниковала");
-        assert!(
-            matches!(slow_reply, CliReply::Error { .. }),
-            "start против фейка с отказом → Error, получено {slow_reply:?}"
-        );
+            .expect("второй клиент обслужен, пока первый висит в start")
+            .expect("задача второго клиента");
+        let reply: CliReply = serde_json::from_value(reply).expect("CliReply");
+        assert!(matches!(reply, CliReply::Error { .. }), "tombstone List");
 
+        start.await.expect("первый клиент дождался ответа");
         shutdown.cancel();
         server.await.unwrap().expect("serve завершился без ошибки");
     }
