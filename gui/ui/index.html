@@ -3,38 +3,31 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>BottleForApps</title>
+    <title>Погребок</title>
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
     <main id="app">
       <header id="app-header">
-        <span id="app-title">🧴 BottleForApps</span>
+        <span id="app-title">🍾 Погребок</span>
         <nav id="tabs">
-          <button class="tab active" data-screen="list">Бутылки</button>
-          <button class="tab" data-screen="create">Создать</button>
+          <button class="tab active" data-screen="env">Env · 0</button>
+          <button class="tab" data-screen="host">Host · 0</button>
           <button class="tab" data-screen="doctor">Диагностика</button>
         </nav>
-        <button id="daemon-stop" type="button" title="Остановить все бутылки и демона">
-          Остановить всё
+        <button id="create-open" type="button" title="Новая бутылка">
+          + Создать бутылку
         </button>
       </header>
 
-      <section id="screen-list" class="screen">
-        <div id="list-layout">
-          <aside id="list-pane">
-            <div id="list-head">
-              <span id="list-count">Бутылки</span>
-              <button id="list-create" type="button" title="Новая бутылка">+</button>
-            </div>
-            <div id="bottle-list"></div>
-          </aside>
-          <div id="detail-pane">
-            <div id="bottle-detail">
-              <p id="detail-empty" class="muted">Выберите бутылку слева или создайте новую</p>
-            </div>
-          </div>
+      <section id="screen-bottles" class="screen screen-grid">
+        <div class="grid-row grid-head">
+          <span>Бутылка</span><span>Статус</span><span></span><span></span><span></span>
         </div>
+        <div id="bottle-grid"></div>
+        <p id="grid-empty" class="muted" hidden>
+          Здесь пусто — создайте первую бутылку кнопкой выше.
+        </p>
       </section>
 
       <section id="screen-create" class="screen" hidden>
@@ -142,6 +135,7 @@
             <div class="form-actions">
               <button type="submit" id="create-submit">Создать</button>
               <button type="button" id="create-reset">Новая бутылка</button>
+              <button type="button" id="create-cancel">Отмена</button>
             </div>
           </div>
         </form>
@@ -171,18 +165,19 @@
         </div>
       </section>
 
-      <section id="daemon-panel" hidden>
-        <p id="daemon-hint"></p>
-        <button id="daemon-start">Запустить демона</button>
-        <pre id="daemon-log"></pre>
-      </section>
-
-      <footer id="statusbar">
-        <span id="statusbar-daemon" class="status-item">
+      <footer id="cmdbar">
+        <span id="cmd-status" class="status-item">
           <span class="dot dot-muted"></span>демон
         </span>
-        <span id="statusbar-active" class="status-item">активных: 0</span>
-        <span id="statusbar-updated" class="status-item muted"></span>
+        <button id="cmd-daemon-start" type="button" hidden>Запустить демона</button>
+        <button id="cmd-daemon-stop" type="button" class="danger" hidden>
+          Остановить демона
+        </button>
+        <button id="cmd-console" type="button" title="Консоль состояний и журнала">
+          Консоль
+        </button>
+        <span class="spacer"></span>
+        <span id="cmd-updated" class="status-item muted"></span>
       </footer>
 
       <div id="toast" hidden></div>
@@ -192,10 +187,10 @@
 
       <dialog id="creds-dialog">
         <form id="creds-form">
-          <h2>Авторизация VPN</h2>
+          <h2>Логин и пароль</h2>
           <p class="section-hint">
-            Конфиг бутылки «<span id="creds-bottle-id"></span>» требует логин и пароль
-            (auth-user-pass). Они не сохраняются — спрашиваются при каждом подключении.
+            Бутылка «<span id="creds-bottle-id"></span>» · хранятся в
+            зашифрованной БД, демон получает их только в память при старте.
           </p>
           <div class="field">
             <label for="creds-username">Логин</label>
@@ -207,7 +202,7 @@
           </div>
           <p id="creds-error" hidden></p>
           <div class="form-actions">
-            <button type="submit" id="creds-submit" class="primary">Подключить</button>
+            <button type="submit" id="creds-submit" class="primary">Сохранить</button>
             <button type="button" id="creds-cancel">Отмена</button>
           </div>
         </form>

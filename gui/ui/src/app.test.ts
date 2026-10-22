@@ -1,377 +1,494 @@
-// Тесты каркаса приложения: refresh списка через CLI-мост, master-detail
-// рендер, состояние «демон не запущен», старт/стоп с busy-спиннером и
-// обновлением, тосты ошибок/успеха, статус-бар.
+// Тесты каркаса приложения 0.3: список из БД работает без демона,
+// вкладки Env/Host фильтруют сетку, статусы — push-события + watchdog,
+// командная панель (запуск/остановка демона, консоль), диалог
+// «Логин и пароль». Мост GuiApi подменяется заглушкой (setGuiApi);
+// модули перезагружаются в каждом тесте — состояние каркаса чистое.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  mountApp,
-  performBottleAction,
-  refreshBottles,
-  setDaemonApi,
-} from "./app";
-import { setBottleInvoker } from "./ipc";
-import type { BottleOutput } from "./ipc";
+import type { GuiApi } from "./backend";
+import type { BottleListRowWire, DaemonStatsWire } from "./ipc";
 
-const reply = (stdout: object, code = 0): BottleOutput => ({
-  stdout: JSON.stringify(stdout),
-  code,
-});
+const ROWS: BottleListRowWire[] = [
+  {
+    id: "office-a",
+    name: "Офис А",
+    kind: "env",
+    protocol: "wireguard",
+    has_credentials: false,
+  },
+  {
+    id: "office-b",
+    name: "Офис Б",
+    kind: "env",
+    protocol: "openvpn",
+    has_credentials: true,
+  },
+  {
+    id: "legacy-ac",
+    name: "Legacy AnyConnect",
+    kind: "host",
+    protocol: null,
+    has_credentials: false,
+  },
+];
 
-function stubInvoker(
-  responses: object[],
-): { calls: string[][]; next: (stdout: object, code?: number) => void } {
-  const calls: string[][] = [];
-  const queue = [...responses];
-  setBottleInvoker(async (args) => {
-    calls.push(args);
-    const head = queue.shift();
-    if (head === undefined) {
-      throw new Error("неожиданный вызов CLI в тесте");
-    }
-    if ("__throw" in head) {
-      throw new Error(String((head as { __throw: string }).__throw));
-    }
-    return reply(head);
-  });
-  return {
-    calls,
-    next: (stdout, code) => queue.push(reply(stdout, code)),
-  };
-}
+const STATS: DaemonStatsWire = {
+  pid: 4242,
+  version: "0.3.0-test",
+  started_at: "2026-10-22T10:00:00Z",
+  active_bottles: 0,
+  total_profiles: ROWS.length,
+  mem_bytes: 1024,
+  cpu_pct: 0,
+  wsl_state: "running",
+  appliance_version: "0.3.0",
+};
+
+const DAEMON_DOWN = "не удалось подключиться к демону — запущен ли bottled?";
 
 const HTML = `
 <main id="app">
-  <section id="screen-list" class="screen">
-    <span id="list-count"></span>
-    <div id="bottle-list"></div>
-    <div id="bottle-detail"></div>
+  <header id="app-header">
+    <nav id="tabs">
+      <button class="tab active" data-screen="env">Env · 0</button>
+      <button class="tab" data-screen="host">Host · 0</button>
+      <button class="tab" data-screen="doctor">Диагностика</button>
+    </nav>
+    <button id="create-open" type="button">+ Создать бутылку</button>
+  </header>
+  <section id="screen-bottles" class="screen screen-grid">
+    <div id="bottle-grid"></div>
+    <p id="grid-empty" hidden></p>
   </section>
-  <section id="daemon-panel" hidden>
-    <p id="daemon-hint"></p>
-    <button id="daemon-start">Запустить демона</button>
-    <pre id="daemon-log"></pre>
+  <section id="screen-create" class="screen" hidden>
+    <form id="create-form">
+      <h2 id="create-title">Новая бутылка</h2>
+      <fieldset id="section-vpn-env">
+        <select id="f-protocol"></select>
+        <div class="field env-field"><input id="f-config" /></div>
+      </fieldset>
+      <fieldset id="section-vpn-host" hidden>
+        <div class="field host-field" hidden><input id="f-vpn" /></div>
+      </fieldset>
+      <input id="f-id" />
+      <select id="f-kind">
+        <option value="env">env</option>
+        <option value="host">host</option>
+      </select>
+      <p id="create-error" hidden></p>
+      <button type="submit" id="create-submit">Создать</button>
+      <button type="button" id="create-reset">Новая бутылка</button>
+      <button type="button" id="create-cancel">Отмена</button>
+    </form>
   </section>
-  <footer id="statusbar">
-    <span id="statusbar-daemon"></span>
-    <span id="statusbar-active"></span>
-    <span id="statusbar-updated"></span>
+  <section id="screen-doctor" class="screen" hidden>
+    <p id="doctor-summary"></p>
+    <button id="doctor-refresh" type="button">Проверить снова</button>
+    <button id="logs-export" type="button">Собрать логи</button>
+    <button id="appliance-upgrade" type="button">Обновить аплаенс</button>
+    <button id="appliance-reset" type="button">Сбросить аплаенс</button>
+    <div id="doctor-list"></div>
+    <p id="logs-path" hidden></p>
+    <button id="logs-open-dir" hidden>Открыть папку</button>
+  </section>
+  <footer id="cmdbar">
+    <span id="cmd-status"></span>
+    <button id="cmd-daemon-start" type="button" hidden>Запустить демона</button>
+    <button id="cmd-daemon-stop" type="button" hidden>Остановить демона</button>
+    <button id="cmd-console" type="button">Консоль</button>
+    <span class="spacer"></span>
+    <span id="cmd-updated"></span>
   </footer>
   <div id="toast" hidden></div>
+  <dialog id="creds-dialog">
+    <form id="creds-form">
+      <span id="creds-bottle-id"></span>
+      <input id="creds-username" />
+      <input id="creds-password" type="password" />
+      <p id="creds-error" hidden></p>
+      <button type="submit" id="creds-submit">Сохранить</button>
+      <button type="button" id="creds-cancel">Отмена</button>
+    </form>
+  </dialog>
 </main>`;
 
-const listReply = {
-  List: { bottles: [{ id: "a", name: "Офис А", kind: "env", state: null }] },
-};
-const statusReply = {
-  Status: { bottles: [{ id: "a", state: "Up", socks5: 1080, forwards: [] }] },
-};
+/** Заглушка GuiApi: каждый метод — vi.fn с рабочим дефолтом. */
+function makeGuiApi(overrides: Partial<GuiApi> = {}): GuiApi {
+  return {
+    listBottles: vi.fn(async () => ROWS.map((row) => ({ ...row }))),
+    daemonConnect: vi.fn(async () => {}),
+    startBottle: vi.fn(async () => {}),
+    stopBottle: vi.fn(async () => {}),
+    stopDaemon: vi.fn(async () => {}),
+    daemonStats: vi.fn(async () => ({ ...STATS })),
+    updateCredentials: vi.fn(async () => {}),
+    logEvent: vi.fn(async () => {}),
+    ...overrides,
+  };
+}
 
-describe("refreshBottles", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
+/** Свежие модули + чистый DOM: module-level состояние каркаса не течёт
+ * между тестами. */
+async function boot() {
+  vi.resetModules();
+  document.body.innerHTML = HTML;
+  const app = await import("./app");
+  const backend = await import("./backend");
+  const ipc = await import("./ipc");
+  return { app, backend, ipc };
+}
 
-  it("list+status сливаются и рендерятся в master-список и detail", async () => {
-    document.body.innerHTML = HTML;
-    stubInvoker([listReply, statusReply]);
-    const rows = await refreshBottles();
-    expect(rows).toEqual([
-      {
-        id: "a",
-        name: "Офис А",
-        kind: "env",
-        state: "up",
-        reason: undefined,
-        socks5: 1080,
-        forwards: [],
-      },
-    ]);
-    expect(document.querySelectorAll(".bottle-item")).toHaveLength(1);
-    // Первая (и единственная) строка авто-выбрана — detail показывает её.
-    expect(document.querySelector(".bottle-item")?.classList.contains("selected")).toBe(true);
-    expect(document.querySelector("#bottle-detail")?.textContent).toContain("Офис А");
-    // Демон жив — панель инструкции скрыта.
+/** Ждёт, пока условие не станет истиной (асинхронные цепочки mountApp). */
+async function until(check: () => void): Promise<void> {
+  await vi.waitFor(check, { timeout: 1000, interval: 10 });
+}
+
+function gridRow(id: string): HTMLElement | null {
+  return document.querySelector<HTMLElement>(`[data-bottle-id="${id}"]`);
+}
+
+function gridIds(): string[] {
+  return [...document.querySelectorAll<HTMLElement>("[data-bottle-id]")].map(
+    (row) => row.dataset.bottleId ?? "",
+  );
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("главное окно 0.3", () => {
+  it("рендер без демона: список из БД, кнопки погашены, панель предлагает запуск", async () => {
+    const { app, backend } = await boot();
+    const api = makeGuiApi({
+      daemonConnect: vi.fn(async () => {
+        throw new Error(DAEMON_DOWN);
+      }),
+    });
+    backend.setGuiApi(api);
+    app.mountApp({ once: true });
+
+    await until(() => {
+      expect(gridIds().sort()).toEqual(["office-a", "office-b"]);
+    });
+    // Мета-строка честно сообщает, что демон выключен (пункт 6: список
+    // показывается и без демона).
+    expect(gridRow("office-a")?.querySelector(".grid-meta")?.textContent).toBe(
+      "демон выкл.",
+    );
+    const action = gridRow("office-a")?.querySelector<HTMLButtonElement>(
+      "[data-role=action]",
+    );
+    expect(action?.disabled).toBe(true);
+    expect(action?.classList.contains("off")).toBe(true);
+    expect(action?.title).toBe("демон не запущен");
+    // Пилюля без состояния.
     expect(
-      document.querySelector<HTMLElement>("#daemon-panel")?.hidden,
+      gridRow("office-a")?.querySelector("[data-role=state]")?.textContent,
+    ).toBe("—");
+    // Командная панель: демон остановлен, видна кнопка запуска.
+    expect(document.querySelector("#cmd-status")?.textContent).toContain(
+      "демон остановлен",
+    );
+    expect(
+      document.querySelector<HTMLElement>("#cmd-daemon-start")?.hidden,
+    ).toBe(false);
+    expect(
+      document.querySelector<HTMLElement>("#cmd-daemon-stop")?.hidden,
     ).toBe(true);
   });
 
-  it("повторный refresh не пересоздаёт узлы списка (точечный рендер)", async () => {
-    document.body.innerHTML = HTML;
-    stubInvoker([listReply, statusReply, listReply, statusReply]);
-    await refreshBottles();
-    const before = document.querySelector<HTMLElement>(".bottle-item");
-    await refreshBottles();
-    const after = document.querySelector<HTMLElement>(".bottle-item");
-    expect(after).toBe(before);
+  it("счётчики вкладок: Env · 2 / Host · 1", async () => {
+    const { app, backend } = await boot();
+    backend.setGuiApi(makeGuiApi());
+    app.mountApp({ once: true });
+
+    await until(() => {
+      expect(
+        document.querySelector<HTMLButtonElement>('[data-screen="env"]')
+          ?.textContent,
+      ).toBe("Env · 2");
+    });
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-screen="host"]')
+        ?.textContent,
+    ).toBe("Host · 1");
   });
 
-  it("«демон не запущен» — отдельное состояние с инструкцией, список очищен", async () => {
-    document.body.innerHTML = HTML;
-    stubInvoker([{ __throw: "Не удалось подключиться к демону BottleForApps — запущен ли bottled?" }]);
-    const rows = await refreshBottles();
-    expect(rows).toEqual([]);
-    const panel = document.querySelector<HTMLElement>("#daemon-panel");
-    expect(panel?.hidden).toBe(false);
-    expect(document.querySelector("#daemon-hint")?.textContent).toMatch(
-      /Запустить демона|bottled/,
+  it("вкладка Host фильтрует сетку до host-бутылок", async () => {
+    const { app, backend } = await boot();
+    backend.setGuiApi(makeGuiApi());
+    app.mountApp({ once: true });
+
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
+    });
+    document.querySelector<HTMLButtonElement>('[data-screen="host"]')?.click();
+    expect(gridIds()).toEqual(["legacy-ac"]);
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-screen="host"]')
+        ?.classList.contains("active"),
+    ).toBe(true);
+    // Обратно на Env — обе env-бутылки на месте.
+    document.querySelector<HTMLButtonElement>('[data-screen="env"]')?.click();
+    expect(gridIds().sort()).toEqual(["office-a", "office-b"]);
+  });
+
+  it("StateChanged обновляет строку и счётчик активных в панели", async () => {
+    const { app, backend } = await boot();
+    backend.setGuiApi(makeGuiApi());
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
+    });
+
+    app.handleDaemonEvent({
+      StateChanged: {
+        id: "office-a",
+        state: "up",
+        detail: null,
+        socks5: 55123,
+        forwards: [{ port: 13389, target: "10.20.30.15:3389" }],
+      },
+    });
+    const pill = gridRow("office-a")?.querySelector("[data-role=state]");
+    expect(pill?.textContent).toBe("up");
+    expect(pill?.className).toBe("pill pill-up");
+    expect(gridRow("office-a")?.querySelector(".grid-meta")?.textContent)
+      .toContain("socks5 :55123");
+    expect(document.querySelector("#cmd-status")?.textContent).toContain(
+      "активных: 1",
     );
-    expect(document.querySelectorAll(".bottle-item")).toHaveLength(0);
-    expect(document.querySelector("#statusbar-daemon")?.textContent).toContain(
+
+    // degraded с причиной: текст причины — в title пилюли.
+    app.handleDaemonEvent({
+      StateChanged: {
+        id: "office-b",
+        state: "degraded",
+        detail: "handshake не проходит 94 с",
+        socks5: null,
+        forwards: [],
+      },
+    });
+    const degradedPill = gridRow("office-b")?.querySelector(
+      "[data-role=state]",
+    );
+    expect(degradedPill?.textContent).toBe("degraded");
+    expect(degradedPill?.getAttribute("title")).toBe(
+      "handshake не проходит 94 с",
+    );
+  });
+
+  it("разрыв event-соединения гасит сетку до переподключения", async () => {
+    const { app, backend } = await boot();
+    backend.setGuiApi(makeGuiApi());
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
+    });
+    app.handleDaemonEvent({
+      StateChanged: {
+        id: "office-a",
+        state: "up",
+        detail: null,
+        socks5: 55123,
+        forwards: [],
+      },
+    });
+    expect(app.isDaemonDownNow()).toBe(false);
+
+    app.handleDaemonDisconnected();
+    expect(app.isDaemonDownNow()).toBe(true);
+    expect(gridRow("office-a")?.querySelector(".grid-meta")?.textContent).toBe(
+      "демон выкл.",
+    );
+    expect(document.querySelector("#cmd-status")?.textContent).toContain(
       "демон остановлен",
     );
   });
 
-  it("прочая ошибка CLI — тост с дословным сообщением", async () => {
-    document.body.innerHTML = HTML;
-    stubInvoker([{ __throw: "хранилище профилей недоступно" }]);
-    const rows = await refreshBottles();
-    expect(rows).toEqual([]);
+  it("watchdog: отказ stats → down; восстановление → повторный connect", async () => {
+    const { app, backend } = await boot();
+    const api = makeGuiApi({
+      daemonStats: vi
+        .fn(async () => ({ ...STATS }))
+        .mockRejectedValueOnce(new Error(DAEMON_DOWN)),
+    });
+    backend.setGuiApi(api);
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
+    });
+
+    await app.daemonWatchdog();
+    expect(app.isDaemonDownNow()).toBe(true);
+
+    await app.daemonWatchdog();
+    expect(app.isDaemonDownNow()).toBe(false);
+    // 1 раз при монтировании + 1 раз при восстановлении watchdog'ом.
+    expect(api.daemonConnect).toHaveBeenCalledTimes(2);
+  });
+
+  it("старт/стоп идут через мост; ошибка демона — тостом дословно", async () => {
+    const { app, backend } = await boot();
+    const api = makeGuiApi({
+      stopBottle: vi.fn(async () => {
+        throw new Error("бутылка занята: идёт проброс портов");
+      }),
+    });
+    backend.setGuiApi(api);
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
+    });
+
+    await app.performBottleAction("office-a", "start");
+    expect(api.startBottle).toHaveBeenCalledWith("office-a");
+
+    await app.performBottleAction("office-a", "stop");
     const toast = document.querySelector<HTMLElement>("#toast");
     expect(toast?.hidden).toBe(false);
-    expect(toast?.textContent).toContain("хранилище профилей недоступно");
+    expect(toast?.textContent).toBe("бутылка занята: идёт проброс портов");
   });
 
-  it("статус-бар: активные бутылки и демон работает", async () => {
-    document.body.innerHTML = HTML;
-    stubInvoker([listReply, statusReply]);
-    await refreshBottles();
-    expect(document.querySelector("#statusbar-active")?.textContent).toBe(
-      "активных: 1",
-    );
-    expect(document.querySelector("#statusbar-daemon")?.textContent).toContain(
-      "демон работает",
-    );
-    expect(
-      document.querySelector("#statusbar-updated")?.textContent,
-    ).toContain("обновлено");
-  });
-});
-
-describe("performBottleAction", () => {
-  it("старт вызывает CLI с --json start <id> и обновляет список", async () => {
-    document.body.innerHTML = HTML;
-    const invoker = stubInvoker([
-      { Started: { id: "a" } },
-      listReply,
-      statusReply,
-    ]);
-    await performBottleAction("a", "start");
-    expect(invoker.calls).toEqual([
-      ["--json", "start", "a"],
-      ["--json", "list"],
-      ["--json", "status"],
-    ]);
-    expect(document.querySelectorAll(".bottle-item")).toHaveLength(1);
-  });
-
-  it("на время CLI-вызова кнопка показывает спиннер (pending)", async () => {
-    document.body.innerHTML = HTML;
-    let release: (output: BottleOutput) => void = () => {};
-    const calls: string[][] = [];
-    setBottleInvoker((args) => {
-      calls.push(args);
-      if (args[1] === "start") {
-        return new Promise<BottleOutput>((resolve) => {
-          release = resolve;
-        });
-      }
-      return Promise.resolve(reply(args[1] === "list" ? listReply : statusReply));
+  it("«Логин и пароль»: модальный диалог сохраняет креды через мост", async () => {
+    const { app, backend } = await boot();
+    const api = makeGuiApi();
+    backend.setGuiApi(api);
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
     });
-    await refreshBottles();
-    const pending = performBottleAction("a", "start");
-    // CLI-вызов в полёте — кнопка detail со спиннером и заблокирована.
-    const button = document.querySelector<HTMLButtonElement>("#detail-action");
-    expect(button?.disabled).toBe(true);
-    expect(button?.textContent).toContain("ждите");
-    release(reply({ Started: { id: "a" } }));
-    await pending;
-    expect(
-      document.querySelector<HTMLButtonElement>("#detail-action")?.textContent,
-    ).not.toContain("ждите");
-  });
 
-  it("stopped с warning демона показывает предупреждение тостом", async () => {
-    document.body.innerHTML = HTML;
-    stubInvoker([
-      { Stopped: { id: "corp", warning: "VPN-клиент оставлен запущенным" } },
-      { List: { bottles: [] } },
-      { Status: { bottles: [] } },
-    ]);
-    await performBottleAction("corp", "stop");
-    const toast = document.querySelector<HTMLElement>("#toast");
-    expect(toast?.textContent).toContain("VPN-клиент оставлен запущенным");
-  });
-
-  it("ошибка старта — тост с сообщением демона, без refresh", async () => {
-    document.body.innerHTML = HTML;
-    const invoker = stubInvoker([{ __throw: "профиль не найден: x" }]);
-    await performBottleAction("x", "start");
-    expect(invoker.calls).toEqual([["--json", "start", "x"]]);
-    expect(document.querySelector("#toast")?.textContent).toContain(
-      "профиль не найден: x",
+    // Кнопка активна только у openvpn-бутылки.
+    const credsButton = gridRow("office-b")?.querySelector<HTMLButtonElement>(
+      "[data-role=creds]",
     );
-  });
-});
+    expect(credsButton?.disabled).toBe(false);
+    credsButton?.click();
 
-describe("кнопка «Запустить демона»", () => {
-  it("вызывает start_daemon и затем refresh", async () => {
-    document.body.innerHTML = HTML;
-    const daemonCalls: string[] = [];
-    setDaemonApi({
-      start: async () => {
-        daemonCalls.push("start");
-      },
-      status: async () => ({ running: true, log_tail: "bottled 0.2.0" }),
+    const dialog = document.querySelector<HTMLDialogElement>("#creds-dialog");
+    await until(() => {
+      expect(dialog?.open).toBe(true);
     });
-    stubInvoker([
-      { List: { bottles: [] } },
-      { Status: { bottles: [] } },
-    ]);
-    mountApp({ once: true });
-    const button = document.querySelector<HTMLButtonElement>("#daemon-start");
-    button?.click();
-    await vi.waitFor(() => expect(daemonCalls).toEqual(["start"]));
-  });
-});
+    expect(document.querySelector("#creds-bottle-id")?.textContent).toBe(
+      "office-b",
+    );
+    document.querySelector<HTMLInputElement>("#creds-username")!.value =
+      "vpn-user";
+    document.querySelector<HTMLInputElement>("#creds-password")!.value =
+      "s3cret";
+    document
+      .querySelector<HTMLFormElement>("#creds-form")
+      ?.dispatchEvent(new Event("submit", { cancelable: true }));
 
-describe("nextPollDelayMs (I4: backoff при выключенном демоне)", () => {
-  it("демон недоступен — медленный зонд 10 с; жив — 2 с", async () => {
-    const { nextPollDelayMs } = await import("./app");
-    expect(nextPollDelayMs(true)).toBe(10000);
-    expect(nextPollDelayMs(false)).toBe(2000);
-  });
-});
-
-describe("кнопки аплаенса и остановки демона", () => {
-  // Фикстура с шапкой и doctor-экраном, где живут новые кнопки.
-  const HTML_BUTTONS = `
-  <main id="app">
-    <header id="app-header">
-      <nav id="tabs"></nav>
-      <button id="daemon-stop" type="button">Остановить всё</button>
-    </header>
-    <section id="screen-list" class="screen">
-      <span id="list-count"></span>
-      <div id="bottle-list"></div>
-      <div id="bottle-detail"></div>
-    </section>
-    <section id="screen-doctor" class="screen" hidden>
-      <p id="doctor-summary" class="muted"></p>
-      <div id="doctor-list"></div>
-      <button id="appliance-upgrade" type="button">Обновить аплаенс</button>
-      <button id="appliance-reset" type="button">Сбросить аплаенс</button>
-      <p id="logs-path" hidden></p>
-    </section>
-    <section id="daemon-panel" hidden>
-      <p id="daemon-hint"></p>
-      <button id="daemon-start">Запустить демона</button>
-      <pre id="daemon-log"></pre>
-    </section>
-    <footer id="statusbar">
-      <span id="statusbar-daemon"></span>
-      <span id="statusbar-active"></span>
-      <span id="statusbar-updated"></span>
-    </footer>
-    <div id="toast" hidden></div>
-  </main>`;
-
-  const doctorReply = {
-    DoctorReport: { items: [{ code: "wsl", status: "Ok", detail: "ок" }] },
-  };
-
-  afterEach(() => {
-    vi.restoreAllMocks();
+    await until(() => {
+      expect(api.updateCredentials).toHaveBeenCalledWith(
+        "office-b",
+        "vpn-user",
+        "s3cret",
+      );
+    });
+    expect(dialog?.open).toBe(false);
   });
 
-  it("«Обновить аплаенс» шлёт upgrade и показывает версии тостом", async () => {
-    document.body.innerHTML = HTML_BUTTONS;
-    const invoker = stubInvoker([
-      listReply,
-      statusReply, // начальный refresh при mountApp
-      { Upgraded: { previous: "0.2.4", current: "0.2.7" } },
-      doctorReply,
-      listReply,
-      statusReply,
-    ]);
-    mountApp({ once: true });
-    // Дожидаемся начального refresh (list+status), чтобы клик не
-    // перехватил их ответы из очереди.
-    await vi.waitFor(() =>
-      expect(invoker.calls).toContainEqual(["--json", "status"]),
-    );
-    document.querySelector<HTMLButtonElement>("#appliance-upgrade")?.click();
-    await vi.waitFor(() =>
-      expect(invoker.calls).toContainEqual(["--json", "upgrade"]),
-    );
-    await vi.waitFor(() =>
-      expect(document.querySelector("#toast")?.textContent).toContain(
-        "0.2.4 → 0.2.7",
-      ),
-    );
+  it("«Запустить демона»: спавн bottled, затем подключение и sync", async () => {
+    const { app, backend } = await boot();
+    const api = makeGuiApi({
+      daemonConnect: vi
+        .fn(async () => {})
+        .mockRejectedValueOnce(new Error(DAEMON_DOWN)),
+    });
+    backend.setGuiApi(api);
+    const start = vi.fn(async () => {});
+    app.setDaemonApi({
+      start,
+      status: vi.fn(async () => ({ running: false, log_tail: "" })),
+    });
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(
+        document.querySelector<HTMLElement>("#cmd-daemon-start")?.hidden,
+      ).toBe(false);
+    });
+
+    document.querySelector<HTMLButtonElement>("#cmd-daemon-start")?.click();
+    await until(() => {
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(api.daemonConnect).toHaveBeenCalledTimes(2);
+    });
+    await until(() => {
+      expect(document.querySelector("#cmd-status")?.textContent).toContain(
+        "демон работает",
+      );
+    });
   });
 
-  it("«Сбросить аплаенс» без подтверждения ничего не шлёт, с подтверждением — upgrade --force", async () => {
-    document.body.innerHTML = HTML_BUTTONS;
-    const { setConfirmAction } = await import("./app");
-    const invoker = stubInvoker([listReply, statusReply]);
-    mountApp({ once: true });
-    // Дожидаемся начального refresh, чтобы клик не перехватил его ответы.
-    await vi.waitFor(() =>
-      expect(invoker.calls).toContainEqual(["--json", "status"]),
-    );
-    setConfirmAction(() => false);
-    document.querySelector<HTMLButtonElement>("#appliance-reset")?.click();
+  it("«Остановить демона»: с подтверждением шлёт Shutdown", async () => {
+    const { app, backend } = await boot();
+    const api = makeGuiApi();
+    backend.setGuiApi(api);
+    app.setConfirmAction(() => true);
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
+    });
+
+    document.querySelector<HTMLButtonElement>("#cmd-daemon-stop")?.click();
+    await until(() => {
+      expect(api.stopDaemon).toHaveBeenCalledTimes(1);
+    });
+    // Отмена подтверждения — Shutdown не уходит.
+    app.setConfirmAction(() => false);
+    document.querySelector<HTMLButtonElement>("#cmd-daemon-stop")?.click();
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(invoker.calls).not.toContainEqual(["--json", "upgrade", "--force"]);
-
-    setConfirmAction(() => true);
-    invoker.next({ Upgraded: { previous: null, current: "0.2.7" } });
-    invoker.next(doctorReply);
-    invoker.next(listReply);
-    invoker.next(statusReply);
-    document.querySelector<HTMLButtonElement>("#appliance-reset")?.click();
-    await vi.waitFor(() =>
-      expect(invoker.calls).toContainEqual(["--json", "upgrade", "--force"]),
-    );
+    expect(api.stopDaemon).toHaveBeenCalledTimes(1);
   });
 
-  it("«Остановить всё» с подтверждением шлёт daemon stop", async () => {
-    document.body.innerHTML = HTML_BUTTONS;
-    const { setConfirmAction } = await import("./app");
-    setConfirmAction(() => true);
-    const invoker = stubInvoker([
-      listReply,
-      statusReply, // начальный refresh при mountApp
-      { Done: { warning: null } },
-    ]);
-    mountApp({ once: true });
-    // Дожидаемся начального refresh, чтобы клик не перехватил его ответы.
-    await vi.waitFor(() =>
-      expect(invoker.calls).toContainEqual(["--json", "status"]),
-    );
-    document.querySelector<HTMLButtonElement>("#daemon-stop")?.click();
-    await vi.waitFor(() =>
-      expect(invoker.calls).toContainEqual(["--json", "daemon", "stop"]),
-    );
-    await vi.waitFor(() =>
-      expect(document.querySelector("#toast")?.textContent).toContain(
-        "Демон останавливается",
-      ),
-    );
-  });
-});
+  it("«Консоль» открывает вкладку Диагностики", async () => {
+    const { app, backend, ipc } = await boot();
+    backend.setGuiApi(makeGuiApi());
+    ipc.setBottleInvoker(async () => ({
+      stdout: JSON.stringify({ DoctorReport: { items: [] } }),
+      code: 0,
+    }));
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
+    });
 
-describe("refreshBottles: частичные данные (M7)", () => {
-  it("отказ status не прячет список — строки без рантайма", async () => {
-    document.body.innerHTML = HTML;
-    stubInvoker([
-      listReply,
-      { __throw: "менеджер бутылок не подключён" },
-    ]);
-    const rows = await refreshBottles();
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.state).toBe("stopped");
-    expect(document.querySelectorAll(".bottle-item")).toHaveLength(1);
+    document.querySelector<HTMLButtonElement>("#cmd-console")?.click();
+    expect(
+      document
+        .querySelector<HTMLButtonElement>('[data-screen="doctor"]')
+        ?.classList.contains("active"),
+    ).toBe(true);
+    expect(
+      document.querySelector<HTMLElement>("#screen-doctor")?.hidden,
+    ).toBe(false);
+    expect(
+      document.querySelector<HTMLElement>("#screen-bottles")?.hidden,
+    ).toBe(true);
+  });
+
+  it("ошибка БД при list — тостом, сетка пустая", async () => {
+    const { app, backend } = await boot();
+    backend.setGuiApi(
+      makeGuiApi({
+        listBottles: vi.fn(async () => {
+          throw new Error("хранилище не разблокировано");
+        }),
+      }),
+    );
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(document.querySelector("#toast")?.textContent).toBe(
+        "хранилище не разблокировано",
+      );
+    });
+    expect(gridIds()).toHaveLength(0);
+    expect(
+      document.querySelector<HTMLElement>("#grid-empty")?.hidden,
+    ).toBe(false);
   });
 });

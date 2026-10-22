@@ -67,6 +67,7 @@ pub const REGISTRY: &[EventDef] = &[
     EventDef { code: "bottle.deleted", level: Level::Info, template: "Бутылка {id} удалена" },
     EventDef { code: "bottle.credentials_updated", level: Level::Info, template: "Обновлены логин и пароль бутылки {id}" },
     EventDef { code: "bottle.start.requested", level: Level::Info, template: "Пользователь запустил бутылку {id}" },
+    EventDef { code: "bottle.stop.requested", level: Level::Info, template: "Пользователь остановил бутылку {id}" },
     EventDef { code: "bottle.up", level: Level::Info, template: "{id} поднята (socks5 :{port})" },
     EventDef { code: "bottle.failed", level: Level::Error, template: "{id}: {reason}" },
     EventDef { code: "wsl.imported", level: Level::Info, template: "Апплайенс импортирован" },

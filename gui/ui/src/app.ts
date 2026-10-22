@@ -1,23 +1,21 @@
-// Каркас приложения: master-detail список (точечный рендер), поллинг
-// каждые 2 с (10 с при упавшем демоне — I4), busy-спиннер на время
-// CLI-вызова старт/стоп, удаление с двухшаговым подтверждением, тосты
-// ошибок/успеха, статус-бар (демон, активные, время обновления), панель
-// «демон не запущен» (журнал опрашивается, только пока панель видима).
+// Каркас приложения 0.3: вкладки Env/Host/Диагностика, сетка бутылок из
+// БД (работает без демона), статусы — push-событиями демона (замена
+// поллинга; watchdog 30 с ловит тихий разрыв), командная панель демона
+// (запуск/остановка/консоль). Список читает `list_bottles` из
+// зашифрованного хранилища; старт/стоп идут через DaemonClient.
 
-import { isDaemonUnavailable, runBottleReply, setBottleInvoker } from "./ipc";
-import type { CliReply } from "./ipc";
+import { gui, isDaemonDown } from "./backend";
+import type { DaemonEventWire, EventWire, RuntimeState } from "./ipc";
 import {
   mergeListStatus,
-  renderBottleDetail,
-  renderBottleList,
-  resetDeleteConfirm,
+  renderBottleGrid,
   type BottleAction,
   type BottleRow,
 } from "./list";
 import { loadProfileForEdit, resetForm, submitCreate } from "./create";
 import { collectLogs, loadDoctor } from "./doctor";
 
-/** API демона (Rust-команды start_daemon/daemon_status), подменяется в тестах. */
+/** API спавна демона (Rust-команда start_daemon), подменяется в тестах. */
 export interface DaemonApi {
   start: () => Promise<void>;
   status: () => Promise<{ running: boolean; log_tail: string }>;
@@ -39,21 +37,12 @@ export function setRevealInDir(fn: (path: string) => Promise<void>): void {
   revealInDir = fn;
 }
 
-/** Интервал статус-поллинга (D1). */
-const POLL_INTERVAL_MS = 2000;
-/** Зонд при выключенном демоне: без него каждый тик спавнит CLI,
- * который 60 с ретраит connect (~30 висящих процессов, I4 ревью). */
-const POLL_INTERVAL_DAEMON_DOWN_MS = 10000;
-
-/** Задержка до следующего refresh: живой демон — 2 с, недоступный —
- * медленный зонд 10 с (демон мог быть запущен и вручную). */
-export function nextPollDelayMs(daemonDown: boolean): number {
-  return daemonDown ? POLL_INTERVAL_DAEMON_DOWN_MS : POLL_INTERVAL_MS;
-}
+/** Интервал watchdog'а демона (замена поллинга статусов, спека §5). */
+export const WATCHDOG_MS = 30_000;
 
 export type ToastKind = "error" | "success";
 
-/** Показывает тост (ошибки дословно от CLI/демона, успехи — кратко). */
+/** Показывает тост (ошибки дословно от демона, успехи — кратко). */
 function showToast(message: string, kind: ToastKind = "error"): void {
   const toast = document.querySelector<HTMLElement>("#toast");
   if (toast === null) {
@@ -67,86 +56,67 @@ function showToast(message: string, kind: ToastKind = "error"): void {
   }, 8000);
 }
 
-/** Панель «демон не запущен»: показать с инструкцией / скрыть. */
-function setDaemonPanel(visible: boolean): void {
-  const panel = document.querySelector<HTMLElement>("#daemon-panel");
-  if (panel === null) {
-    return;
-  }
-  panel.hidden = !visible;
-  if (visible) {
-    const hint = panel.querySelector<HTMLElement>("#daemon-hint");
-    if (hint !== null) {
-      hint.textContent =
-        "Демон BottleForApps не запущен. Нажмите «Запустить демона» " +
-        "(bottled) или стартуйте его вручную — затем список обновится сам.";
-    }
-    void updateDaemonLog();
-  }
-}
-
-/** Подтягивает хвост журнала демона в панель — только когда панель видима. */
-async function updateDaemonLog(): Promise<void> {
-  const panel = document.querySelector<HTMLElement>("#daemon-panel");
-  const log = document.querySelector<HTMLElement>("#daemon-log");
-  if (panel === null || panel.hidden || log === null || daemonApi === null) {
-    return;
-  }
-  try {
-    const status = await daemonApi.status();
-    log.textContent = status.log_tail || "(журнал пуст)";
-  } catch {
-    log.textContent = "";
-  }
-}
-
-/** Подписчик на обновления строк списка (tray-меню). */
+/** Подписчик на обновления строк сетки (tray-меню). */
 let rowsNotifier: ((rows: BottleRow[]) => void) | null = null;
 
 export function setRowsNotifier(fn: ((rows: BottleRow[]) => void) | null): void {
   rowsNotifier = fn;
 }
 
-/** Выбранная в master-списке бутылка (null — detail показывает заглушку). */
-let selectedId: string | null = null;
-
-/** Действие, выполняемое прямо сейчас (CLI-вызов): спиннер на кнопке. */
+/** Действие, выполняемое прямо сейчас: спиннер на кнопке строки. */
 const pendingActions = new Map<string, BottleAction>();
 
 let daemonDown = false;
 
-/** Выбранная строка из последнего refresh (null — нет/демон down). */
-function selectedRow(rows: BottleRow[]): BottleRow | null {
-  if (selectedId === null) {
-    return null;
-  }
-  return rows.find((row) => row.id === selectedId) ?? null;
+/** Активная вкладка списка. */
+let currentTab: "env" | "host" = "env";
+
+/** Последние строки (для перерисовки при событиях без запроса к БД). */
+let rowsCache: BottleRow[] = [];
+
+/** Последние профили из БД (merge с рантаймом при событиях). */
+let profilesCache: Parameters<typeof mergeListStatus>[0] = [];
+
+/** Снимок рантайма по id: наполняется push-событиями StateChanged. */
+const runtimeCache = new Map<string, RuntimeState>();
+
+/** Лента событий демона для консоли «Диагностики» (Task 17 читает). */
+export const daemonLogFeed: EventWire[] = [];
+
+/** Подписчик ленты журнала демона (консоль Диагностики, Task 17). */
+let daemonLogListener: ((event: EventWire) => void) | null = null;
+
+export function setDaemonLogListener(fn: ((event: EventWire) => void) | null): void {
+  daemonLogListener = fn;
 }
 
-/** Перерисовка master-списка и detail-панели из свежих строк. */
+/**
+ * Id активных бутылок (starting/up/degraded/stopping держат ресурсы) —
+ * для текста подтверждения выхода из трея (0.3).
+ */
+export function activeBottleIds(): string[] {
+  const ACTIVE = new Set(["starting", "up", "degraded", "stopping"]);
+  return rowsCache.filter((row) => ACTIVE.has(row.state)).map((row) => row.id);
+}
+
+/** Демон недоступен? (для тестов и будущих экранов). */
+export function isDaemonDownNow(): boolean {
+  return daemonDown;
+}
+
+/** Перерисовка сетки (фильтр вкладки), счётчиков и командной панели. */
 function renderAll(rows: BottleRow[]): void {
-  if (selectedId !== null && !rows.some((row) => row.id === selectedId)) {
-    selectedId = rows[0]?.id ?? null;
-    resetDeleteConfirm();
+  const envCount = rows.filter((row) => row.kind === "env").length;
+  const hostCount = rows.length - envCount;
+  for (const tab of document.querySelectorAll<HTMLButtonElement>(".tab")) {
+    if (tab.dataset.screen === "env") {
+      tab.textContent = `Env · ${envCount}`;
+    } else if (tab.dataset.screen === "host") {
+      tab.textContent = `Host · ${hostCount}`;
+    }
   }
-  if (selectedId === null && rows.length > 0) {
-    selectedId = rows[0]?.id ?? null;
-  }
-  renderBottleList(rows, selectedId, {
-    onSelect: (id) => {
-      if (id !== selectedId) {
-        resetDeleteConfirm();
-      }
-      selectedId = id;
-      renderAll(rowsCache);
-    },
-    onCreate: () => {
-      resetForm();
-      syncKindFields();
-      switchScreen("create");
-    },
-  });
-  renderBottleDetail(selectedRow(rows), pendingActions.get(selectedId ?? "") ?? null, {
+  const visible = rows.filter((row) => row.kind === currentTab);
+  renderBottleGrid(visible, daemonDown, pendingActions, {
     onAction: (id, action) => {
       void performBottleAction(id, action);
     },
@@ -160,106 +130,140 @@ function renderAll(rows: BottleRow[]): void {
         }
       });
     },
-    onDelete: (id) => {
-      void deleteBottle(id);
-    },
-    onNotify: (message, kind) => {
-      showToast(message, kind);
+    onCreds: (id) => {
+      openCredsDialog(id);
     },
   });
-}
-
-/** Последние строки (для перерисовки при смене выбора без CLI-запроса). */
-let rowsCache: BottleRow[] = [];
-
-/**
- * Id активных бутылок (starting/up/degraded/stopping держат ресурсы) —
- * для текста подтверждения выхода из трея (0.3).
- */
-export function activeBottleIds(): string[] {
-  const ACTIVE = new Set(["starting", "up", "degraded", "stopping"]);
-  return rowsCache.filter((row) => ACTIVE.has(row.state)).map((row) => row.id);
+  updateCmdBar(rows);
 }
 
 /**
- * Однократное обновление списка: `--json list` + `--json status` →
- * merge → точечный рендер. Ошибка «демон не запущен» — панель с
- * инструкцией; прочие ошибки — тост. Возвращает строки (пусто при
- * любой ошибке).
+ * Однократное обновление списка: `list_bottles` из БД + merge с
+ * рантайм-кэшем событий. Ошибка «хранилище не разблокировано» —
+ * тост; демон для списка не нужен (спека §3).
  */
 export async function refreshBottles(): Promise<BottleRow[]> {
-  let list: CliReply;
-  let status: CliReply | null = null;
   try {
-    list = await runBottleReply(["--json", "list"]);
+    profilesCache = await gui().listBottles();
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    daemonDown = isDaemonUnavailable(error);
-    if (isDaemonUnavailable(error)) {
-      setDaemonPanel(true);
-    } else {
-      setDaemonPanel(false);
-      showToast(message);
-    }
+    showToast(error instanceof Error ? error.message : String(error));
     rowsCache = [];
     renderAll([]);
-    updateStatusBar([]);
     return [];
   }
-  daemonDown = false;
-  // Status — вспомогательный: его отказ (например, dev-демон без
-  // менеджера на macOS) не прячет список — строки без рантайма (M7).
-  try {
-    status = await runBottleReply(["--json", "status"]);
-  } catch {
-    status = null;
-  }
-  setDaemonPanel(false);
-  if (!("List" in list)) {
-    showToast("Неожиданный ответ демона на list");
-    return [];
-  }
-  const runtime = status !== null && "Status" in status ? status.Status.bottles : [];
-  const rows = mergeListStatus(list.List.bottles, runtime);
+  return remerge();
+}
+
+/** Пересобирает строки из кэшей (профили БД + рантайм) и рисует. */
+function remerge(): BottleRow[] {
+  const rows = mergeListStatus(profilesCache, [...runtimeCache.values()]);
   rowsCache = rows;
   renderAll(rows);
-  updateStatusBar(rows);
   rowsNotifier?.(rows);
   return rows;
 }
 
-/** Статус-бар: демон жив/нет, активные бутылки, время обновления. */
-function updateStatusBar(rows: BottleRow[]): void {
-  const daemon = document.querySelector<HTMLElement>("#statusbar-daemon");
-  if (daemon !== null) {
-    const dotClass = daemonDown ? "dot dot-failed" : "dot dot-up";
-    daemon.innerHTML = "";
+/** Командная панель: статус демона, кнопки запуска/остановки, метка времени. */
+function updateCmdBar(rows: BottleRow[]): void {
+  const status = document.querySelector<HTMLElement>("#cmd-status");
+  if (status !== null) {
+    status.innerHTML = "";
     const dot = document.createElement("span");
-    dot.className = dotClass;
-    daemon.append(dot, document.createTextNode(daemonDown ? "демон остановлен" : "демон работает"));
-  }
-  const active = document.querySelector<HTMLElement>("#statusbar-active");
-  if (active !== null) {
-    const count = rows.filter(
+    dot.className = daemonDown ? "dot dot-failed" : "dot dot-up";
+    const active = rows.filter(
       (row) => row.state === "up" || row.state === "degraded",
     ).length;
-    active.textContent = `активных: ${count}`;
+    status.append(
+      dot,
+      document.createTextNode(
+        daemonDown ? "демон остановлен" : `демон работает · активных: ${active}`,
+      ),
+    );
   }
-  const updated = document.querySelector<HTMLElement>("#statusbar-updated");
+  const start = document.querySelector<HTMLElement>("#cmd-daemon-start");
+  if (start !== null) {
+    start.hidden = !daemonDown;
+  }
+  const stop = document.querySelector<HTMLElement>("#cmd-daemon-stop");
+  if (stop !== null) {
+    stop.hidden = daemonDown;
+  }
+  const updated = document.querySelector<HTMLElement>("#cmd-updated");
   if (updated !== null) {
     updated.textContent = `обновлено ${new Date().toLocaleTimeString("ru-RU")}`;
   }
 }
 
+/** Push-событие демона: StateChanged обновляет строку, Log — ленту. */
+export function handleDaemonEvent(event: DaemonEventWire): void {
+  if ("StateChanged" in event) {
+    const change = event.StateChanged;
+    runtimeCache.set(change.id, {
+      id: change.id,
+      state: change.state,
+      socks5: change.socks5,
+      forwards: change.forwards,
+    });
+    // Причина failed/degraded лежит в detail — mergeListStatus ждёт
+    // проводную форму; прямое присвоение точнее.
+    if (change.detail !== null) {
+      const live = runtimeCache.get(change.id);
+      if (live !== undefined && typeof live.state === "string") {
+        if (change.state === "failed") {
+          live.state = { Failed: { reason: change.detail } };
+        } else if (change.state === "degraded") {
+          live.state = { Degraded: { reason: change.detail } };
+        }
+      }
+    }
+    remerge();
+  } else {
+    daemonLogFeed.push(event.Log);
+    daemonLogListener?.(event.Log);
+  }
+}
+
+/** Разрыв event-соединения: статусы неизвестны, watchdog поднимет. */
+export function handleDaemonDisconnected(): void {
+  if (daemonDown) {
+    return;
+  }
+  daemonDown = true;
+  runtimeCache.clear();
+  remerge();
+}
+
 /**
- * Старт/стоп бутылки: `--json start|stop <id>`; на время CLI-вызова
- * кнопка показывает спиннер (pending), warning демона и ошибки — тостом
- * дословно; после успеха список обновляется немедленно.
- *
- * Если демон ответил `NeedCredentials` (конфиг OpenVPN с голым
- * auth-user-pass), показывается диалог логина/пароля и старт
- * повторяется с кредами — они не хранятся и спрашиваются при каждом
- * подключении. Отмена диалога = отмена старта.
+ * Watchdog (каждые WATCHDOG_MS): тихий разрыв без события ловится
+ * отказом daemonStats; поднявшийся демон — переподключением и
+ * полной синхронизацией профилей.
+ */
+export async function daemonWatchdog(): Promise<void> {
+  try {
+    await gui().daemonStats();
+    if (daemonDown) {
+      daemonDown = false;
+      try {
+        await gui().daemonConnect();
+      } catch (error) {
+        daemonDown = true;
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    }
+    remerge();
+  } catch {
+    if (!daemonDown) {
+      daemonDown = true;
+      runtimeCache.clear();
+      remerge();
+    }
+  }
+}
+
+/**
+ * Старт/стоп бутылки через DaemonClient; на время вызова — спиннер
+ * на кнопке строки. Креды демон уже имеет из синхронизации (спека §5) —
+ * диалог логина при старте больше не нужен.
  */
 export async function performBottleAction(
   id: string,
@@ -267,48 +271,47 @@ export async function performBottleAction(
 ): Promise<void> {
   pendingActions.set(id, action);
   renderAll(rowsCache);
-  let reply: CliReply;
   try {
-    reply = await runBottleReply(["--json", action, id]);
-    if ("NeedCredentials" in reply && action === "start") {
-      const creds = await askCredentials(id);
-      if (creds === null) {
-        // Отмена диалога — тихий выход без ошибки.
-        pendingActions.delete(id);
-        renderAll(rowsCache);
-        return;
-      }
-      reply = await runBottleReply([
-        "--json",
-        action,
-        id,
-        "--username",
-        creds.username,
-        "--password",
-        creds.password,
-      ]);
+    if (action === "start") {
+      await gui().startBottle(id);
+    } else {
+      await gui().stopBottle(id);
     }
   } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error));
+  } finally {
     pendingActions.delete(id);
     renderAll(rowsCache);
-    showToast(error instanceof Error ? error.message : String(error));
-    return;
   }
-  pendingActions.delete(id);
-  if ("Stopped" in reply && reply.Stopped.warning !== null) {
-    showToast(reply.Stopped.warning);
-  }
-  await refreshBottles();
 }
 
-/** Логин/пароль из диалога авторизации VPN. */
+/**
+ * «Логин и пароль» (пункт 9): модальный диалог обновления кредов
+ * бутылки; сохранение — в зашифрованную БД с синхронизацией демону.
+ */
+function openCredsDialog(id: string): void {
+  void askCredentials(id).then(async (creds) => {
+    if (creds === null) {
+      return;
+    }
+    try {
+      await gui().updateCredentials(id, creds.username, creds.password);
+      showToast(`Логин и пароль бутылки ${id} сохранены`, "success");
+      await refreshBottles();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    }
+  });
+}
+
+/** Логин/пароль из диалога бутылки. */
 export interface CredsAnswer {
   username: string;
   password: string;
 }
 
 /**
- * Показывает модальный диалог авторизации VPN и ждёт ввода.
+ * Показывает модальный диалог логина/пароля и ждёт ввода.
  * `null` — пользователь отменил. Пустой логин не принимается (ошибка
  * показывается в самом диалоге, ввод продолжается).
  */
@@ -371,65 +374,70 @@ export function askCredentials(id: string): Promise<CredsAnswer | null> {
   });
 }
 
-/** Удаление профиля: `--json delete <id>`; warning — тостом. */
-async function deleteBottle(id: string): Promise<void> {
-  let reply: CliReply;
-  try {
-    reply = await runBottleReply(["--json", "delete", id]);
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : String(error));
-    return;
-  }
-  if ("Deleted" in reply) {
-    showToast(`Профиль ${id} удалён`, "success");
-    if (reply.Deleted.warning !== null) {
-      showToast(reply.Deleted.warning);
-    }
-    if (selectedId === id) {
-      selectedId = null;
-    }
-  }
-  await refreshBottles();
-}
-
-/** Кнопка «Запустить демона»: стартует bottled и обновляет список. */
+/** «Запустить демона»: спавн bottled, затем подключение и sync. */
 async function onStartDaemon(): Promise<void> {
   if (daemonApi === null) {
     return;
   }
   try {
     await daemonApi.start();
+    await gui().daemonConnect();
+    daemonDown = false;
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error));
+  }
+  await refreshBottles();
+}
+
+/** «Остановить демона»: Shutdown — бутылки останавливаются, демон гаснет. */
+async function onDaemonStop(): Promise<void> {
+  if (
+    !confirmAction(
+      "Остановить все бутылки и завершить демона? " +
+        "Запустить его снова можно кнопкой «Запустить демона».",
+    )
+  ) {
     return;
   }
-  // Демон поднимает каналы не мгновенно — поллинг доведёт список сам.
-  await refreshBottles();
+  try {
+    await gui().stopDaemon();
+    showToast("Демон останавливается", "success");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error));
+  }
 }
 
 /** Переключение экранов: активный таб + видимость секций. */
 export function switchScreen(screen: string): void {
+  if (screen === "env" || screen === "host") {
+    currentTab = screen;
+  }
   for (const tab of document.querySelectorAll<HTMLButtonElement>(".tab")) {
     tab.classList.toggle("active", tab.dataset.screen === screen);
   }
+  const sectionId =
+    screen === "env" || screen === "host" ? "screen-bottles" : `screen-${screen}`;
   for (const section of document.querySelectorAll<HTMLElement>(".screen")) {
-    section.hidden = section.id !== `screen-${screen}`;
+    section.hidden = section.id !== sectionId;
   }
   if (screen === "doctor") {
     loadDoctor().catch((error: unknown) => {
       showToast(error instanceof Error ? error.message : String(error));
     });
   }
+  if (screen === "env" || screen === "host") {
+    renderAll(rowsCache);
+  }
 }
 
-/** Submit формы create: edit определяется по readonly id (заполнен из show). */
+/** Submit формы create: edit определяется по readonly id. */
 async function onCreateSubmit(): Promise<void> {
   const idField = document.querySelector<HTMLInputElement>("#f-id");
   const isEdit = idField !== null && idField.readOnly;
   const ok = await submitCreate(isEdit);
   if (ok) {
     showToast(isEdit ? "Профиль обновлён" : "Бутылка создана", "success");
-    switchScreen("list");
+    switchScreen(currentTab);
     await refreshBottles();
   }
 }
@@ -456,9 +464,7 @@ export function setConfirmAction(fn: (message: string) => boolean): void {
 }
 
 /**
- * «Обновить аплаенс» / «Сбросить аплаенс»: `bottle upgrade [--force]`.
- * Сброс дополнительно останавливает все бутылки и гасит WSL целиком —
- * спрашиваем подтверждение. По завершении обновляем диагностику.
+ * «Обновить аплаенс» / «Сбросить аплаенс»: служебные команды демона.
  */
 async function onApplianceUpgrade(force: boolean): Promise<void> {
   if (
@@ -474,6 +480,7 @@ async function onApplianceUpgrade(force: boolean): Promise<void> {
     ? ["--json", "upgrade", "--force"]
     : ["--json", "upgrade"];
   try {
+    const { runBottleReply } = await import("./ipc");
     const reply = await runBottleReply(args);
     if ("Upgraded" in reply) {
       const { previous, current } = reply.Upgraded;
@@ -492,33 +499,6 @@ async function onApplianceUpgrade(force: boolean): Promise<void> {
     showToast(error instanceof Error ? error.message : String(error));
   }
   await loadDoctor().catch(() => undefined);
-  await refreshBottles();
-}
-
-/**
- * «Остановить всё»: `bottle daemon stop` — бутылки останавливаются,
- * процесс демона завершается. Опрос состояния сам покажет панель
- * «демон не запущен».
- */
-async function onDaemonStop(): Promise<void> {
-  if (
-    !confirmAction(
-      "Остановить все бутылки и завершить демона? " +
-        "Запустить его снова можно кнопкой «Запустить демона».",
-    )
-  ) {
-    return;
-  }
-  try {
-    const reply = await runBottleReply(["--json", "daemon", "stop"]);
-    if ("Error" in reply) {
-      showToast(reply.Error.message);
-    } else {
-      showToast("Демон останавливается", "success");
-    }
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : String(error));
-  }
 }
 
 /** Показ/скрытие секций формы по типу бутылки (env ↔ host). */
@@ -551,21 +531,27 @@ function syncKindFields(): void {
 }
 
 /**
- * Монтирует обработчики и запускает поллинг. `once: true` — подключить
- * только обработчики (тесты), без интервала.
+ * Монтирует обработчики, делает первое подключение к демону и запускает
+ * watchdog. `once: true` — только обработчики (тесты), без интервала.
  */
 export function mountApp(options?: { once?: boolean }): { noop: boolean } {
-  const daemonStart = document.querySelector<HTMLButtonElement>("#daemon-start");
-  if (daemonStart !== null) {
-    daemonStart.addEventListener("click", () => {
-      void onStartDaemon();
-    });
-  }
   for (const tab of document.querySelectorAll<HTMLButtonElement>(".tab")) {
     tab.addEventListener("click", () => {
-      switchScreen(tab.dataset.screen ?? "list");
+      switchScreen(tab.dataset.screen ?? "env");
     });
   }
+  document
+    .querySelector<HTMLButtonElement>("#create-open")
+    ?.addEventListener("click", () => {
+      resetForm();
+      syncKindFields();
+      switchScreen("create");
+    });
+  document
+    .querySelector<HTMLButtonElement>("#create-cancel")
+    ?.addEventListener("click", () => {
+      switchScreen(currentTab);
+    });
   const form = document.querySelector<HTMLFormElement>("#create-form");
   form?.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -584,13 +570,6 @@ export function mountApp(options?: { once?: boolean }): { noop: boolean } {
     .querySelector<HTMLButtonElement>("#f-config-pick")
     ?.addEventListener("click", () => {
       void pickConfigFile();
-    });
-  document
-    .querySelector<HTMLButtonElement>("#list-create")
-    ?.addEventListener("click", () => {
-      resetForm();
-      syncKindFields();
-      switchScreen("create");
     });
   document
     .querySelector<HTMLButtonElement>("#doctor-refresh")
@@ -622,26 +601,42 @@ export function mountApp(options?: { once?: boolean }): { noop: boolean } {
       void onApplianceUpgrade(true);
     });
   document
-    .querySelector<HTMLButtonElement>("#daemon-stop")
+    .querySelector<HTMLButtonElement>("#cmd-daemon-start")
+    ?.addEventListener("click", () => {
+      void onStartDaemon();
+    });
+  document
+    .querySelector<HTMLButtonElement>("#cmd-daemon-stop")
     ?.addEventListener("click", () => {
       void onDaemonStop();
     });
+  document
+    .querySelector<HTMLButtonElement>("#cmd-console")
+    ?.addEventListener("click", () => {
+      switchScreen("doctor");
+    });
   syncKindFields();
-  void refreshBottles();
+  // Первичное наполнение: список из БД (демон не нужен), затем попытка
+  // подключения к демону (упавший — не блокирует список).
+  void refreshBottles().then(async () => {
+    try {
+      await gui().daemonConnect();
+      daemonDown = false;
+      remerge();
+    } catch (error) {
+      if (isDaemonDown(error)) {
+        daemonDown = true;
+        runtimeCache.clear();
+        remerge();
+      } else {
+        showToast(error instanceof Error ? error.message : String(error));
+      }
+    }
+  });
   if (options?.once !== true) {
-    // Поллинг с backoff: при недоступном демоне — медленный зонд
-    // (I4), чтобы не плодить висящие CLI-процессы с 60-с ретраем.
-    const scheduleNext = (): void => {
-      window.setTimeout(() => {
-        void refreshBottles().finally(scheduleNext);
-      }, nextPollDelayMs(daemonDown));
-    };
-    scheduleNext();
-    // Журнал демона — тем же темпом, но запрос уходит только когда
-    // панель «демон не запущен» видима (иначе лишний IPC каждые 2 с).
     window.setInterval(() => {
-      void updateDaemonLog();
-    }, POLL_INTERVAL_MS);
+      void daemonWatchdog();
+    }, WATCHDOG_MS);
   }
   return { noop: true };
 }
@@ -665,6 +660,3 @@ async function pickConfigFile(): Promise<void> {
     }
   }
 }
-
-// Реэкспорт для main.ts: единая точка подключения мостов.
-export { setBottleInvoker };

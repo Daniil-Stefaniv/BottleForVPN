@@ -9,6 +9,8 @@ const row = (over: Partial<BottleRow>): BottleRow => ({
   id: "office-a",
   name: "Офис А",
   kind: "env",
+  protocol: "wireguard",
+  hasCredentials: false,
   state: "up",
   socks5: null,
   forwards: [],

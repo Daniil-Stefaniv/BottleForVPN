@@ -8,11 +8,61 @@ export interface BottleOutput {
   code: number;
 }
 
+// --- Проводные типы 0.3 (GUI↔демон, crates/core/src/ipc.rs) --------------
+
+/** Статистика демона (ответ на Stats) для командной панели/Диагностики. */
+export interface DaemonStatsWire {
+  pid: number;
+  version: string;
+  started_at: string;
+  active_bottles: number;
+  total_profiles: number;
+  mem_bytes: number;
+  cpu_pct: number;
+  wsl_state: string;
+  appliance_version: string | null;
+}
+
+/** Событие журнала (единый формат daemon/gui, спека §6). */
+export interface EventWire {
+  ts: string;
+  level: "debug" | "info" | "warn" | "error" | "fatal";
+  src: "daemon" | "gui" | "svc";
+  event: string;
+  desc: string;
+  ctx: Record<string, unknown>;
+}
+
+/** Событие демона на event-соединении (push вместо поллинга). */
+export type DaemonEventWire =
+  | {
+      StateChanged: {
+        id: string;
+        state: string;
+        detail: string | null;
+        socks5: number | null;
+        forwards: ForwardPort[];
+      };
+    }
+  | { Log: EventWire };
+
 export interface BottleSummary {
   id: string;
   name: string;
   kind: "env" | "host";
   state: string | null;
+}
+
+/** Строка сетки из команды `list_bottles` (БД, 0.3): сводка + протокол
+ * env-бутылки + флаг сохранённых кредов. */
+export interface BottleListRowWire {
+  id: string;
+  name: string;
+  kind: "env" | "host";
+  protocol: string | null;
+  has_credentials: boolean;
+  /** Из БД всегда null (состояние приходит событиями демона). */
+  state?: string | null;
 }
 
 export interface ForwardPort {

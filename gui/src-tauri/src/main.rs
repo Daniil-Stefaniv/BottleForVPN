@@ -220,6 +220,193 @@ fn legacy_import(vault: tauri::State<'_, VaultState>) -> Result<ImportOutcome, S
     })
 }
 
+// ---------------------------------------------------------------------------
+// Управление демоном и бутылками (главное окно, Task 15): список — из БД
+// (работает без демона), старт/стоп/статистика — через DaemonClient.
+// ---------------------------------------------------------------------------
+
+/// Связь с демоном: event-цикл подписки спавнится один раз за сессию.
+#[derive(Default)]
+struct DaemonLink {
+    loop_spawned: std::sync::atomic::AtomicBool,
+}
+
+/// Control-запрос демону свежим соединением (демон обслуживает
+/// параллельные подключения; соединение закрывается после ответа).
+async fn control_request(token: &str, req: bottle_core::ipc::GuiRequest) -> Result<bottle_core::ipc::GuiReply, String> {
+    let client = daemon_client::DaemonClient::new()
+        .ok_or_else(|| "каталог данных недоступен".to_string())?;
+    client.connect(token).await?;
+    client.request(req).await
+}
+
+/// Разблокированное хранилище из состояния (иначе понятная ошибка).
+fn unlocked_vault<'a>(
+    vault: &'a tauri::State<'a, VaultState>,
+) -> Result<std::sync::MutexGuard<'a, Option<db::Vault>>, String> {
+    let guard = vault.vault.lock().expect("vault не отравлен");
+    if guard.is_none() {
+        return Err("хранилище не разблокировано".to_string());
+    }
+    Ok(guard)
+}
+
+/// Список бутылок из БД (работает при выключенном демоне — спека §3).
+#[tauri::command]
+fn list_bottles(
+    vault: tauri::State<'_, VaultState>,
+) -> Result<Vec<db::bottles::BottleListRow>, String> {
+    unlocked_vault(&vault)?
+        .as_ref()
+        .expect("проверено выше")
+        .list_rows()
+}
+
+/// Подключается к демону: Hello → полная синхронизация профилей из БД →
+/// один раз спавнится event-цикл (события → фронтенд). Вызывается после
+/// разблокировки и когда watchdog увидел поднявшийся демон.
+#[tauri::command]
+async fn daemon_connect(
+    app: tauri::AppHandle,
+    daemon: tauri::State<'_, DaemonHandle>,
+    link: tauri::State<'_, DaemonLink>,
+    vault: tauri::State<'_, VaultState>,
+    log: tauri::State<'_, gui_log::GuiLog>,
+) -> Result<(), String> {
+    let profiles = {
+        let guard = unlocked_vault(&vault)?;
+        guard.as_ref().expect("проверено выше").all_full()?
+    };
+    let count = profiles.len();
+    let token = daemon.token().to_string();
+    let client = daemon_client::DaemonClient::new()
+        .ok_or_else(|| "каталог данных недоступен".to_string())?;
+    client.connect(&token).await?;
+    client.sync_all(profiles).await?;
+    let mut ctx = serde_json::Map::new();
+    ctx.insert("count".to_string(), count.into());
+    let _ = log.emit("profiles.synced", ctx);
+    if !link
+        .loop_spawned
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        client.spawn_event_loop(app, token);
+    }
+    Ok(())
+}
+
+/// Старт бутылки (креды демон уже имеет из синхронизации — спека §5).
+#[tauri::command]
+async fn start_bottle(
+    daemon: tauri::State<'_, DaemonHandle>,
+    log: tauri::State<'_, gui_log::GuiLog>,
+    id: &str,
+) -> Result<(), String> {
+    let mut ctx = serde_json::Map::new();
+    ctx.insert("id".to_string(), id.into());
+    let _ = log.emit("bottle.start.requested", ctx);
+    match control_request(
+        daemon.token(),
+        bottle_core::ipc::GuiRequest::StartBottle { id: id.to_string() },
+    )
+    .await?
+    {
+        bottle_core::ipc::GuiReply::Ok => Ok(()),
+        bottle_core::ipc::GuiReply::Error { message } => Err(message),
+        other => Err(format!("неожиданный ответ демона: {other:?}")),
+    }
+}
+
+/// Стоп бутылки.
+#[tauri::command]
+async fn stop_bottle(
+    daemon: tauri::State<'_, DaemonHandle>,
+    log: tauri::State<'_, gui_log::GuiLog>,
+    id: &str,
+) -> Result<(), String> {
+    let mut ctx = serde_json::Map::new();
+    ctx.insert("id".to_string(), id.into());
+    let _ = log.emit("bottle.stop.requested", ctx);
+    match control_request(
+        daemon.token(),
+        bottle_core::ipc::GuiRequest::StopBottle { id: id.to_string() },
+    )
+    .await?
+    {
+        bottle_core::ipc::GuiReply::Ok => Ok(()),
+        bottle_core::ipc::GuiReply::Error { message } => Err(message),
+        other => Err(format!("неожиданный ответ демона: {other:?}")),
+    }
+}
+
+/// «Остановить демона» (командная панель): Shutdown — стоп всех
+/// бутылок и завершение процесса демона. GUI остаётся живым.
+#[tauri::command]
+async fn stop_daemon(
+    daemon: tauri::State<'_, DaemonHandle>,
+    log: tauri::State<'_, gui_log::GuiLog>,
+) -> Result<(), String> {
+    let _ = log.emit("daemon.shutdown", Default::default());
+    // Демон гаснет после ответа — обрыв соединения вместо Ok не считаем
+    // ошибкой: команда принята.
+    match control_request(daemon.token(), bottle_core::ipc::GuiRequest::Shutdown).await {
+        Ok(bottle_core::ipc::GuiReply::Error { message }) => Err(message),
+        Ok(_) | Err(_) => Ok(()),
+    }
+}
+
+/// Статистика демона для командной панели и карт «Диагностики»;
+/// Err — демон недоступен (watchdog помечает его выключенным).
+#[tauri::command]
+async fn daemon_stats(
+    daemon: tauri::State<'_, DaemonHandle>,
+) -> Result<bottle_core::ipc::DaemonStats, String> {
+    match control_request(daemon.token(), bottle_core::ipc::GuiRequest::Stats).await? {
+        bottle_core::ipc::GuiReply::Stats(stats) => Ok(*stats),
+        bottle_core::ipc::GuiReply::Error { message } => Err(message),
+        other => Err(format!("неожиданный ответ демона: {other:?}")),
+    }
+}
+
+/// «Обновить логин и пароль» (пункт 9): сохранить в БД и точечно
+/// синхронизировать профиль демону, если он запущен.
+#[tauri::command]
+async fn update_credentials(
+    daemon: tauri::State<'_, DaemonHandle>,
+    vault: tauri::State<'_, VaultState>,
+    log: tauri::State<'_, gui_log::GuiLog>,
+    id: &str,
+    username: &str,
+    password: &str,
+) -> Result<(), String> {
+    {
+        let guard = unlocked_vault(&vault)?;
+        guard
+            .as_ref()
+            .expect("проверено выше")
+            .set_credentials(id, username, password)?;
+    }
+    let mut ctx = serde_json::Map::new();
+    ctx.insert("id".to_string(), id.into());
+    let _ = log.emit("bottle.credentials_updated", ctx);
+    // Демон держит креды в памяти: обновляем точечно (не запущен — при
+    // следующем daemon_connect уедет полная синхронизация).
+    let full = {
+        let guard = unlocked_vault(&vault)?;
+        guard.as_ref().expect("проверено выше").get_full(id)?
+    };
+    if let Some(full) = full {
+        let _ = control_request(
+            daemon.token(),
+            bottle_core::ipc::GuiRequest::UpsertProfile {
+                profile: Box::new(full),
+            },
+        )
+        .await;
+    }
+    Ok(())
+}
+
 /// Подтверждённый выход: шлёт демону `Shutdown` (стоп бутылок → выход)
 /// и завершает GUI. Демон недоступен/не наш — просто выходим.
 #[tauri::command]
@@ -260,6 +447,7 @@ fn main() {
         .manage(DaemonHandle::default())
         .manage(TrayState { enabled: with_tray })
         .manage(VaultState::default())
+        .manage(DaemonLink::default())
         // Журнал GUI: файл не открылся — работаем с буфером в памяти.
         .manage(
             gui_log::GuiLog::logs_dir()
@@ -280,7 +468,14 @@ fn main() {
             create_vault,
             unlock_vault,
             reset_vault,
-            legacy_import
+            legacy_import,
+            list_bottles,
+            daemon_connect,
+            start_bottle,
+            stop_bottle,
+            stop_daemon,
+            daemon_stats,
+            update_credentials
         ])
         .setup(move |app| {
             if with_tray {

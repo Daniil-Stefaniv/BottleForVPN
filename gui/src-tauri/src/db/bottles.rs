@@ -12,7 +12,69 @@ use bottle_core::profile::{BottleKind, BottleProfile, ExposeConfig, VpnConfig};
 
 use super::Vault;
 
+/// Строка списка для сетки главного окна (Task 15): к сводке добавлены
+/// протокол env-бутылки (у WireGuard нет логина/пароля — кнопка гаснет)
+/// и признак сохранённых кредов (мета-строка «сохранён логин/пароль»).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BottleListRow {
+    pub id: String,
+    pub name: String,
+    pub kind: BottleKind,
+    /// Протокол env-бутылки (`wireguard`/`openvpn`); у host — `None`.
+    pub protocol: Option<String>,
+    /// Сохранены ли логин/пароль в хранилище.
+    pub has_credentials: bool,
+}
+
 impl Vault {
+    /// Строки сетки главного окна: профили + протокол + флаг кредов.
+    /// Конфиги не читаются (быстрый список, Review Focus #4).
+    pub fn list_rows(&self) -> Result<Vec<BottleListRow>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT b.id, b.name, b.kind, b.vpn_json,
+                        (SELECT COUNT(*) FROM credentials r WHERE r.bottle_id = b.id)
+                 FROM bottles b ORDER BY b.id",
+            )
+            .map_err(|e| format!("не удалось прочитать бутылки: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|e| format!("не удалось прочитать бутылки: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, name, kind, vpn_json, creds) =
+                row.map_err(|e| format!("битая строка bottles: {e}"))?;
+            let vpn: VpnConfig = serde_json::from_str(&vpn_json)
+                .map_err(|e| format!("битый vpn_json бутылки {id}: {e}"))?;
+            let protocol = match &vpn {
+                VpnConfig::Env { protocol, .. } => Some(
+                    serde_json::to_value(protocol)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default(),
+                ),
+                VpnConfig::Host { .. } => None,
+            };
+            out.push(BottleListRow {
+                id,
+                name,
+                kind: parse_kind(&kind)?,
+                protocol,
+                has_credentials: creds > 0,
+            });
+        }
+        Ok(out)
+    }
+
     /// Сводки всех бутылок (вкладки «Env»/«Host» главного окна).
     /// `state` заполняет фронт из статуса демона — здесь `None`.
     /// Конфиги (`configs.config_text`) здесь не читаются: список
@@ -379,6 +441,32 @@ mod tests {
 
         let all = vault.all_full().unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    /// list_rows: протокол env-бутылки и флаг сохранённых кредов для
+    /// сетки главного окна (у WireGuard кнопка кредов погашена).
+    #[test]
+    fn list_rows_expose_protocol_and_credentials_flag() {
+        let (_tmp, vault) = vault();
+        vault.create_bottle(&env_full("office-a")).unwrap(); // WireGuard + креды
+        vault.create_bottle(&host_full("corp")).unwrap(); // host без кредов
+        let mut openvpn = env_full("client-b");
+        openvpn.profile.vpn = VpnConfig::Env {
+            protocol: TunnelProtocol::OpenVpn,
+            config: "client-b.ovpn".to_string(),
+        };
+        openvpn.credentials = None;
+        vault.create_bottle(&openvpn).unwrap();
+
+        let rows = vault.list_rows().unwrap();
+        assert_eq!(rows.len(), 3);
+        let by_id = |id: &str| rows.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(by_id("office-a").protocol.as_deref(), Some("wireguard"));
+        assert!(by_id("office-a").has_credentials);
+        assert_eq!(by_id("client-b").protocol.as_deref(), Some("openvpn"));
+        assert!(!by_id("client-b").has_credentials);
+        assert_eq!(by_id("corp").protocol, None);
+        assert!(!by_id("corp").has_credentials);
     }
 
     /// Дубль id — понятная ошибка, существующая запись не тронута

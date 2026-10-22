@@ -887,3 +887,179 @@ button.copy {
   width: 0;
   transition: width 0.15s ease;
 }
+
+/* ── Сетка бутылок (0.3, макет v5) ──────────────────────────────
+ * Единая сетка: бутылка · статус · старт/стоп · изменить · логин/пароль.
+ * Колонки фиксированной ширины — ровный ритм команд в каждой строке. */
+
+.screen-grid {
+  padding: 0.5rem 1rem 1rem;
+  overflow-y: auto;
+}
+
+.grid-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 86px 74px 86px 110px;
+  gap: 6px;
+  align-items: center;
+  padding: 0.4rem 0.55rem;
+  border-radius: var(--radius-sm);
+}
+
+.grid-row[data-bottle-id]:hover {
+  background: var(--bg-subtle);
+}
+
+.grid-head {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-muted);
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  padding-bottom: 0.3rem;
+  margin-bottom: 0.2rem;
+}
+
+.grid-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.grid-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.grid-meta {
+  font-size: 0.72rem;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#grid-empty {
+  padding: 2rem 0;
+  text-align: center;
+}
+
+/* Пилюля состояния: компактная, фиксированной колонки. */
+.pill {
+  font-size: 0.68rem;
+  padding: 2px 0;
+  border-radius: 8px;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pill-up {
+  background: color-mix(in srgb, var(--state-up) 16%, transparent);
+  color: var(--state-up);
+}
+
+.pill-down {
+  background: var(--bg-accent);
+  color: var(--fg-muted);
+}
+
+.pill-deg {
+  background: color-mix(in srgb, var(--state-degraded) 16%, transparent);
+  color: var(--state-degraded);
+}
+
+.pill-transit {
+  background: color-mix(in srgb, var(--state-transit) 16%, transparent);
+  color: var(--state-transit);
+}
+
+/* Кнопки строки сетки: старт/стоп акцентные, служебные нейтральные. */
+.grid-btn,
+.grid-row [data-role="action"] {
+  font: inherit;
+  font-size: 0.76rem;
+  padding: 0.28rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.grid-btn:hover,
+.grid-row [data-role="action"]:hover {
+  background: var(--bg-subtle);
+}
+
+.grid-row [data-role="action"].go {
+  border-color: var(--state-up);
+  color: var(--state-up);
+  font-weight: 600;
+}
+
+.grid-row [data-role="action"].halt {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.grid-row [data-role="action"].off,
+.grid-btn.off {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.grid-row [data-role="action"][disabled],
+.grid-btn[disabled] {
+  pointer-events: none;
+}
+
+/* ── Командная панель демона (0.3) ────────────────────────────── */
+
+#cmdbar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  height: 34px;
+  padding: 0 0.8rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+  flex-shrink: 0;
+}
+
+#cmdbar .spacer {
+  flex: 1;
+}
+
+#cmdbar button {
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+#cmdbar button:hover {
+  background: var(--bg-subtle);
+}
+
+#cmdbar button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+#cmd-status {
+  gap: 0.4rem;
+}

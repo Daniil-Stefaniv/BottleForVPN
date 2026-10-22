@@ -11,6 +11,8 @@ import { ask, open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   activeBottleIds,
+  handleDaemonDisconnected,
+  handleDaemonEvent,
   mountApp,
   performBottleAction,
   setConfigFileDialog,
@@ -18,8 +20,20 @@ import {
   setRevealInDir,
   setRowsNotifier,
 } from "./app";
+import {
+  dispatchDaemonDisconnected,
+  dispatchDaemonEvent,
+  setDaemonDisconnectListener,
+  setDaemonEventListener,
+  setGuiApi,
+} from "./backend";
 import { setBottleInvoker } from "./ipc";
-import type { BottleOutput } from "./ipc";
+import type {
+  BottleListRowWire,
+  BottleOutput,
+  DaemonEventWire,
+  DaemonStatsWire,
+} from "./ipc";
 import { renderLock } from "./lock";
 import type { ImportOutcome, LockStatus } from "./lock";
 import { initTray } from "./tray";
@@ -50,6 +64,32 @@ setConfigFileDialog(async () => {
 
 setRevealInDir(async (path) => {
   await revealItemInDir(path);
+});
+
+// Мост GUI→Rust-команды 0.3 (Task 15): список из БД, управление демоном
+// и бутылками, журнал. Имена аргументов — camelCase, Tauri разложит их
+// в snake_case параметры команд.
+setGuiApi({
+  listBottles: () => invoke<BottleListRowWire[]>("list_bottles"),
+  daemonConnect: () => invoke<void>("daemon_connect"),
+  startBottle: (id) => invoke<void>("start_bottle", { id }),
+  stopBottle: (id) => invoke<void>("stop_bottle", { id }),
+  stopDaemon: () => invoke<void>("stop_daemon"),
+  daemonStats: () => invoke<DaemonStatsWire>("daemon_stats"),
+  updateCredentials: (id, username, password) =>
+    invoke<void>("update_credentials", { id, username, password }),
+  logEvent: (code, ctx) => invoke<void>("log_event", { code, ctx }),
+});
+
+// Push-события демона (Task 11): event-цикл Rust-стороны эмитит
+// "daemon-event" (StateChanged/Log) и "daemon-disconnected" (разрыв).
+setDaemonEventListener(handleDaemonEvent);
+setDaemonDisconnectListener(handleDaemonDisconnected);
+await listen<DaemonEventWire>("daemon-event", (event) => {
+  dispatchDaemonEvent(event.payload);
+});
+await listen("daemon-disconnected", () => {
+  dispatchDaemonDisconnected();
 });
 
 // Tray (Task 5): меню обновляется после каждого refresh списка,
