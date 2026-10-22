@@ -124,6 +124,8 @@ fn count_toml(dir: &Path) -> usize {
 /// Полный сброс хранилища (настройки): удаляет файл БД и спутники
 /// WAL/SHM. Несуществующий файл — не ошибка (сброс идемпотентен).
 /// Вызывается при ЗАКРЫТОМ хранилище (GUI закрывает Vault до вызова).
+// Вызывается Tauri-командой настроек из Task 18 («Сбросить хранилище»).
+#[allow(dead_code)]
 pub fn reset_vault(path: &Path) -> Result<(), String> {
     for suffix in ["", "-wal", "-shm"] {
         let file = if suffix.is_empty() {

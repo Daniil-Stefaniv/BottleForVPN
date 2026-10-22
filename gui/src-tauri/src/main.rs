@@ -10,6 +10,7 @@
 
 mod bottle;
 mod daemon;
+mod daemon_client;
 mod db;
 mod tray;
 

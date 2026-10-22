@@ -37,17 +37,41 @@ struct DaemonInner {
 
 /// Управление спавненным демоном: один экземпляр на приложение
 /// (tauri State), журнал дочитывается фоновой задачей (внутренность
-/// за Arc — ридер живёт в 'static-задаче).
-#[derive(Default, Clone)]
+/// за Arc — ридер живёт в 'static-задаче). Токен авторизации
+/// генерируется при старте GUI и передаётся демону `--gui-token`
+/// (0.3, спека §5; живёт только в памяти GUI).
+#[derive(Clone)]
 pub struct DaemonHandle {
     inner: Arc<Mutex<DaemonInner>>,
+    token: String,
+}
+
+impl Default for DaemonHandle {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(DaemonInner::default())),
+            token: crate::daemon_client::generate_token(),
+        }
+    }
 }
 
 impl DaemonHandle {
+    /// Токен авторизации GUI→демон этой сессии (для DaemonClient).
+    // Проводится в Tauri-команды в задачах 14–15 (запуск демона + sync).
+    #[allow(dead_code)]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     /// Запускает демона `bottled` (резолв как у CLI: env → рядом с exe →
-    /// PATH); повторный вызов при живом процессе — ошибка.
+    /// PATH) с токеном авторизации; повторный вызов при живом процессе —
+    /// ошибка.
     pub async fn start(&self) -> Result<(), String> {
-        self.start_custom(resolve_bottled_path(), vec![]).await
+        self.start_custom(
+            resolve_bottled_path(),
+            vec!["--gui-token".to_string(), self.token.clone()],
+        )
+        .await
     }
 
     /// Запускает конкретную программу как «демона» (тесты/dev).

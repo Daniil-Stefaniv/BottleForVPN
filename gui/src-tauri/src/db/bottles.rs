@@ -4,6 +4,9 @@
 //! (параллельной модели нет). Мутации — транзакции (бутылка + конфиг +
 //! креды атомарно).
 
+// Проводится в Tauri-команды в задачах 15–16 (окна бутылок).
+#![allow(dead_code)]
+
 use bottle_core::ipc::{BottleSummary, FullProfile, VpnCredentials};
 use bottle_core::profile::{BottleKind, BottleProfile, ExposeConfig, VpnConfig};
 

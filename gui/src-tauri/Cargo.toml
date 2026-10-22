@@ -26,7 +26,14 @@ rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"]
 bottle-core = { path = "../../crates/core" }
 # Каталог профилей 0.2.x для миграции (%LOCALAPPDATA%\BottleForApps\bottles).
 dirs = "5"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
+# Клиент демона (0.3): кадры LengthJsonCodec поверх UDS/named pipe.
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+# Токен авторизации GUI→демон (та же зависимость, что у демона).
+getrandom = "0.3"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "net", "io-util"] }
 
 [profile.release]
 strip = true
