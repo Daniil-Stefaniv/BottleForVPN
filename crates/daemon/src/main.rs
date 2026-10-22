@@ -43,6 +43,9 @@ pub struct Daemon {
     pub data_root: PathBuf,
     /// Сэмплер RSS/CPU процесса (Stats, дельта между вызовами).
     pub sampler: stats::ProcessSampler,
+    /// Событийный журнал `events.jsonl` (None — файл недоступен,
+    /// события идут только подписчикам).
+    pub event_log: logging::SharedEventLog,
 }
 
 /// Демон для тестов: пустой реестр, заданный токен, менеджер —
@@ -65,6 +68,7 @@ pub(crate) fn test_daemon(
         started_ts: bottle_core::events::now_ts(),
         data_root: root.to_path_buf(),
         sampler: stats::ProcessSampler::new(),
+        event_log: std::sync::Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -171,6 +175,28 @@ pub async fn serve_daemon(
 
     let registry = crate::registry::Registry::new_shared();
     let (events, _) = tokio::sync::broadcast::channel(256);
+    // Событийный журнал `<data>/logs/events.jsonl` (спека §6); сбой
+    // открытия не фатален — события идут только подписчикам.
+    let event_log: logging::SharedEventLog = std::sync::Arc::new(std::sync::Mutex::new(
+        match logging::EventLog::open(&paths::logs_dir(&data_root)) {
+            Ok(log) => Some(log),
+            Err(error) => {
+                tracing::warn!(%error, "событийный журнал недоступен");
+                None
+            }
+        },
+    ));
+    {
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("pid".to_string(), std::process::id().into());
+        logging::emit(
+            &events,
+            &event_log,
+            bottle_core::events::Src::Daemon,
+            "daemon.spawned",
+            ctx,
+        );
+    }
 
     #[cfg(windows)]
     {
@@ -183,12 +209,13 @@ pub async fn serve_daemon(
             manager::AGENT_CONNECT_TIMEOUT,
         ));
         // Менеджер читает профили из in-memory реестра (0.3): наполняет
-        // его GUI сообщением SyncProfiles после подключения.
-        let manager = Arc::new(manager::BottleManager::new(
-            registry.clone(),
-            data_root.clone(),
-            connect,
-        ));
+        // его GUI сообщением SyncProfiles после подключения. События
+        // (bottle.up/failed) менеджер шлёт через тот же фаннел, что и
+        // диспетчер: файл events.jsonl + push подписчикам.
+        let manager = Arc::new(
+            manager::BottleManager::new(registry.clone(), data_root.clone(), connect)
+                .with_event_sink(events.clone(), event_log.clone()),
+        );
         // Фоновый цикл DNS-перепроверки host-бутылок (спека §7.2, шаг 5)
         // живёт до остановки демона.
         manager.spawn_host_dns_recheck(shutdown.clone());
@@ -206,6 +233,7 @@ pub async fn serve_daemon(
             started_ts: bottle_core::events::now_ts(),
             data_root,
             sampler: stats::ProcessSampler::new(),
+            event_log,
         });
         pipe::serve(bottle_core::ipc::DAEMON_PIPE, daemon, shutdown).await
     }
@@ -229,6 +257,7 @@ pub async fn serve_daemon(
             started_ts: bottle_core::events::now_ts(),
             data_root,
             sampler: stats::ProcessSampler::new(),
+            event_log,
         });
         uds::serve(&socket, daemon, shutdown).await
     }

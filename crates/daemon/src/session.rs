@@ -11,16 +11,17 @@
 //! допустимы только служебные `Doctor`/`LogsExport` (их шлёт CLI без
 //! токена); остальное отклоняется `AUTH: …`. Неверный токен — ошибка
 //! и закрытие соединения. `Subscribe { token }` после проверки
-//! переводит соединение в event-режим: исходящий поток [`DaemonEvent`]
+//! переводит соединение в event-режим: исходящий поток
+//! [`bottle_core::ipc::DaemonEvent`]
 //! из broadcast-канала демона (отставший подписчик пропускает события
 //! с warn-логом, соединение не рвётся).
 
 use std::sync::Arc;
 
-use bottle_core::events::{self, Event, Src};
+use bottle_core::events::Src;
 use bottle_core::frame::LengthJsonCodec;
 use bottle_core::ipc::{
-    CliReply, CliRequest, DaemonEvent, DaemonStats, GuiReply, GuiRequest, AUTH_ERR,
+    CliReply, CliRequest, DaemonStats, GuiReply, GuiRequest, AUTH_ERR,
 };
 use bytes::BytesMut;
 use tokio::io::{split, AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -192,20 +193,11 @@ fn to_value<T: serde::Serialize>(value: &T) -> serde_json::Value {
 
 /// Публикует событие реестра (спека §6) подписчикам; отсутствие
 /// подписчиков — не ошибка.
+/// Пишет событие реестра в событийный журнал демона (файл + push
+/// подписчикам). Тонкая обёртка над [`crate::logging::emit`]: источник
+/// всегда daemon.
 pub(crate) fn emit(daemon: &Daemon, code: &str, ctx: serde_json::Map<String, serde_json::Value>) {
-    let Some((level, desc)) = events::render(code, ctx.clone()) else {
-        tracing::warn!(code, "событие вне реестра");
-        return;
-    };
-    let event = Event {
-        ts: events::now_ts(),
-        level,
-        src: Src::Daemon,
-        event: code.to_string(),
-        desc,
-        ctx,
-    };
-    let _ = daemon.events.send(DaemonEvent::Log(Box::new(event)));
+    crate::logging::emit(&daemon.events, &daemon.event_log, Src::Daemon, code, ctx);
 }
 
 /// Диспетчер протокола GUI (control-соединение после auth-гейта;
@@ -286,6 +278,7 @@ pub(crate) async fn gui_dispatch(
             },
         },
         GuiRequest::Shutdown => {
+            emit(daemon, "daemon.shutdown", serde_json::Map::new());
             if let Some(manager) = &daemon.manager {
                 let failed = manager.stop_all().await;
                 if !failed.is_empty() {
@@ -459,11 +452,11 @@ mod tests {
         assert_eq!(reply, GuiReply::Ok);
         assert_eq!(daemon.registry.read().expect("реестр").ids(), ["a", "b"]);
 
-        let DaemonEvent::Log(event) = rx.recv().await.expect("событие sync") else {
+        let bottle_core::ipc::DaemonEvent::Log(event) = rx.recv().await.expect("событие sync") else {
             panic!("ожидали Log-событие");
         };
         assert_eq!(event.event, "profiles.synced");
-        assert_eq!(event.level, events::Level::Debug);
+        assert_eq!(event.level, bottle_core::events::Level::Debug);
         assert!(event.desc.contains('2'), "число профилей: {}", event.desc);
 
         // Повторный Sync — полная замена, не слияние.

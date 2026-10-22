@@ -105,6 +105,34 @@ pub fn now_ts() -> String {
         .expect("дата форматируется")
 }
 
+/// Оставляет в `ctx` только ключи, которые шаблон события реально
+/// подставляет (`{key}`), и урезает строковые значения до 200 символов.
+/// Код вне реестра → пустой контекст. Гарантия «секреты не в журнале»
+/// (спека §6): вызывающий может передать широкий ctx, в запись уйдут
+/// только публичные параметры шаблона.
+pub fn sanitize_ctx(
+    code: &str,
+    ctx: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let Some(def) = REGISTRY.iter().find(|d| d.code == code) else {
+        return serde_json::Map::new();
+    };
+    let mut out = serde_json::Map::new();
+    for (key, mut value) in ctx {
+        if !def.template.contains(&format!("{{{key}}}")) {
+            continue;
+        }
+        if let serde_json::Value::String(text) = &mut value {
+            const MAX: usize = 200;
+            if text.chars().count() > MAX {
+                *text = text.chars().take(MAX).collect();
+            }
+        }
+        out.insert(key, value);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +164,30 @@ mod tests {
         let line = serde_json::to_string(&e).unwrap();
         assert!(line.contains(r#""src":"gui""#) && line.contains(r#""event":"bottle.created""#));
         assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn sanitize_ctx_keeps_only_template_keys() {
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("id".into(), "office-a".into());
+        ctx.insert("port".into(), 1080.into());
+        ctx.insert("password".into(), "s3cr3t".into());
+        ctx.insert("PrivateKey".into(), "ABCDEF".into());
+        let out = sanitize_ctx("bottle.up", ctx);
+        assert!(out.contains_key("id") && out.contains_key("port"));
+        assert!(!out.contains_key("password") && !out.contains_key("PrivateKey"));
+
+        // Код вне реестра — контекст пуст.
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("id".into(), "x".into());
+        assert!(sanitize_ctx("nope", ctx).is_empty());
+
+        // Длинные строки урезаются.
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("reason".into(), "я".repeat(500).into());
+        let out = sanitize_ctx("bottle.failed", ctx);
+        let reason = out["reason"].as_str().unwrap();
+        assert_eq!(reason.chars().count(), 200);
     }
 
     #[test]

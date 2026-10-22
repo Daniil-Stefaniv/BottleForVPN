@@ -110,6 +110,102 @@ pub fn mask_args(args: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------
+// Событийный журнал 0.3 (спека §6): структурные события Event из
+// реестра bottle_core::events — JSONL-файл `<logs>/events.jsonl` и
+// push-поток DaemonEvent::Log подписчикам (GUI «Диагностика»).
+// ---------------------------------------------------------------------
+
+/// Файл событийного журнала (`events.jsonl` в каталоге журналов):
+/// append-only, одна JSONL-строка на событие.
+pub struct EventLog {
+    file: fs::File,
+}
+
+impl EventLog {
+    /// Открывает (создаёт) `events.jsonl` в `logs_dir` на дозапись.
+    /// На unix файл — 0600 (в журнале нет секретов, но есть топология).
+    pub fn open(logs_dir: &Path) -> io::Result<EventLog> {
+        fs::create_dir_all(logs_dir)?;
+        let path = logs_dir.join("events.jsonl");
+        let file = open_private_append(&path)?;
+        Ok(EventLog { file })
+    }
+
+    /// Дописывает событие одной JSONL-строкой.
+    pub fn write(&mut self, event: &bottle_core::events::Event) -> io::Result<()> {
+        use std::io::Write;
+        let line = serde_json::to_string(event).map_err(io::Error::other)?;
+        self.file.write_all(line.as_bytes())?;
+        self.file.write_all(b"\n")
+    }
+}
+
+/// Append-открытие с правами 0600 на unix.
+#[cfg(unix)]
+fn open_private_append(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Append-открытие с правами 0600 на unix.
+#[cfg(not(unix))]
+fn open_private_append(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Разделяемый файловый журнал событий демона (None — журнал недоступен,
+/// события идут только подписчикам).
+pub type SharedEventLog = std::sync::Arc<std::sync::Mutex<Option<EventLog>>>;
+
+/// Пишет событие в файловый журнал и шлёт `DaemonEvent::Log`
+/// подписчикам (один фаннел для демона и менеджера бутылок).
+///
+/// ctx санитизируется [`bottle_core::events::sanitize_ctx`]: в запись
+/// уходят только ключи шаблона (секреты в журнал не попадают). Код вне
+/// реестра — debug-запись «вне реестра» с пустым контекстом: потерять
+/// факт события хуже, чем потерять его формулировку.
+pub fn emit(
+    events: &tokio::sync::broadcast::Sender<bottle_core::ipc::DaemonEvent>,
+    log: &SharedEventLog,
+    src: bottle_core::events::Src,
+    code: &str,
+    ctx: serde_json::Map<String, serde_json::Value>,
+) {
+    use bottle_core::events::Level;
+
+    let ctx = bottle_core::events::sanitize_ctx(code, ctx);
+    let (level, desc) = match bottle_core::events::render(code, ctx.clone()) {
+        Some((level, desc)) => (level, desc),
+        None => {
+            tracing::debug!(code, "событие вне реестра");
+            (Level::Debug, format!("{code} (вне реестра событий)"))
+        }
+    };
+    let event = bottle_core::events::Event {
+        ts: bottle_core::events::now_ts(),
+        level,
+        src,
+        event: code.to_string(),
+        desc,
+        ctx,
+    };
+    if let Ok(mut guard) = log.lock() {
+        if let Some(log) = guard.as_mut() {
+            if let Err(error) = log.write(&event) {
+                tracing::warn!(%error, "событийный журнал недоступен");
+                // Дальше файл не трогаем: повторные сбои не спамят.
+                *guard = None;
+            }
+        }
+    }
+    let _ = events.send(bottle_core::ipc::DaemonEvent::Log(Box::new(event)));
+}
+
 /// Удаляет из `dir` файлы с префиксом `<base>.` старше `retention`
 /// (по mtime). Возвращает число удалённых; ошибки отдельных файлов
 /// пропускаются (чистка — фон, следующий проход повторит).
@@ -209,6 +305,90 @@ mod tests {
         assert!(!old.exists(), "31 день — удалён");
         assert!(fresh.exists(), "29 дней — жив");
         assert!(foreign.exists(), "чужие файлы каталога не трогаем");
+    }
+
+    /// Событийный журнал: emit пишет JSONL-строку в events.jsonl и шлёт
+    /// то же событие подписчикам broadcast (push в GUI).
+    #[test]
+    fn emit_writes_event_and_broadcasts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log: SharedEventLog =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(EventLog::open(tmp.path()).unwrap())));
+        let (events, mut rx) = tokio::sync::broadcast::channel(8);
+
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("id".into(), "office-a".into());
+        ctx.insert("port".into(), 1080.into());
+        emit(
+            &events,
+            &log,
+            bottle_core::events::Src::Daemon,
+            "bottle.up",
+            ctx,
+        );
+
+        let line = fs::read_to_string(tmp.path().join("events.jsonl")).unwrap();
+        assert!(line.contains(r#""event":"bottle.up""#), "код в файле: {line}");
+        assert!(line.contains(r#""port":1080"#), "порт в ctx: {line}");
+        assert!(line.contains("office-a"), "описание в файле: {line}");
+
+        let pushed = rx.try_recv().expect("событие ушло подписчикам");
+        let bottle_core::ipc::DaemonEvent::Log(event) = pushed else {
+            panic!("ожидали Log, получили {pushed:?}");
+        };
+        assert_eq!(event.event, "bottle.up");
+        assert_eq!(event.desc, "office-a поднята (socks5 :1080)");
+    }
+
+    /// Сканер секретов: ctx с password/PrivateKey не сериализуется —
+    /// в запись уходят только ключи шаблона (спека §6).
+    #[test]
+    fn log_line_never_contains_secret_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log: SharedEventLog =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(EventLog::open(tmp.path()).unwrap())));
+        let (events, _rx) = tokio::sync::broadcast::channel::<bottle_core::ipc::DaemonEvent>(8);
+
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("id".into(), "office-a".into());
+        ctx.insert("port".into(), 1080.into());
+        ctx.insert("password".into(), "s3cr3t-P@ss".into());
+        ctx.insert("PrivateKey".into(), "PRIVATE-KEY-MATERIAL".into());
+        emit(
+            &events,
+            &log,
+            bottle_core::events::Src::Daemon,
+            "bottle.up",
+            ctx,
+        );
+        // Код вне реестра: контекст отбрасывается целиком.
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("token".into(), "TOP-SECRET".into());
+        emit(
+            &events,
+            &log,
+            bottle_core::events::Src::Daemon,
+            "custom.unknown",
+            ctx,
+        );
+
+        let content = fs::read_to_string(tmp.path().join("events.jsonl")).unwrap();
+        for secret in ["s3cr3t-P@ss", "PRIVATE-KEY-MATERIAL", "TOP-SECRET"] {
+            assert!(
+                !content.contains(secret),
+                "секрет утёк в журнал: {secret}\n{content}"
+            );
+        }
+        for key in ["password", "PrivateKey"] {
+            assert!(
+                !content.contains(key),
+                "имя секретного ключа не пишется: {key}\n{content}"
+            );
+        }
+        assert!(
+            content.contains("custom.unknown (вне реестра событий)"),
+            "неизвестный код — debug-fallback: {content}"
+        );
     }
 
     /// Единственный тест бинарника, инициализирующий глобальный

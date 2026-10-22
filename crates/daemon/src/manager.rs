@@ -358,9 +358,32 @@ pub struct BottleManager {
     /// Канал смертей relay-задач env-бутылок (дренируется health-циклом).
     relay_tx: mpsc::UnboundedSender<RelayDeath>,
     relay_rx: Mutex<mpsc::UnboundedReceiver<RelayDeath>>,
+    /// Фаннел событийного журнала (спека §6): bottle.up/bottle.failed
+    /// уходят в файл и подписчикам. `None` — тесты без шины.
+    events: Option<(
+        tokio::sync::broadcast::Sender<bottle_core::ipc::DaemonEvent>,
+        crate::logging::SharedEventLog,
+    )>,
 }
 
 impl BottleManager {
+    /// Событие событийного журнала (безопасный no-op без шины).
+    pub(crate) fn emit_event(&self, code: &str, ctx: serde_json::Map<String, serde_json::Value>) {
+        if let Some((events, log)) = &self.events {
+            crate::logging::emit(events, log, bottle_core::events::Src::Daemon, code, ctx);
+        }
+    }
+
+    /// Подключает фаннел событийного журнала (шина демона + файл).
+    pub fn with_event_sink(
+        mut self,
+        events: tokio::sync::broadcast::Sender<bottle_core::ipc::DaemonEvent>,
+        log: crate::logging::SharedEventLog,
+    ) -> Self {
+        self.events = Some((events, log));
+        self
+    }
+
     /// Создаёт менеджера над реестром и подключением; host-часть —
     /// продакшн-инъекции ([`crate::host_manager::HostParts::real`]).
     pub fn new(registry: SharedRegistry, data_root: PathBuf, connect: Arc<dyn AgentConnect>) -> Self {
@@ -402,6 +425,7 @@ impl BottleManager {
             relay_serve: real_relay_serve(),
             relay_tx,
             relay_rx: Mutex::new(relay_rx),
+            events: None,
         }
     }
 
@@ -605,6 +629,10 @@ impl BottleManager {
                             },
                         );
                         tracing::warn!(id = %id, %error, "восстановление бутылки не удалось");
+                        let mut ctx = serde_json::Map::new();
+                        ctx.insert("id".to_string(), id.clone().into());
+                        ctx.insert("reason".to_string(), error.to_string().into());
+                        self.emit_event("bottle.failed", ctx);
                     }
                 }
                 _ => tracing::info!(id = %id, "восстановление пропущено: бутылка уже остановлена"),
@@ -753,6 +781,7 @@ impl BottleManager {
         let marker_alive = runtime.get(id).is_some_and(|r| r.generation == generation);
         match outcome {
             Ok(made) if marker_alive => {
+                let socks5_port = made.listeners.socks5.local_addr().ok().map(|addr| addr.port());
                 runtime.insert(
                     id.to_string(),
                     Runtime {
@@ -765,6 +794,13 @@ impl BottleManager {
                 );
                 drop(runtime);
                 tracing::info!(id, "бутылка поднята");
+                let mut ctx = serde_json::Map::new();
+                ctx.insert("id".to_string(), id.into());
+                ctx.insert(
+                    "port".to_string(),
+                    socks5_port.unwrap_or_default().into(),
+                );
+                self.emit_event("bottle.up", ctx);
                 if let Some(command) = &profile.expose.launch {
                     crate::launch::spawn_launch(command);
                 }
@@ -816,6 +852,10 @@ impl BottleManager {
                 }
                 drop(runtime);
                 tracing::warn!(id, %reason, "поднятие бутылки не удалось");
+                let mut ctx = serde_json::Map::new();
+                ctx.insert("id".to_string(), id.into());
+                ctx.insert("reason".to_string(), reason.clone().into());
+                self.emit_event("bottle.failed", ctx);
                 Ok(CliReply::Error { message: reason })
             }
         }
@@ -3033,6 +3073,70 @@ mod tests {
             .status()
             .await
             .is_empty());
+    }
+
+    /// Событийный журнал (спека §6): успешный start шлёт bottle.up
+    /// подписчикам шины (id + реальный порт) и пишет строку в файл;
+    /// провал старта — bottle.failed с причиной.
+    #[tokio::test]
+    async fn start_and_failure_emit_events_to_bus_and_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = registry_with(&env_profile("office-a", "wg.conf"));
+        let fake = FakeAgent::spawn(UpBehavior::Ready).await;
+        let (events, mut rx) = tokio::sync::broadcast::channel(8);
+        let log: crate::logging::SharedEventLog = std::sync::Arc::new(std::sync::Mutex::new(
+            Some(crate::logging::EventLog::open(tmp.path()).unwrap()),
+        ));
+        let manager = BottleManager::new(
+            registry.clone(),
+            tmp.path().to_path_buf(),
+            Arc::new(fake),
+        )
+        .with_event_sink(events.clone(), log.clone());
+
+        manager.start("office-a").await.expect("бутылка поднята");
+
+        let pushed = rx.try_recv().expect("событие bottle.up");
+        let bottle_core::ipc::DaemonEvent::Log(event) = pushed else {
+            panic!("ожидали Log, получили {pushed:?}");
+        };
+        assert_eq!(event.event, "bottle.up");
+        assert_eq!(event.ctx["id"], "office-a");
+        let port = event.ctx["port"].as_u64().unwrap_or(0);
+        assert!(port > 0, "реальный порт слушателя: {port}");
+        let content = std::fs::read_to_string(tmp.path().join("events.jsonl")).unwrap();
+        assert!(content.contains(r#""event":"bottle.up""#), "строка в файле");
+
+        // Провал старта — bottle.failed с причиной.
+        registry
+            .write()
+            .expect("реестр")
+            .upsert(full_profile_of(&env_profile("office-b", "wg.conf"), None));
+        let failing = BottleManager::new(
+            registry,
+            tmp.path().join("m2"),
+            Arc::new(
+                FakeAgent::spawn(UpBehavior::TunnelFailed(
+                    "туннель не поднялся".to_string(),
+                ))
+                .await,
+            ),
+        )
+        .with_event_sink(events, log);
+        let reply = failing.start("office-b").await.expect("ответ, не сбой");
+        assert!(matches!(reply, CliReply::Error { .. }), "start провалился");
+
+        let pushed = rx.try_recv().expect("событие bottle.failed");
+        let bottle_core::ipc::DaemonEvent::Log(event) = pushed else {
+            panic!("ожидали Log, получили {pushed:?}");
+        };
+        assert_eq!(event.event, "bottle.failed");
+        assert_eq!(event.ctx["id"], "office-b");
+        assert!(
+            event.desc.contains("туннель не поднялся"),
+            "причина в описании: {}",
+            event.desc
+        );
     }
 
     // ------------------------------------------------------------------
