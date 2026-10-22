@@ -4,7 +4,7 @@
 // (запуск/остановка/консоль). Список читает `list_bottles` из
 // зашифрованного хранилища; старт/стоп идут через DaemonClient.
 
-import { gui, isDaemonDown } from "./backend";
+import { gui, isDaemonDown, setBottlesChangedListener } from "./backend";
 import type { DaemonEventWire, EventWire, RuntimeState } from "./ipc";
 import {
   mergeListStatus,
@@ -12,7 +12,7 @@ import {
   type BottleAction,
   type BottleRow,
 } from "./list";
-import { loadProfileForEdit, resetForm, submitCreate } from "./create";
+import { askCredentials } from "./creds";
 import { collectLogs, loadDoctor } from "./doctor";
 
 /** API спавна демона (Rust-команда start_daemon), подменяется в тестах. */
@@ -121,14 +121,12 @@ function renderAll(rows: BottleRow[]): void {
       void performBottleAction(id, action);
     },
     onEdit: (id) => {
-      switchScreen("create");
-      void loadProfileForEdit(id).then((loaded) => {
-        if (loaded) {
-          syncKindFields();
-        } else {
-          showToast(`Профиль бутылки не найден: ${id}`);
-        }
-      });
+      const row = rowsCache.find((item) => item.id === id);
+      gui()
+        .openEditor(id, row?.state ?? null)
+        .catch((error: unknown) => {
+          showToast(error instanceof Error ? error.message : String(error));
+        });
     },
     onCreds: (id) => {
       openCredsDialog(id);
@@ -304,76 +302,6 @@ function openCredsDialog(id: string): void {
   });
 }
 
-/** Логин/пароль из диалога бутылки. */
-export interface CredsAnswer {
-  username: string;
-  password: string;
-}
-
-/**
- * Показывает модальный диалог логина/пароля и ждёт ввода.
- * `null` — пользователь отменил. Пустой логин не принимается (ошибка
- * показывается в самом диалоге, ввод продолжается).
- */
-export function askCredentials(id: string): Promise<CredsAnswer | null> {
-  const dialog = document.querySelector<HTMLDialogElement>("#creds-dialog");
-  const form = document.querySelector<HTMLFormElement>("#creds-form");
-  const usernameInput = document.querySelector<HTMLInputElement>("#creds-username");
-  const passwordInput = document.querySelector<HTMLInputElement>("#creds-password");
-  const errorElement = document.querySelector<HTMLElement>("#creds-error");
-  const idElement = document.querySelector<HTMLElement>("#creds-bottle-id");
-  if (
-    dialog === null ||
-    form === null ||
-    usernameInput === null ||
-    passwordInput === null ||
-    errorElement === null
-  ) {
-    return Promise.resolve(null);
-  }
-  if (idElement !== null) {
-    idElement.textContent = id;
-  }
-  errorElement.hidden = true;
-  errorElement.textContent = "";
-
-  return new Promise((resolve) => {
-    const cancelButton = document.querySelector<HTMLButtonElement>("#creds-cancel");
-
-    const cleanup = (): void => {
-      form.removeEventListener("submit", onSubmit);
-      cancelButton?.removeEventListener("click", onCancel);
-      dialog.removeEventListener("cancel", onCancel);
-      dialog.close();
-      form.reset();
-    };
-    const onCancel = (): void => {
-      cleanup();
-      resolve(null);
-    };
-    const onSubmit = (event: Event): void => {
-      event.preventDefault();
-      const username = usernameInput.value.trim();
-      const password = passwordInput.value;
-      if (username === "") {
-        errorElement.textContent = "Укажите логин.";
-        errorElement.hidden = false;
-        usernameInput.focus();
-        return;
-      }
-      cleanup();
-      resolve({ username, password });
-    };
-
-    form.addEventListener("submit", onSubmit);
-    cancelButton?.addEventListener("click", onCancel);
-    // Esc в <dialog> генерирует cancel — та же отмена.
-    dialog.addEventListener("cancel", onCancel);
-    dialog.showModal();
-    usernameInput.focus();
-  });
-}
-
 /** «Запустить демона»: спавн bottled, затем подключение и sync. */
 async function onStartDaemon(): Promise<void> {
   if (daemonApi === null) {
@@ -427,18 +355,6 @@ export function switchScreen(screen: string): void {
   }
   if (screen === "env" || screen === "host") {
     renderAll(rowsCache);
-  }
-}
-
-/** Submit формы create: edit определяется по readonly id. */
-async function onCreateSubmit(): Promise<void> {
-  const idField = document.querySelector<HTMLInputElement>("#f-id");
-  const isEdit = idField !== null && idField.readOnly;
-  const ok = await submitCreate(isEdit);
-  if (ok) {
-    showToast(isEdit ? "Профиль обновлён" : "Бутылка создана", "success");
-    switchScreen(currentTab);
-    await refreshBottles();
   }
 }
 
@@ -501,33 +417,13 @@ async function onApplianceUpgrade(force: boolean): Promise<void> {
   await loadDoctor().catch(() => undefined);
 }
 
-/** Показ/скрытие секций формы по типу бутылки (env ↔ host). */
-function syncKindFields(): void {
-  const kind = document.querySelector<HTMLSelectElement>("#f-kind")?.value;
-  for (const field of document.querySelectorAll<HTMLElement>(".env-field")) {
-    field.hidden = kind !== "env";
-  }
-  for (const field of document.querySelectorAll<HTMLElement>(".host-field")) {
-    field.hidden = kind !== "host";
-  }
-  const envSection = document.querySelector<HTMLElement>("#section-vpn-env");
-  if (envSection !== null) {
-    envSection.hidden = kind !== "env";
-  }
-  const hostSection = document.querySelector<HTMLElement>("#section-vpn-host");
-  if (hostSection !== null) {
-    hostSection.hidden = kind !== "host";
-  }
-  const title = document.querySelector<HTMLElement>("#create-title");
-  const submit = document.querySelector<HTMLButtonElement>("#create-submit");
-  const idField = document.querySelector<HTMLInputElement>("#f-id");
-  const isEdit = idField !== null && idField.readOnly;
-  if (title !== null) {
-    title.textContent = isEdit ? `Изменить «${idField.value}»` : "Новая бутылка";
-  }
-  if (submit !== null) {
-    submit.textContent = isEdit ? "Сохранить" : "Создать";
-  }
+/** Открыть редактор бутылки (окно ОС в Tauri, overlay в демо). */
+function openEditorWindow(id: string | null, state: string | null): void {
+  gui()
+    .openEditor(id, state)
+    .catch((error: unknown) => {
+      showToast(error instanceof Error ? error.message : String(error));
+    });
 }
 
 /**
@@ -543,34 +439,18 @@ export function mountApp(options?: { once?: boolean }): { noop: boolean } {
   document
     .querySelector<HTMLButtonElement>("#create-open")
     ?.addEventListener("click", () => {
-      resetForm();
-      syncKindFields();
-      switchScreen("create");
+      openEditorWindow(null, null);
     });
-  document
-    .querySelector<HTMLButtonElement>("#create-cancel")
-    ?.addEventListener("click", () => {
-      switchScreen(currentTab);
-    });
-  const form = document.querySelector<HTMLFormElement>("#create-form");
-  form?.addEventListener("submit", (event) => {
-    event.preventDefault();
-    void onCreateSubmit();
+  // Мутации БД из окна редактора: тост + обновление сетки (Task 16).
+  setBottlesChangedListener((payload) => {
+    const messages = {
+      created: `Бутылка ${payload.id} создана`,
+      updated: `Профиль ${payload.id} обновлён`,
+      deleted: `Бутылка ${payload.id} удалена`,
+    } as const;
+    showToast(messages[payload.action], "success");
+    void refreshBottles();
   });
-  document
-    .querySelector<HTMLButtonElement>("#create-reset")
-    ?.addEventListener("click", () => {
-      resetForm();
-      syncKindFields();
-    });
-  document
-    .querySelector<HTMLSelectElement>("#f-kind")
-    ?.addEventListener("change", syncKindFields);
-  document
-    .querySelector<HTMLButtonElement>("#f-config-pick")
-    ?.addEventListener("click", () => {
-      void pickConfigFile();
-    });
   document
     .querySelector<HTMLButtonElement>("#doctor-refresh")
     ?.addEventListener("click", () => {
@@ -615,7 +495,6 @@ export function mountApp(options?: { once?: boolean }): { noop: boolean } {
     ?.addEventListener("click", () => {
       switchScreen("doctor");
     });
-  syncKindFields();
   // Первичное наполнение: список из БД (демон не нужен), затем попытка
   // подключения к демону (упавший — не блокирует список).
   void refreshBottles().then(async () => {
@@ -639,24 +518,4 @@ export function mountApp(options?: { once?: boolean }): { noop: boolean } {
     }, WATCHDOG_MS);
   }
   return { noop: true };
-}
-
-/** Диалог выбора файла конфига (Tauri plugin-dialog; адаптер — в main.ts). */
-let openFileDialog: (() => Promise<string | null>) | null = null;
-
-export function setConfigFileDialog(fn: () => Promise<string | null>): void {
-  openFileDialog = fn;
-}
-
-async function pickConfigFile(): Promise<void> {
-  if (openFileDialog === null) {
-    return;
-  }
-  const path = await openFileDialog();
-  if (path !== null) {
-    const configField = document.querySelector<HTMLInputElement>("#f-config");
-    if (configField !== null) {
-      configField.value = path;
-    }
-  }
 }

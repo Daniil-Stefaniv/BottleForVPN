@@ -60,27 +60,6 @@ const HTML = `
     <div id="bottle-grid"></div>
     <p id="grid-empty" hidden></p>
   </section>
-  <section id="screen-create" class="screen" hidden>
-    <form id="create-form">
-      <h2 id="create-title">Новая бутылка</h2>
-      <fieldset id="section-vpn-env">
-        <select id="f-protocol"></select>
-        <div class="field env-field"><input id="f-config" /></div>
-      </fieldset>
-      <fieldset id="section-vpn-host" hidden>
-        <div class="field host-field" hidden><input id="f-vpn" /></div>
-      </fieldset>
-      <input id="f-id" />
-      <select id="f-kind">
-        <option value="env">env</option>
-        <option value="host">host</option>
-      </select>
-      <p id="create-error" hidden></p>
-      <button type="submit" id="create-submit">Создать</button>
-      <button type="button" id="create-reset">Новая бутылка</button>
-      <button type="button" id="create-cancel">Отмена</button>
-    </form>
-  </section>
   <section id="screen-doctor" class="screen" hidden>
     <p id="doctor-summary"></p>
     <button id="doctor-refresh" type="button">Проверить снова</button>
@@ -123,6 +102,10 @@ function makeGuiApi(overrides: Partial<GuiApi> = {}): GuiApi {
     daemonStats: vi.fn(async () => ({ ...STATS })),
     updateCredentials: vi.fn(async () => {}),
     logEvent: vi.fn(async () => {}),
+    openEditor: vi.fn(async () => {}),
+    getBottle: vi.fn(async () => null),
+    saveBottle: vi.fn(async () => {}),
+    deleteBottle: vi.fn(async () => {}),
     ...overrides,
   };
 }
@@ -490,5 +473,68 @@ describe("главное окно 0.3", () => {
     expect(
       document.querySelector<HTMLElement>("#grid-empty")?.hidden,
     ).toBe(false);
+  });
+
+  it("«+ Создать бутылку» и «Изменить» открывают редактор через мост", async () => {
+    const { app, backend } = await boot();
+    const api = makeGuiApi();
+    backend.setGuiApi(api);
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
+    });
+
+    document.querySelector<HTMLButtonElement>("#create-open")?.click();
+    await until(() => {
+      expect(api.openEditor).toHaveBeenCalledWith(null, null);
+    });
+
+    gridRow("office-a")
+      ?.querySelector<HTMLButtonElement>("[data-role=edit]")
+      ?.click();
+    await until(() => {
+      expect(api.openEditor).toHaveBeenCalledWith("office-a", "stopped");
+    });
+
+    // Поднятая бутылка передаёт состояние (баннер/запрет удаления в окне).
+    app.handleDaemonEvent({
+      StateChanged: {
+        id: "office-a",
+        state: "up",
+        detail: null,
+        socks5: null,
+        forwards: [],
+      },
+    });
+    gridRow("office-a")
+      ?.querySelector<HTMLButtonElement>("[data-role=edit]")
+      ?.click();
+    await until(() => {
+      expect(api.openEditor).toHaveBeenCalledWith("office-a", "up");
+    });
+  });
+
+  it("bottles-changed из окна редактора: тост и обновление сетки", async () => {
+    const { app, backend } = await boot();
+    const api = makeGuiApi();
+    backend.setGuiApi(api);
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
+    });
+    const callsBefore = (api.listBottles as ReturnType<typeof vi.fn>).mock
+      .calls.length;
+
+    backend.dispatchBottlesChanged({ action: "created", id: "office-c" });
+    await until(() => {
+      expect(document.querySelector("#toast")?.textContent).toBe(
+        "Бутылка office-c создана",
+      );
+    });
+    await until(() => {
+      expect(
+        (api.listBottles as ReturnType<typeof vi.fn>).mock.calls.length,
+      ).toBeGreaterThan(callsBefore);
+    });
   });
 });

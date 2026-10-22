@@ -70,6 +70,52 @@ export interface ForwardPort {
   target: string;
 }
 
+// --- Окно редактора бутылки (Task 16) ---------------------------------------
+
+/** Данные бутылки для формы редактора (команда `get_bottle`). */
+export interface BottleEditorDataWire {
+  profile: BottleProfile;
+  /** Сохранены ли логин/пароль в хранилище. */
+  has_credentials: boolean;
+  /** Текст конфига уже в БД (edit без нового файла сохранит его). */
+  has_config: boolean;
+}
+
+/** Контекст открытого редактора (команда `editor_context`). */
+export interface EditorContextWire {
+  /** `null` — создание новой бутылки. */
+  id: string | null;
+  /** Последнее известное состояние (up-бутылка — баннер и запрет удаления). */
+  state: string | null;
+}
+
+/** Аргументы команды `save_bottle` (форма редактора). */
+export interface SaveBottleArgsWire {
+  id: string;
+  name: string;
+  kind: "env" | "host";
+  is_edit: boolean;
+  protocol?: "wireguard" | "openvpn";
+  config_path?: string;
+  client?: string;
+  args?: string;
+  endpoints?: string[];
+  interface?: string;
+  socks5: number;
+  forwards: string[];
+  dns?: string;
+  launch?: string;
+  save_credentials: boolean;
+  username?: string;
+  password?: string;
+}
+
+/** Событие `bottles-changed` (эмитит Rust после мутации БД). */
+export interface BottlesChangedWire {
+  action: "created" | "updated" | "deleted";
+  id: string;
+}
+
 /** BottleState на проводе: строка-юнит или объект с причиной. */
 export type BottleStateWire =
   | string

@@ -6,9 +6,12 @@
 // демо-режим подставляют заглушки через setGuiApi.
 
 import type {
+  BottleEditorDataWire,
   BottleListRowWire,
+  BottlesChangedWire,
   DaemonEventWire,
   DaemonStatsWire,
+  SaveBottleArgsWire,
 } from "./ipc";
 
 /** API Rust-стороны GUI (команды из main.rs). */
@@ -27,6 +30,14 @@ export interface GuiApi {
   updateCredentials(id: string, username: string, password: string): Promise<void>;
   /** Запись в журнал GUI (коды — из реестра core::events). */
   logEvent(code: string, ctx: Record<string, unknown>): Promise<void>;
+  /** Открыть редактор бутылки (Task 16): окно ОС в Tauri, overlay в демо. */
+  openEditor(id: string | null, state: string | null): Promise<void>;
+  /** Профиль для формы редактирования; `null` — нет такой. */
+  getBottle(id: string): Promise<BottleEditorDataWire | null>;
+  /** «Создать»/«Сохранить» редактора: БД + синхронизация демону. */
+  saveBottle(args: SaveBottleArgsWire): Promise<void>;
+  /** Удаление из окна редактирования (БД + RemoveProfile демону). */
+  deleteBottle(id: string): Promise<void>;
 }
 
 let api: GuiApi | null = null;
@@ -66,6 +77,22 @@ export function setDaemonDisconnectListener(fn: (() => void) | null): void {
 
 export function dispatchDaemonDisconnected(): void {
   disconnectListener?.();
+}
+
+/** Подписчик на событие `bottles-changed` (мутация БД из окна редактора). */
+let bottlesChangedListener: ((payload: BottlesChangedWire) => void) | null =
+  null;
+
+export function setBottlesChangedListener(
+  fn: ((payload: BottlesChangedWire) => void) | null,
+): void {
+  bottlesChangedListener = fn;
+}
+
+/** Точка входа события из main-tauri.ts (listen("bottles-changed"))
+ * и из демо-редактора (overlay сохраняет локально). */
+export function dispatchBottlesChanged(payload: BottlesChangedWire): void {
+  bottlesChangedListener?.(payload);
 }
 
 /** Признак «демон не запущен» в ошибках команд 0.3. */

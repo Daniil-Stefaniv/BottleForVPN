@@ -12,8 +12,14 @@ import {
   setRevealInDir,
   switchScreen,
 } from "./app";
-import { setGuiApi } from "./backend";
-import type { BottleListRowWire, DaemonStatsWire } from "./ipc";
+import { dispatchBottlesChanged, setGuiApi } from "./backend";
+import { mountEditor, setEditorHost } from "./editor";
+import type {
+  BottleEditorDataWire,
+  BottleListRowWire,
+  DaemonStatsWire,
+  SaveBottleArgsWire,
+} from "./ipc";
 import { setBottleInvoker } from "./ipc";
 import type { BottleOutput } from "./ipc";
 
@@ -83,6 +89,74 @@ const runtime = new Map<string, DemoRuntime>([
     },
   ],
   ["legacy-ac", { state: "stopped", detail: null, socks5: null, forwards: [] }],
+]);
+
+/** Данные редактора для демо-бутылок (getBottle в overlay-режиме). */
+const DEMO_EDITOR = new Map<string, BottleEditorDataWire>([
+  [
+    "office-a",
+    {
+      profile: {
+        id: "office-a",
+        name: "Офис А (WireGuard)",
+        kind: "env",
+        vpn: { protocol: "wireguard", config: "wg-office-a.conf" },
+        expose: {
+          socks5: 55123,
+          forwards: [{ listen: 13389, target: "10.20.30.15:3389" }],
+          dns: "10.20.30.1",
+          launch: "mstsc /v:127.0.0.1:13389",
+        },
+      },
+      has_credentials: false,
+      has_config: true,
+    },
+  ],
+  [
+    "office-b",
+    {
+      profile: {
+        id: "office-b",
+        name: "Офис Б (OpenVPN)",
+        kind: "env",
+        vpn: { protocol: "openvpn", config: "office-b.ovpn" },
+        expose: { socks5: 0, forwards: [], dns: null, launch: null },
+      },
+      has_credentials: true,
+      has_config: true,
+    },
+  ],
+  [
+    "corp-test",
+    {
+      profile: {
+        id: "corp-test",
+        name: "Тестовый контур",
+        kind: "env",
+        vpn: { protocol: "openvpn", config: "corp-test.ovpn" },
+        expose: { socks5: 0, forwards: [], dns: null, launch: null },
+      },
+      has_credentials: false,
+      has_config: true,
+    },
+  ],
+  [
+    "legacy-ac",
+    {
+      profile: {
+        id: "legacy-ac",
+        name: "Legacy Cisco AnyConnect",
+        kind: "host",
+        vpn: {
+          client: "C:\\vpn\\anyconnect.exe",
+          endpoints: ["vpn.legacy.example.com"],
+        },
+        expose: { socks5: 0, forwards: [], dns: null, launch: null },
+      },
+      has_credentials: false,
+      has_config: false,
+    },
+  ],
 ]);
 
 /** Демон «жив» в демо (режим down переводит в false). */
@@ -212,8 +286,103 @@ export function mountDemo(down: boolean, view?: string | null): void {
         throw new Error(`бутылка не найдена: ${id}`);
       }
       profile.has_credentials = true;
+      const data = DEMO_EDITOR.get(id);
+      if (data !== undefined) {
+        data.has_credentials = true;
+      }
     },
     logEvent: async () => {},
+    // Редактор в демо — overlay поверх главного (нет Tauri): та же
+    // форма editor.ts, но окно ОС заменяет затемнённая подложка.
+    openEditor: async (id, state) => {
+      const overlay = document.createElement("div");
+      overlay.className = "editor-overlay";
+      const panel = document.createElement("div");
+      panel.className = "editor-panel";
+      overlay.append(panel);
+      document.body.append(overlay);
+      setEditorHost({
+        context: async () => ({ id, state }),
+        pickConfig: async () => "C:\\vpn\\demo-config.conf",
+        close: () => {
+          overlay.remove();
+        },
+      });
+      await mountEditor(panel);
+    },
+    getBottle: async (id) => DEMO_EDITOR.get(id) ?? null,
+    saveBottle: async (args: SaveBottleArgsWire) => {
+      const existing = PROFILES.find((row) => row.id === args.id);
+      if (!args.is_edit && existing !== undefined) {
+        throw new Error(
+          `бутылка с id «${args.id}» уже существует — выберите другой id`,
+        );
+      }
+      if (args.is_edit && existing === undefined) {
+        throw new Error(`бутылка не найдена: ${args.id}`);
+      }
+      const hasCreds =
+        (existing?.has_credentials ?? false) || args.save_credentials;
+      const row: BottleListRowWire = {
+        id: args.id,
+        name: args.name,
+        kind: args.kind,
+        protocol: args.kind === "env" ? (args.protocol ?? "wireguard") : null,
+        has_credentials: hasCreds,
+      };
+      if (existing === undefined) {
+        PROFILES.push(row);
+        runtime.set(args.id, {
+          state: "stopped",
+          detail: null,
+          socks5: null,
+          forwards: [],
+        });
+      } else {
+        Object.assign(existing, row);
+      }
+      DEMO_EDITOR.set(args.id, {
+        profile: {
+          id: args.id,
+          name: args.name,
+          kind: args.kind,
+          vpn:
+            args.kind === "env"
+              ? {
+                  protocol: args.protocol ?? "wireguard",
+                  config: args.config_path ?? `${args.id}.conf`,
+                }
+              : {
+                  client: args.client ?? "",
+                  args: args.args,
+                  endpoints: args.endpoints ?? [],
+                  interface: args.interface,
+                },
+          expose: {
+            socks5: args.socks5,
+            forwards: args.forwards.map((target) => ({ listen: 0, target })),
+            dns: args.dns ?? null,
+            launch: args.launch ?? null,
+          },
+        },
+        has_credentials: hasCreds,
+        has_config: args.kind === "env",
+      });
+      dispatchBottlesChanged({
+        action: args.is_edit ? "updated" : "created",
+        id: args.id,
+      });
+    },
+    deleteBottle: async (id) => {
+      const index = PROFILES.findIndex((row) => row.id === id);
+      if (index === -1) {
+        throw new Error(`бутылка не найдена: ${id}`);
+      }
+      PROFILES.splice(index, 1);
+      DEMO_EDITOR.delete(id);
+      runtime.delete(id);
+      dispatchBottlesChanged({ action: "deleted", id });
+    },
   });
 
   // CLI-мост нужен только экрану «Диагностика» (doctor/logs) — в 0.3

@@ -407,6 +407,372 @@ async fn update_credentials(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Окно редактора бутылки (Task 16, спека §3.3): дочернее окно ОС поверх
+// заблокированного главного. Контекст (id + состояние) — через EditorState,
+// данные и мутации — командами get_bottle/save_bottle/delete_bottle.
+// ---------------------------------------------------------------------------
+
+/// Контекст открытого редактора: какую бутылку править (`None` — создание)
+/// и её последнее известное состояние (поднятая — баннер «изменения
+/// применятся после перезапуска», удаление запрещено).
+#[derive(Default, Clone, serde::Serialize)]
+struct EditorContext {
+    id: Option<String>,
+    state: Option<String>,
+}
+
+#[derive(Default)]
+struct EditorState {
+    context: std::sync::Mutex<EditorContext>,
+}
+
+/// Данные бутылки для формы редактора (`get_bottle`).
+#[derive(serde::Serialize)]
+struct BottleEditorData {
+    profile: bottle_core::profile::BottleProfile,
+    /// Сохранены ли логин/пароль (форма пишет «уже в хранилище»).
+    has_credentials: bool,
+    /// Текст конфига уже в БД: edit без выбора нового файла сохранит его.
+    has_config: bool,
+}
+
+/// Аргументы `save_bottle` из формы редактора (JS шлёт camelCase,
+/// Tauri конвертирует в snake_case поля).
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SaveBottleArgs {
+    id: String,
+    name: String,
+    kind: bottle_core::profile::BottleKind,
+    /// `true` — обновление существующей (id readonly), `false` —
+    /// создание (дубль id — ошибка, Review Focus #5).
+    is_edit: bool,
+    // env:
+    protocol: Option<bottle_core::profile::TunnelProtocol>,
+    /// Файл конфига, выбранный пользователем; `None` при edit —
+    /// оставить сохранённый в БД.
+    config_path: Option<String>,
+    // host:
+    client: Option<String>,
+    args: Option<String>,
+    endpoints: Option<Vec<String>>,
+    interface: Option<String>,
+    // expose:
+    socks5: u16,
+    /// Цели пробросов `host:port` (порт слушателя назначит демон).
+    forwards: Vec<String>,
+    dns: Option<String>,
+    launch: Option<String>,
+    // Второй шаг OpenVPN («сохранить логин и пароль»):
+    save_credentials: bool,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+/// Собирает `FullProfile` из аргументов формы: валидация id, чтение
+/// конфига (при edit без нового файла — прежний из БД), разбор
+/// пробросов и DNS. Чистая функция — тесты без Tauri (бриф Step 1).
+fn build_full_profile(
+    args: &SaveBottleArgs,
+    existing: Option<&bottle_core::ipc::FullProfile>,
+    read_config: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<bottle_core::ipc::FullProfile, String> {
+    use bottle_core::profile::{BottleKind, ExposeConfig, ForwardSpec, VpnConfig};
+
+    let id = args.id.trim();
+    if id.is_empty() {
+        return Err("идентификатор обязателен".to_string());
+    }
+    let valid_id = id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+    if !valid_id {
+        return Err(
+            "идентификатор: строчные латинские буквы, цифры и дефис; \
+             начинается с буквы или цифры"
+                .to_string(),
+        );
+    }
+    let name = args.name.trim();
+    if name.is_empty() {
+        return Err("имя бутылки обязательно".to_string());
+    }
+
+    let mut read_config = Some(read_config);
+    let (vpn, config_text) = match args.kind {
+        BottleKind::Env => {
+            let protocol = args
+                .protocol
+                .unwrap_or(bottle_core::profile::TunnelProtocol::WireGuard);
+            // Правка без нового файла: имя и текст конфига — прежние.
+            let previous = existing.and_then(|full| match &full.profile.vpn {
+                VpnConfig::Env { config, .. } => {
+                    Some((config.clone(), full.config_text.clone()))
+                }
+                VpnConfig::Host { .. } => None,
+            });
+            let (config_name, text) = match &args.config_path {
+                Some(path) if !path.trim().is_empty() => {
+                    let text = read_config.take().expect("read_config вызывается раз")(path)?;
+                    // Имя файла — по обоим разделителям: приложение живёт
+                    // на Windows (пути с `\`), тесты гоняются и на Unix.
+                    let file_name = path
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(path)
+                        .to_string();
+                    (file_name, Some(text))
+                }
+                _ => previous.unwrap_or_default(),
+            };
+            let text =
+                text.ok_or_else(|| "укажите файл конфигурации туннеля".to_string())?;
+            (
+                VpnConfig::Env {
+                    protocol,
+                    config: config_name,
+                },
+                Some(text),
+            )
+        }
+        BottleKind::Host => {
+            let client = args.client.clone().unwrap_or_default();
+            if client.trim().is_empty() {
+                return Err("укажите VPN-клиент (путь к исполняемому файлу)".to_string());
+            }
+            (
+                VpnConfig::Host {
+                    client: client.trim().to_string(),
+                    args: args.args.clone().filter(|a| !a.trim().is_empty()),
+                    endpoints: args
+                        .endpoints
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|e| e.trim().to_string())
+                        .filter(|e| !e.is_empty())
+                        .collect(),
+                    interface: args.interface.clone().filter(|i| !i.trim().is_empty()),
+                },
+                None,
+            )
+        }
+    };
+
+    let mut forwards = Vec::new();
+    for target in &args.forwards {
+        let target = target.trim();
+        if target.is_empty() {
+            continue;
+        }
+        let valid = target
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+        if !valid {
+            return Err(format!("проброс «{target}»: ожидается формат host:port"));
+        }
+        forwards.push(ForwardSpec {
+            listen: 0,
+            target: target.to_string(),
+        });
+    }
+    let dns = match &args.dns {
+        Some(value) if !value.trim().is_empty() => Some(
+            value
+                .trim()
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| format!("DNS «{value}»: ожидается IP-адрес"))?,
+        ),
+        _ => None,
+    };
+    let credentials = if args.save_credentials {
+        let username = args.username.clone().unwrap_or_default();
+        if username.trim().is_empty() {
+            return Err("укажите логин для сохранения в хранилище".to_string());
+        }
+        Some(bottle_core::ipc::VpnCredentials {
+            username: username.trim().to_string(),
+            password: args.password.clone().unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+    Ok(bottle_core::ipc::FullProfile {
+        profile: bottle_core::profile::BottleProfile {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: args.kind,
+            vpn,
+            expose: ExposeConfig {
+                socks5: args.socks5,
+                forwards,
+                dns,
+                launch: args.launch.clone().filter(|l| !l.trim().is_empty()),
+            },
+        },
+        config_text,
+        credentials,
+    })
+}
+
+/// Контекст для окна редактора (вызывается редактором при загрузке).
+#[tauri::command]
+fn editor_context(state: tauri::State<'_, EditorState>) -> EditorContext {
+    state.context.lock().expect("editor не отравлен").clone()
+}
+
+/// Профиль бутылки для формы редактирования; `None` — нет такой.
+#[tauri::command]
+fn get_bottle(
+    vault: tauri::State<'_, VaultState>,
+    id: &str,
+) -> Result<Option<BottleEditorData>, String> {
+    let guard = unlocked_vault(&vault)?;
+    let full = guard.as_ref().expect("проверено выше").get_full(id)?;
+    Ok(full.map(|full| BottleEditorData {
+        has_credentials: full.credentials.is_some(),
+        has_config: full.config_text.is_some(),
+        profile: full.profile,
+    }))
+}
+
+/// «Создать»/«Сохранить» редактора: профиль в БД одной транзакцией,
+/// точечная синхронизация демону (недоступен — доедет при connect),
+/// событие `bottles-changed` главному окну.
+#[tauri::command]
+async fn save_bottle(
+    app: tauri::AppHandle,
+    daemon: tauri::State<'_, DaemonHandle>,
+    vault: tauri::State<'_, VaultState>,
+    log: tauri::State<'_, gui_log::GuiLog>,
+    args: SaveBottleArgs,
+) -> Result<(), String> {
+    let existing = {
+        let guard = unlocked_vault(&vault)?;
+        guard.as_ref().expect("проверено выше").get_full(&args.id)?
+    };
+    if args.is_edit && existing.is_none() {
+        return Err(format!("бутылка не найдена: {}", args.id));
+    }
+    let full = build_full_profile(&args, existing.as_ref(), |path| {
+        std::fs::read_to_string(path)
+            .map_err(|error| format!("не удалось прочитать файл конфигурации «{path}»: {error}"))
+    })?;
+    {
+        let guard = unlocked_vault(&vault)?;
+        let vault = guard.as_ref().expect("проверено выше");
+        if args.is_edit {
+            vault.update_bottle(&full)?;
+        } else {
+            vault.create_bottle(&full)?;
+        }
+    }
+    let mut ctx = serde_json::Map::new();
+    ctx.insert("id".to_string(), full.profile.id.clone().into());
+    let _ = log.emit(
+        if args.is_edit {
+            "bottle.updated"
+        } else {
+            "bottle.created"
+        },
+        ctx,
+    );
+    let _ = control_request(
+        daemon.token(),
+        bottle_core::ipc::GuiRequest::UpsertProfile {
+            profile: Box::new(full.clone()),
+        },
+    )
+    .await;
+    use tauri::Emitter as _;
+    let _ = app.emit(
+        "bottles-changed",
+        serde_json::json!({
+            "action": if args.is_edit { "updated" } else { "created" },
+            "id": full.profile.id,
+        }),
+    );
+    Ok(())
+}
+
+/// Удаление из окна редактирования (поднятую бутылку фронт не даёт
+/// удалить — кнопка погашена): БД + `RemoveProfile` демону.
+#[tauri::command]
+async fn delete_bottle(
+    app: tauri::AppHandle,
+    daemon: tauri::State<'_, DaemonHandle>,
+    vault: tauri::State<'_, VaultState>,
+    log: tauri::State<'_, gui_log::GuiLog>,
+    id: &str,
+) -> Result<(), String> {
+    {
+        let guard = unlocked_vault(&vault)?;
+        guard.as_ref().expect("проверено выше").delete_bottle(id)?;
+    }
+    let mut ctx = serde_json::Map::new();
+    ctx.insert("id".to_string(), id.into());
+    let _ = log.emit("bottle.deleted", ctx);
+    let _ = control_request(
+        daemon.token(),
+        bottle_core::ipc::GuiRequest::RemoveProfile { id: id.to_string() },
+    )
+    .await;
+    use tauri::Emitter as _;
+    let _ = app.emit(
+        "bottles-changed",
+        serde_json::json!({ "action": "deleted", "id": id }),
+    );
+    Ok(())
+}
+
+/// Открывает редактор бутылки: дочернее окно ОС поверх главного;
+/// главное блокируется (`set_enabled`) до закрытия редактора (спека
+/// §3.3, п.8). Уже открыто — фокус на нём.
+#[tauri::command]
+fn open_editor(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, EditorState>,
+    id: Option<String>,
+    bottle_state: Option<String>,
+) -> Result<(), String> {
+    use tauri::Manager as _;
+    if let Some(window) = app.get_webview_window("editor") {
+        let _ = window.set_focus();
+        return Ok(());
+    }
+    *state.context.lock().expect("editor не отравлен") = EditorContext {
+        id,
+        state: bottle_state,
+    };
+    let parent = app
+        .get_webview_window("main")
+        .ok_or_else(|| "главное окно не найдено".to_string())?;
+    let parent_for_close = parent.clone();
+    let editor = tauri::WebviewWindowBuilder::new(
+        &app,
+        "editor",
+        tauri::WebviewUrl::App("editor.html".into()),
+    )
+    .title("Погребок — бутылка")
+    .inner_size(620.0, 700.0)
+    .min_inner_size(480.0, 560.0)
+    .always_on_top(true)
+    .build()
+    .map_err(|error| format!("не удалось открыть окно редактора: {error}"))?;
+    parent
+        .set_enabled(false)
+        .map_err(|error| format!("не удалось заблокировать главное окно: {error}"))?;
+    editor.on_window_event(move |event| {
+        if let tauri::WindowEvent::Destroyed = event {
+            let _ = parent_for_close.set_enabled(true);
+        }
+    });
+    Ok(())
+}
+
 /// Подтверждённый выход: шлёт демону `Shutdown` (стоп бутылок → выход)
 /// и завершает GUI. Демон недоступен/не наш — просто выходим.
 #[tauri::command]
@@ -448,6 +814,7 @@ fn main() {
         .manage(TrayState { enabled: with_tray })
         .manage(VaultState::default())
         .manage(DaemonLink::default())
+        .manage(EditorState::default())
         // Журнал GUI: файл не открылся — работаем с буфером в памяти.
         .manage(
             gui_log::GuiLog::logs_dir()
@@ -475,7 +842,12 @@ fn main() {
             stop_bottle,
             stop_daemon,
             daemon_stats,
-            update_credentials
+            update_credentials,
+            editor_context,
+            get_bottle,
+            save_bottle,
+            delete_bottle,
+            open_editor
         ])
         .setup(move |app| {
             if with_tray {
@@ -508,5 +880,162 @@ mod tests {
         assert!(text.contains("office-a"), "{text}");
         assert!(text.contains("client-b"), "{text}");
         assert!(text.contains("будут остановлены"), "{text}");
+    }
+
+    // --- build_full_profile (Task 16, бриф Step 1) --------------------------
+
+    use bottle_core::profile::{BottleKind, TunnelProtocol, VpnConfig};
+
+    fn args_env() -> SaveBottleArgs {
+        SaveBottleArgs {
+            id: "office-a".to_string(),
+            name: "Офис А".to_string(),
+            kind: BottleKind::Env,
+            is_edit: false,
+            protocol: Some(TunnelProtocol::WireGuard),
+            config_path: Some(r"C:\vpn\wg-office.conf".to_string()),
+            client: None,
+            args: None,
+            endpoints: None,
+            interface: None,
+            socks5: 0,
+            forwards: vec!["10.20.30.15:3389".to_string()],
+            dns: Some("10.20.30.1".to_string()),
+            launch: Some("mstsc".to_string()),
+            save_credentials: false,
+            username: None,
+            password: None,
+        }
+    }
+
+    /// env-create: конфиг читается из выбранного файла, имя конфига —
+    /// имя файла; пробросы и DNS разобраны.
+    #[test]
+    fn build_env_create_reads_config_file() {
+        let full = build_full_profile(&args_env(), None, |path| {
+            assert_eq!(path, r"C:\vpn\wg-office.conf");
+            Ok("[Interface]\nPrivateKey = SECRET\n".to_string())
+        })
+        .unwrap();
+        assert_eq!(full.profile.id, "office-a");
+        assert_eq!(
+            full.profile.vpn,
+            VpnConfig::Env {
+                protocol: TunnelProtocol::WireGuard,
+                config: "wg-office.conf".to_string()
+            }
+        );
+        assert_eq!(
+            full.config_text.as_deref(),
+            Some("[Interface]\nPrivateKey = SECRET\n")
+        );
+        assert_eq!(full.profile.expose.forwards.len(), 1);
+        assert_eq!(full.profile.expose.forwards[0].listen, 0);
+        assert_eq!(
+            full.profile.expose.dns,
+            Some("10.20.30.1".parse().unwrap())
+        );
+        assert!(full.credentials.is_none());
+    }
+
+    /// env-create без файла конфига — понятная ошибка.
+    #[test]
+    fn build_env_create_without_config_is_error() {
+        let mut args = args_env();
+        args.config_path = None;
+        let error = build_full_profile(&args, None, |_| unreachable!()).unwrap_err();
+        assert!(error.contains("файл конфигурации"), "{error}");
+    }
+
+    /// env-edit без нового файла: имя и текст конфига остаются прежними
+    /// (пользователь не перевыбирал файл).
+    #[test]
+    fn build_env_edit_keeps_stored_config() {
+        let existing = build_full_profile(&args_env(), None, |_| {
+            Ok("OLD CONFIG".to_string())
+        })
+        .unwrap();
+        let mut args = args_env();
+        args.is_edit = true;
+        args.config_path = None;
+        args.name = "Переименованная".to_string();
+        let full = build_full_profile(&args, Some(&existing), |_| {
+            panic!("файл не читается, если не перевыбрали")
+        })
+        .unwrap();
+        assert_eq!(full.config_text.as_deref(), Some("OLD CONFIG"));
+        assert_eq!(
+            full.profile.vpn,
+            VpnConfig::Env {
+                protocol: TunnelProtocol::WireGuard,
+                config: "wg-office.conf".to_string()
+            }
+        );
+        assert_eq!(full.profile.name, "Переименованная");
+    }
+
+    /// host-create: клиент обязателен; конфиг не пишется (даже если
+    /// бутылка правится из env — призрака не остаётся).
+    #[test]
+    fn build_host_requires_client_and_drops_config() {
+        let mut args = args_env();
+        args.kind = BottleKind::Host;
+        args.config_path = None;
+        let error = build_full_profile(&args, None, |_| unreachable!()).unwrap_err();
+        assert!(error.contains("VPN-клиент"), "{error}");
+
+        args.client = Some(r"C:\vpn\cisco.exe".to_string());
+        args.endpoints = Some(vec![" vpn.example.com ".to_string(), String::new()]);
+        let full = build_full_profile(&args, None, |_| unreachable!()).unwrap();
+        assert_eq!(
+            full.profile.vpn,
+            VpnConfig::Host {
+                client: r"C:\vpn\cisco.exe".to_string(),
+                args: None,
+                endpoints: vec!["vpn.example.com".to_string()],
+                interface: None,
+            }
+        );
+        assert!(full.config_text.is_none());
+    }
+
+    /// Кривой проброс и кривой DNS — ошибки с указанием значения.
+    #[test]
+    fn build_rejects_bad_forward_and_dns() {
+        let mut args = args_env();
+        args.forwards = vec!["без-порта".to_string()];
+        let error = build_full_profile(&args, None, |_| Ok("x".to_string())).unwrap_err();
+        assert!(error.contains("host:port"), "{error}");
+
+        let mut args = args_env();
+        args.dns = Some("не-ip".to_string());
+        let error = build_full_profile(&args, None, |_| Ok("x".to_string())).unwrap_err();
+        assert!(error.contains("DNS"), "{error}");
+    }
+
+    /// Чекбокс «сохранить логин и пароль» без логина — ошибка;
+    /// с логином — креды в профиль (демон получит в память).
+    #[test]
+    fn build_credentials_step() {
+        let mut args = args_env();
+        args.save_credentials = true;
+        let error = build_full_profile(&args, None, |_| Ok("x".to_string())).unwrap_err();
+        assert!(error.contains("логин"), "{error}");
+
+        args.username = Some(" vpn-user ".to_string());
+        args.password = Some("s3cret".to_string());
+        let full = build_full_profile(&args, None, |_| Ok("x".to_string())).unwrap();
+        let creds = full.credentials.expect("креды собраны");
+        assert_eq!(creds.username, "vpn-user");
+        assert_eq!(creds.password, "s3cret");
+    }
+
+    /// Невалидный id — ошибка до чтения файла (дешёвая проверка).
+    #[test]
+    fn build_rejects_invalid_id() {
+        let mut args = args_env();
+        args.id = "Офис А".to_string();
+        let error = build_full_profile(&args, None, |_| unreachable!()).unwrap_err();
+        assert!(error.contains("идентификатор"), "{error}");
     }
 }
