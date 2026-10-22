@@ -12,6 +12,7 @@ mod bottle;
 mod daemon;
 mod daemon_client;
 mod db;
+mod gui_log;
 mod tray;
 
 use daemon::DaemonHandle;
@@ -78,6 +79,27 @@ fn quit_confirm(active: Vec<String>) -> String {
     quit_confirm_text(&active)
 }
 
+/// Фронтенд логирует действие пользователя: код из реестра событий,
+/// `src` всегда `gui`. Неизвестный код — ошибка (реестр един).
+#[tauri::command]
+fn log_event(
+    state: tauri::State<'_, gui_log::GuiLog>,
+    code: &str,
+    ctx: serde_json::Value,
+) -> Result<(), String> {
+    let ctx = match ctx {
+        serde_json::Value::Object(map) => map,
+        _ => Default::default(),
+    };
+    state.emit(code, ctx)
+}
+
+/// Буфер журнала GUI для слияния лент в консоли «Диагностики».
+#[tauri::command]
+fn gui_log_recent(state: tauri::State<'_, gui_log::GuiLog>) -> Vec<bottle_core::events::Event> {
+    state.recent()
+}
+
 /// Подтверждённый выход: шлёт демону `Shutdown` (стоп бутылок → выход)
 /// и завершает GUI. Демон недоступен/не наш — просто выходим.
 #[tauri::command]
@@ -117,6 +139,12 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .manage(DaemonHandle::default())
         .manage(TrayState { enabled: with_tray })
+        // Журнал GUI: файл не открылся — работаем с буфером в памяти.
+        .manage(
+            gui_log::GuiLog::logs_dir()
+                .and_then(|dir| gui_log::GuiLog::init(&dir).ok())
+                .unwrap_or_else(gui_log::GuiLog::memory_only),
+        )
         .invoke_handler(tauri::generate_handler![
             run_bottle,
             start_daemon,
@@ -124,7 +152,9 @@ fn main() {
             update_tray,
             tray_enabled,
             quit_confirm,
-            confirm_quit
+            confirm_quit,
+            log_event,
+            gui_log_recent
         ])
         .setup(move |app| {
             if with_tray {
