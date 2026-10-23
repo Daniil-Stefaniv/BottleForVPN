@@ -11,6 +11,7 @@ import type {
   BottlesChangedWire,
   DaemonEventWire,
   DaemonStatsWire,
+  EventWire,
   SaveBottleArgsWire,
 } from "./ipc";
 
@@ -30,6 +31,10 @@ export interface GuiApi {
   updateCredentials(id: string, username: string, password: string): Promise<void>;
   /** Запись в журнал GUI (коды — из реестра core::events). */
   logEvent(code: string, ctx: Record<string, unknown>): Promise<void>;
+  /** Последние события журнала GUI (консоль Диагностики, Task 17). */
+  guiLogRecent(): Promise<EventWire[]>;
+  /** Папка журналов («Открыть папку логов»). */
+  logsDir(): Promise<string>;
   /** Открыть редактор бутылки (Task 16): окно ОС в Tauri, overlay в демо. */
   openEditor(id: string | null, state: string | null): Promise<void>;
   /** Профиль для формы редактирования; `null` — нет такой. */

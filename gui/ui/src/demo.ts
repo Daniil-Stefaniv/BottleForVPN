@@ -292,6 +292,33 @@ export function mountDemo(down: boolean, view?: string | null): void {
       }
     },
     logEvent: async () => {},
+    guiLogRecent: async () => [
+      {
+        ts: new Date(Date.now() - 50_000).toISOString(),
+        level: "info",
+        src: "gui",
+        event: "db.unlocked",
+        desc: "Хранилище разблокировано",
+        ctx: {},
+      },
+      {
+        ts: new Date(Date.now() - 40_000).toISOString(),
+        level: "info",
+        src: "gui",
+        event: "bottle.start.requested",
+        desc: "Пользователь запустил бутылку office-a",
+        ctx: { id: "office-a" },
+      },
+      {
+        ts: new Date(Date.now() - 30_000).toISOString(),
+        level: "warn",
+        src: "gui",
+        event: "daemon.disconnected",
+        desc: "Потеряно соединение с демоном, переподключение…",
+        ctx: {},
+      },
+    ],
+    logsDir: async () => "/tmp/pogrebok-logs-demo",
     // Редактор в демо — overlay поверх главного (нет Tauri): та же
     // форма editor.ts, но окно ОС заменяет затемнённая подложка.
     openEditor: async (id, state) => {

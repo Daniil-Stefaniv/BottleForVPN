@@ -1229,3 +1229,199 @@ button.copy {
   font-size: 0.85rem;
   cursor: pointer;
 }
+
+/* ── Диагностика: статус-карты и живая консоль (0.3, Task 17) ──── */
+
+#stats-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+
+.stat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+}
+
+.stat-title {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-muted);
+}
+
+.stat-value {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.stat-hint {
+  font-size: 0.72rem;
+  color: var(--fg-muted);
+}
+
+#console {
+  display: flex;
+  flex-direction: column;
+  min-height: 220px;
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+#console-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+
+.chips {
+  display: flex;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+}
+
+.chip {
+  font: inherit;
+  font-size: 0.7rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.chip.on {
+  border-color: var(--primary);
+  color: var(--primary);
+  font-weight: 600;
+}
+
+#console-search {
+  flex: 1;
+  min-width: 140px;
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.25rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+}
+
+#console-pause {
+  font: inherit;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+#console-pause.on {
+  border-color: var(--state-transit);
+  color: var(--state-transit);
+  font-weight: 600;
+}
+
+.console-row {
+  display: grid;
+  grid-template-columns: 70px 58px 64px minmax(120px, 200px) minmax(0, 1fr);
+  gap: 0.6rem;
+  padding: 0.14rem 0.6rem;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  align-items: baseline;
+}
+
+.console-head {
+  font-family: var(--font);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-muted);
+  border-bottom: 1px solid var(--border);
+  padding: 0.3rem 0.6rem;
+}
+
+#console-list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 120px;
+  max-height: 320px;
+}
+
+.console-row .c-time {
+  color: var(--fg-muted);
+}
+
+.console-row .c-event {
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.console-row .c-desc {
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.c-level {
+  font-weight: 700;
+}
+
+.lv-debug { color: var(--fg-muted); }
+.lv-info { color: var(--state-up); }
+.lv-warn { color: var(--state-transit); }
+.lv-error { color: var(--state-failed); }
+.lv-fatal { color: var(--state-failed); }
+
+.console-row.lvl-warn { background: color-mix(in srgb, var(--state-transit) 6%, transparent); }
+.console-row.lvl-error,
+.console-row.lvl-fatal { background: color-mix(in srgb, var(--state-failed) 7%, transparent); }
+
+#console-foot {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  border-top: 1px solid var(--border);
+  background: var(--bg-subtle);
+  font-size: 0.72rem;
+}
+
+#console-foot .spacer {
+  flex: 1;
+}
+
+#console-foot button {
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+#console-foot button:hover {
+  background: var(--bg-accent);
+}

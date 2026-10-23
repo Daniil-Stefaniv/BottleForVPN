@@ -22,6 +22,8 @@ function makeGuiApi(overrides: Partial<GuiApi> = {}): GuiApi {
     daemonStats: vi.fn(async () => {
       throw new Error("не нужен в тестах редактора");
     }),
+    guiLogRecent: vi.fn(async () => []),
+    logsDir: vi.fn(async () => "/tmp/pogrebok-logs"),
     updateCredentials: vi.fn(async () => {}),
     logEvent: vi.fn(async () => {}),
     openEditor: vi.fn(async () => {}),

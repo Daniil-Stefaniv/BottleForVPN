@@ -8,6 +8,7 @@ import type {
   BottleEditorDataWire,
   BottleListRowWire,
   DaemonStatsWire,
+  EventWire,
   SaveBottleArgsWire,
 } from "./ipc";
 
@@ -23,6 +24,8 @@ export function makeTauriGuiApi(): GuiApi {
     updateCredentials: (id, username, password) =>
       invoke<void>("update_credentials", { id, username, password }),
     logEvent: (code, ctx) => invoke<void>("log_event", { code, ctx }),
+    guiLogRecent: () => invoke<EventWire[]>("gui_log_recent"),
+    logsDir: () => invoke<string>("logs_dir"),
     openEditor: (id, state) =>
       invoke<void>("open_editor", { id, bottleState: state }),
     getBottle: (id) => invoke<BottleEditorDataWire | null>("get_bottle", { id }),

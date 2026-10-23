@@ -39,7 +39,6 @@
             </div>
             <div class="doctor-actions">
               <button id="doctor-refresh" type="button">Проверить снова</button>
-              <button id="logs-export" type="button">Собрать логи</button>
               <button id="appliance-upgrade" type="button" title="Пере-импорт аплаенса из свежего rootfs (бутылки должны быть остановлены)">
                 Обновить аплаенс
               </button>
@@ -48,9 +47,37 @@
               </button>
             </div>
           </div>
+
+          <!-- Статус-карты (0.3): daemon_stats по таймеру при живом демоне. -->
+          <div id="stats-cards"></div>
+
+          <!-- Живая консоль: единая лента событий демона и GUI. -->
+          <div id="console">
+            <div id="console-toolbar">
+              <div class="chips" id="chips-src"></div>
+              <div class="chips" id="chips-level"></div>
+              <div class="chips" id="chips-cat"></div>
+              <input id="console-search" placeholder="Поиск по событиям…" />
+              <button id="console-pause" type="button">Пауза</button>
+            </div>
+            <div class="console-row console-head">
+              <span>Время</span>
+              <span>Уровень</span>
+              <span>Источник</span>
+              <span>Событие</span>
+              <span>Описание</span>
+            </div>
+            <div id="console-list"></div>
+            <div id="console-foot">
+              <button id="logs-export" type="button">Собрать логи (ZIP)</button>
+              <button id="logs-open-dir" type="button">Открыть папку логов</button>
+              <span class="spacer"></span>
+              <span id="console-count" class="muted"></span>
+            </div>
+          </div>
+
           <div id="doctor-list"></div>
           <p id="logs-path" hidden></p>
-          <button id="logs-open-dir" hidden>Открыть папку</button>
         </div>
       </section>
 

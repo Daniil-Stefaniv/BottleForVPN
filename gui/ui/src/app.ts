@@ -13,6 +13,7 @@ import {
   type BottleRow,
 } from "./list";
 import { askCredentials } from "./creds";
+import { mountConsole, type ConsoleHandle } from "./console";
 import { collectLogs, loadDoctor } from "./doctor";
 
 /** API спавна демона (Rust-команда start_daemon), подменяется в тестах. */
@@ -349,23 +350,50 @@ export function switchScreen(screen: string): void {
     section.hidden = section.id !== sectionId;
   }
   if (screen === "doctor") {
+    mountDoctorConsole();
     loadDoctor().catch((error: unknown) => {
       showToast(error instanceof Error ? error.message : String(error));
     });
+  } else {
+    destroyDoctorConsole();
   }
   if (screen === "env" || screen === "host") {
     renderAll(rowsCache);
   }
 }
 
-/** «Собрать логи»: путь + кнопка «Открыть папку» (Tauri opener). */
+/** Консоль Диагностики (Task 17): живёт, только пока вкладка открыта. */
+let doctorConsole: ConsoleHandle | null = null;
+
+function mountDoctorConsole(): void {
+  if (doctorConsole !== null) {
+    return;
+  }
+  const rootEl = document.querySelector<HTMLElement>("#screen-doctor");
+  if (rootEl === null) {
+    return;
+  }
+  doctorConsole = mountConsole(rootEl, {
+    daemonFeed: () => [...daemonLogFeed],
+    guiRecent: () => gui().guiLogRecent(),
+    onDaemonEvent: (fn) => {
+      setDaemonLogListener(fn);
+      return () => setDaemonLogListener(null);
+    },
+    stats: () => gui().daemonStats(),
+  });
+}
+
+function destroyDoctorConsole(): void {
+  doctorConsole?.destroy();
+  doctorConsole = null;
+}
+
+/** «Собрать логи (ZIP)»: путь — тостом; папка открывается соседней кнопкой. */
 async function onCollectLogs(): Promise<void> {
   try {
     lastLogsPath = await collectLogs();
-    const openButton = document.querySelector<HTMLElement>("#logs-open-dir");
-    if (openButton !== null) {
-      openButton.hidden = false;
-    }
+    showToast(`Логи собраны: ${lastLogsPath}`, "success");
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error));
   }
@@ -466,9 +494,17 @@ export function mountApp(options?: { once?: boolean }): { noop: boolean } {
   document
     .querySelector<HTMLButtonElement>("#logs-open-dir")
     ?.addEventListener("click", () => {
-      if (lastLogsPath !== null && revealInDir !== null) {
-        void revealInDir(lastLogsPath);
-      }
+      // «Открыть папку логов» — всегда доступна (спека §3.4).
+      void gui()
+        .logsDir()
+        .then((dir) => {
+          if (revealInDir !== null) {
+            void revealInDir(dir);
+          }
+        })
+        .catch((error: unknown) => {
+          showToast(error instanceof Error ? error.message : String(error));
+        });
     });
   document
     .querySelector<HTMLButtonElement>("#appliance-upgrade")

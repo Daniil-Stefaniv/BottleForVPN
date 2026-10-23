@@ -63,12 +63,22 @@ const HTML = `
   <section id="screen-doctor" class="screen" hidden>
     <p id="doctor-summary"></p>
     <button id="doctor-refresh" type="button">Проверить снова</button>
-    <button id="logs-export" type="button">Собрать логи</button>
     <button id="appliance-upgrade" type="button">Обновить аплаенс</button>
     <button id="appliance-reset" type="button">Сбросить аплаенс</button>
+    <div id="stats-cards"></div>
+    <div id="console">
+      <div class="chips" id="chips-src"></div>
+      <div class="chips" id="chips-level"></div>
+      <div class="chips" id="chips-cat"></div>
+      <input id="console-search" />
+      <button id="console-pause" type="button">Пауза</button>
+      <div id="console-list"></div>
+      <button id="logs-export" type="button">Собрать логи (ZIP)</button>
+      <button id="logs-open-dir" type="button">Открыть папку логов</button>
+      <span id="console-count"></span>
+    </div>
     <div id="doctor-list"></div>
     <p id="logs-path" hidden></p>
-    <button id="logs-open-dir" hidden>Открыть папку</button>
   </section>
   <footer id="cmdbar">
     <span id="cmd-status"></span>
@@ -100,6 +110,8 @@ function makeGuiApi(overrides: Partial<GuiApi> = {}): GuiApi {
     stopBottle: vi.fn(async () => {}),
     stopDaemon: vi.fn(async () => {}),
     daemonStats: vi.fn(async () => ({ ...STATS })),
+    guiLogRecent: vi.fn(async () => []),
+    logsDir: vi.fn(async () => "/tmp/pogrebok-logs"),
     updateCredentials: vi.fn(async () => {}),
     logEvent: vi.fn(async () => {}),
     openEditor: vi.fn(async () => {}),
@@ -452,6 +464,40 @@ describe("главное окно 0.3", () => {
     expect(
       document.querySelector<HTMLElement>("#screen-bottles")?.hidden,
     ).toBe(true);
+  });
+
+  it("вкладка Диагностики: консоль монтируется и гаснет при уходе", async () => {
+    const { app, backend, ipc } = await boot();
+    const api = makeGuiApi();
+    backend.setGuiApi(api);
+    ipc.setBottleInvoker(async () => ({
+      stdout: JSON.stringify({ DoctorReport: { items: [] } }),
+      code: 0,
+    }));
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
+    });
+
+    document
+      .querySelector<HTMLButtonElement>('[data-screen="doctor"]')
+      ?.click();
+    await until(() => {
+      expect(
+        document.querySelectorAll("#stats-cards .stat-card").length,
+      ).toBeGreaterThan(0);
+    });
+    expect(api.daemonStats).toHaveBeenCalled();
+    expect(api.guiLogRecent).toHaveBeenCalled();
+
+    // Уход на Env — консоль уничтожена, stats больше не опрашивается.
+    const calls = (api.daemonStats as ReturnType<typeof vi.fn>).mock.calls
+      .length;
+    document.querySelector<HTMLButtonElement>('[data-screen="env"]')?.click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(
+      (api.daemonStats as ReturnType<typeof vi.fn>).mock.calls.length,
+    ).toBe(calls);
   });
 
   it("ошибка БД при list — тостом, сетка пустая", async () => {

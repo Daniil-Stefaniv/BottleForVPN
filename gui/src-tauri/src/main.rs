@@ -100,6 +100,15 @@ fn gui_log_recent(state: tauri::State<'_, gui_log::GuiLog>) -> Vec<bottle_core::
     state.recent()
 }
 
+/// Папка журналов (gui-*.jsonl и bottled.log) — кнопка «Открыть папку
+/// логов» в подвале консоли (спека §3.4).
+#[tauri::command]
+fn logs_dir() -> Result<String, String> {
+    gui_log::GuiLog::logs_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .ok_or_else(|| "каталог данных недоступен".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Хранилище (экран блокировки, Task 14): без пароля GUI не пускает дальше.
 // ---------------------------------------------------------------------------
@@ -831,6 +840,7 @@ fn main() {
             confirm_quit,
             log_event,
             gui_log_recent,
+            logs_dir,
             vault_status,
             create_vault,
             unlock_vault,
