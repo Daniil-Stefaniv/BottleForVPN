@@ -26,6 +26,13 @@ export function makeTauriGuiApi(): GuiApi {
     logEvent: (code, ctx) => invoke<void>("log_event", { code, ctx }),
     guiLogRecent: () => invoke<EventWire[]>("gui_log_recent"),
     logsDir: () => invoke<string>("logs_dir"),
+    changePassword: (oldPassword, newPassword) =>
+      invoke<string | null>("change_password", { oldPassword, newPassword }),
+    dataDir: () => invoke<string>("data_dir"),
+    getSetting: (key) => invoke<string | null>("get_setting", { key }),
+    setSetting: (key, value) => invoke<void>("set_setting", { key, value }),
+    applyWindowSize: (width, height) =>
+      invoke<void>("apply_window_size", { width, height }),
     openEditor: (id, state) =>
       invoke<void>("open_editor", { id, bottleState: state }),
     getBottle: (id) => invoke<BottleEditorDataWire | null>("get_bottle", { id }),

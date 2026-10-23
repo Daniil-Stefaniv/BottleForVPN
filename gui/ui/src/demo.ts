@@ -28,6 +28,12 @@ const reply = (stdout: object, code = 0): BottleOutput => ({
   code,
 });
 
+/** Мастер-пароль демо-хранилища (диалог настроек принимает только его). */
+const DEMO_PASSWORD = "demo";
+
+/** In-memory «meta» демо-хранилища (ui.* настройки окна). */
+const DEMO_SETTINGS = new Map<string, string>();
+
 /** Профили демо-«БД»: два env (WireGuard/OpenVPN) и host-клиент. */
 const PROFILES: BottleListRowWire[] = [
   {
@@ -319,6 +325,15 @@ export function mountDemo(down: boolean, view?: string | null): void {
       },
     ],
     logsDir: async () => "/tmp/pogrebok-logs-demo",
+    // Настройки в демо: пароль «demo», хранилище ui.* — в памяти.
+    changePassword: async (oldPassword) =>
+      oldPassword === DEMO_PASSWORD ? null : "wrong_password",
+    dataDir: async () => "/tmp/pogrebok-data-demo",
+    getSetting: async (key) => DEMO_SETTINGS.get(key) ?? null,
+    setSetting: async (key, value) => {
+      DEMO_SETTINGS.set(key, value);
+    },
+    applyWindowSize: async () => {},
     // Редактор в демо — overlay поверх главного (нет Tauri): та же
     // форма editor.ts, но окно ОС заменяет затемнённая подложка.
     openEditor: async (id, state) => {

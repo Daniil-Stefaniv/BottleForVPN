@@ -55,6 +55,7 @@ const HTML = `
       <button class="tab" data-screen="doctor">Диагностика</button>
     </nav>
     <button id="create-open" type="button">+ Создать бутылку</button>
+    <button id="settings-open" type="button">Настройки</button>
   </header>
   <section id="screen-bottles" class="screen screen-grid">
     <div id="bottle-grid"></div>
@@ -89,6 +90,17 @@ const HTML = `
     <span id="cmd-updated"></span>
   </footer>
   <div id="toast" hidden></div>
+  <dialog id="settings-dialog">
+    <form id="settings-form">
+      <input id="settings-old" type="password" />
+      <input id="settings-new" type="password" />
+      <input id="settings-new2" type="password" />
+      <p id="settings-error" hidden></p>
+      <code id="settings-data-dir"></code>
+      <button type="submit" id="settings-submit">Сменить пароль</button>
+      <button type="button" id="settings-close">Закрыть</button>
+    </form>
+  </dialog>
   <dialog id="creds-dialog">
     <form id="creds-form">
       <span id="creds-bottle-id"></span>
@@ -112,6 +124,11 @@ function makeGuiApi(overrides: Partial<GuiApi> = {}): GuiApi {
     daemonStats: vi.fn(async () => ({ ...STATS })),
     guiLogRecent: vi.fn(async () => []),
     logsDir: vi.fn(async () => "/tmp/pogrebok-logs"),
+    changePassword: vi.fn(async () => null),
+    dataDir: vi.fn(async () => "/tmp/pogrebok-data"),
+    getSetting: vi.fn(async () => null),
+    setSetting: vi.fn(async () => {}),
+    applyWindowSize: vi.fn(async () => {}),
     updateCredentials: vi.fn(async () => {}),
     logEvent: vi.fn(async () => {}),
     openEditor: vi.fn(async () => {}),
@@ -498,6 +515,62 @@ describe("главное окно 0.3", () => {
     expect(
       (api.daemonStats as ReturnType<typeof vi.fn>).mock.calls.length,
     ).toBe(calls);
+  });
+
+  it("Ctrl+, открывает настройки; F5 обновляет список и статусы", async () => {
+    const { app, backend } = await boot();
+    const api = makeGuiApi();
+    backend.setGuiApi(api);
+    app.mountApp({ once: true });
+    await until(() => {
+      expect(gridIds()).toHaveLength(2);
+    });
+
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: ",", code: "Comma", ctrlKey: true }),
+    );
+    expect(
+      document.querySelector<HTMLDialogElement>("#settings-dialog")?.open,
+    ).toBe(true);
+
+    const listCalls = (api.listBottles as ReturnType<typeof vi.fn>).mock.calls
+      .length;
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "F5" }));
+    await until(() => {
+      expect(
+        (api.listBottles as ReturnType<typeof vi.fn>).mock.calls.length,
+      ).toBeGreaterThan(listCalls);
+    });
+    expect(api.daemonStats).toHaveBeenCalled();
+  });
+
+  it("вкладка восстанавливается из ui.tab и сохраняется при переключении", async () => {
+    const { app, backend } = await boot();
+    const store: Record<string, string> = { "ui.tab": "host" };
+    const api = makeGuiApi({
+      getSetting: vi.fn(async (key: string) => store[key] ?? null),
+      setSetting: vi.fn(async (key: string, value: string) => {
+        store[key] = value;
+      }),
+    });
+    backend.setGuiApi(api);
+    app.mountApp({ once: true });
+
+    // Восстановленная вкладка Host фильтрует сетку до host-бутылок.
+    await until(() => {
+      expect(gridIds()).toEqual(["legacy-ac"]);
+    });
+    expect(
+      document
+        .querySelector<HTMLButtonElement>('[data-screen="host"]')
+        ?.classList.contains("active"),
+    ).toBe(true);
+
+    // Переключение вкладки перезаписывает настройку.
+    document.querySelector<HTMLButtonElement>('[data-screen="env"]')?.click();
+    await until(() => {
+      expect(store["ui.tab"]).toBe("env");
+    });
   });
 
   it("ошибка БД при list — тостом, сетка пустая", async () => {

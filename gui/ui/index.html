@@ -18,6 +18,9 @@
         <button id="create-open" type="button" title="Новая бутылка">
           + Создать бутылку
         </button>
+        <button id="settings-open" type="button" title="Настройки (Ctrl+,)">
+          ⚙ Настройки
+        </button>
       </header>
 
       <section id="screen-bottles" class="screen screen-grid">
@@ -100,6 +103,41 @@
 
       <!-- Экран блокировки (0.3): поверх главного, без пароля не пускает. -->
       <div id="lock-root" hidden></div>
+
+      <!-- Настройки (Ctrl+,, Task 18): смена мастер-пароля и путь к данным. -->
+      <dialog id="settings-dialog">
+        <form id="settings-form">
+          <h2>Настройки</h2>
+          <h3 class="settings-section">Смена мастер-пароля</h3>
+          <p class="section-hint">
+            Новый пароль действует сразу; старым хранилище больше не открыть.
+          </p>
+          <div class="field">
+            <label for="settings-old">Текущий пароль</label>
+            <input id="settings-old" type="password" autocomplete="current-password" />
+          </div>
+          <div class="field">
+            <label for="settings-new">Новый пароль</label>
+            <input id="settings-new" type="password" autocomplete="new-password" />
+          </div>
+          <div class="field">
+            <label for="settings-new2">Новый пароль ещё раз</label>
+            <input id="settings-new2" type="password" autocomplete="new-password" />
+          </div>
+          <p id="settings-error" hidden></p>
+          <h3 class="settings-section">Данные</h3>
+          <p class="section-hint">
+            Бутылки, конфиги и журналы живут в папке:
+            <code id="settings-data-dir">…</code>
+          </p>
+          <div class="form-actions">
+            <button type="submit" id="settings-submit" class="primary">
+              Сменить пароль
+            </button>
+            <button type="button" id="settings-close">Закрыть</button>
+          </div>
+        </form>
+      </dialog>
 
       <dialog id="creds-dialog">
         <form id="creds-form">

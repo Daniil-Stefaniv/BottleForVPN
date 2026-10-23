@@ -730,6 +730,54 @@ button.copy {
   font-size: 0.82rem;
 }
 
+/* ── Диалог настроек (Task 18) ────────────────────────────────── */
+#settings-dialog {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  max-width: 420px;
+  width: calc(100% - 2rem);
+  background: var(--bg);
+  color: var(--fg);
+}
+
+#settings-dialog::backdrop {
+  background: rgb(0 0 0 / 0.4);
+}
+
+#settings-dialog h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.05rem;
+}
+
+#settings-dialog .settings-section {
+  margin: 1rem 0 0.35rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+#settings-dialog .field {
+  margin-top: 0.75rem;
+}
+
+#settings-dialog code {
+  font-size: 0.72rem;
+  word-break: break-all;
+}
+
+#settings-error {
+  margin-top: 0.75rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-sm);
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: 0.82rem;
+}
+
 /* ── Тост ─────────────────────────────────────────────────────── */
 #toast {
   position: fixed;

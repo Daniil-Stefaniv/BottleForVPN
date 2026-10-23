@@ -35,6 +35,16 @@ export interface GuiApi {
   guiLogRecent(): Promise<EventWire[]>;
   /** Папка журналов («Открыть папку логов»). */
   logsDir(): Promise<string>;
+  /** Смена мастер-пароля (Task 18): null — успех, "wrong_password" — неверный старый. */
+  changePassword(oldPassword: string, newPassword: string): Promise<string | null>;
+  /** Папка данных приложения (диалог настроек). */
+  dataDir(): Promise<string>;
+  /** Настройка из meta БД (ui.*); отсутствующая — null. */
+  getSetting(key: string): Promise<string | null>;
+  /** Запись настройки в meta БД. */
+  setSetting(key: string, value: string): Promise<void>;
+  /** Восстановить размер главного окна из настроек. */
+  applyWindowSize(width: number, height: number): Promise<void>;
   /** Открыть редактор бутылки (Task 16): окно ОС в Tauri, overlay в демо. */
   openEditor(id: string | null, state: string | null): Promise<void>;
   /** Профиль для формы редактирования; `null` — нет такой. */

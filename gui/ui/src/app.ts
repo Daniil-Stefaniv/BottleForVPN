@@ -15,6 +15,13 @@ import {
 import { askCredentials } from "./creds";
 import { mountConsole, type ConsoleHandle } from "./console";
 import { collectLogs, loadDoctor } from "./doctor";
+import {
+  installHotkeys,
+  installWindowSizePersist,
+  persistTab,
+  restoreWindowState,
+  showSettings,
+} from "./settings";
 
 /** API спавна демона (Rust-команда start_daemon), подменяется в тестах. */
 export interface DaemonApi {
@@ -360,6 +367,22 @@ export function switchScreen(screen: string): void {
   if (screen === "env" || screen === "host") {
     renderAll(rowsCache);
   }
+  // Вкладка — часть состояния окна (ui.tab), восстанавливается при запуске.
+  try {
+    persistTab(gui(), screen);
+  } catch {
+    // Мост ещё не привязан (монтирование до разблокировки) — не страшно.
+  }
+}
+
+/** Диалог настроек (Task 18): смена мастер-пароля + папка данных. */
+function openSettingsDialog(): void {
+  showSettings({
+    changePassword: (oldPassword, newPassword) =>
+      gui().changePassword(oldPassword, newPassword),
+    dataDir: () => gui().dataDir(),
+    onInfo: (message) => showToast(message, "success"),
+  });
 }
 
 /** Консоль Диагностики (Task 17): живёт, только пока вкладка открыта. */
@@ -469,6 +492,33 @@ export function mountApp(options?: { once?: boolean }): { noop: boolean } {
     ?.addEventListener("click", () => {
       openEditorWindow(null, null);
     });
+  document
+    .querySelector<HTMLButtonElement>("#settings-open")
+    ?.addEventListener("click", () => {
+      openSettingsDialog();
+    });
+  // Горячие клавиши (спека §9): Ctrl+, настройки, Ctrl+L Диагностика,
+  // F5 обновить список и статусы.
+  installHotkeys({
+    openSettings: openSettingsDialog,
+    openDoctor: () => switchScreen("doctor"),
+    refresh: () => {
+      void refreshBottles();
+      void daemonWatchdog();
+    },
+  });
+  // Состояние окна из БД: размер (ui.win_w/ui.win_h) и последняя вкладка.
+  void restoreWindowState(gui())
+    .then((savedTab) => {
+      if (
+        savedTab === "env" ||
+        savedTab === "host" ||
+        savedTab === "doctor"
+      ) {
+        switchScreen(savedTab);
+      }
+    })
+    .catch(() => undefined);
   // Мутации БД из окна редактора: тост + обновление сетки (Task 16).
   setBottlesChangedListener((payload) => {
     const messages = {
@@ -552,6 +602,8 @@ export function mountApp(options?: { once?: boolean }): { noop: boolean } {
     window.setInterval(() => {
       void daemonWatchdog();
     }, WATCHDOG_MS);
+    // Размер окна — в БД с дебаунсом (восстановит restoreWindowState).
+    installWindowSizePersist(gui());
   }
   return { noop: true };
 }

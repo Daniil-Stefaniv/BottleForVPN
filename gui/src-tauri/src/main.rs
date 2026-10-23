@@ -803,6 +803,95 @@ async fn confirm_quit(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Настройки (Task 18, спека §3.1/§9): смена мастер-пароля, meta-ключи ui.*,
+// папка данных, восстановление размера окна.
+// ---------------------------------------------------------------------------
+
+/// Смена мастер-пароля: старый проверяется отдельным открытием хранилища
+/// (неверный — `Some("wrong_password")`, без rekey), затем `PRAGMA rekey`
+/// на живом соединении и событие `db.rekeyed` в журнал.
+#[tauri::command]
+fn change_password(
+    vault: tauri::State<'_, VaultState>,
+    log: tauri::State<'_, gui_log::GuiLog>,
+    old_password: &str,
+    new_password: &str,
+) -> Result<Option<String>, String> {
+    let guard = vault.vault.lock().expect("vault не отравлен");
+    let opened = guard
+        .as_ref()
+        .ok_or_else(|| "хранилище не разблокировано".to_string())?;
+    match db::Vault::unlock(&vault_path()?, old_password) {
+        Ok(_) => {}
+        Err(db::UnlockError::WrongPassword) => {
+            return Ok(Some("wrong_password".to_string()));
+        }
+        Err(db::UnlockError::Corrupt(detail)) => return Err(detail),
+        Err(db::UnlockError::Busy) => {
+            return Err("хранилище занято — повторите попытку".to_string());
+        }
+    }
+    opened.rekey(new_password)?;
+    let _ = log.emit("db.rekeyed", Default::default());
+    Ok(None)
+}
+
+/// Читает настройку из meta (`ui.tab`, `ui.win_w`, …). Отсутствующая — None.
+#[tauri::command]
+fn get_setting(
+    vault: tauri::State<'_, VaultState>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    let guard = vault.vault.lock().expect("vault не отравлен");
+    guard
+        .as_ref()
+        .ok_or_else(|| "хранилище не разблокировано".to_string())?
+        .get_meta(key)
+}
+
+/// Пишет настройку в meta.
+#[tauri::command]
+fn set_setting(
+    vault: tauri::State<'_, VaultState>,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let guard = vault.vault.lock().expect("vault не отравлен");
+    guard
+        .as_ref()
+        .ok_or_else(|| "хранилище не разблокировано".to_string())?
+        .set_meta(key, value)
+}
+
+/// Папка данных приложения — показывается в настройках.
+#[tauri::command]
+fn data_dir() -> Result<String, String> {
+    bottle_core::ipc::default_data_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .ok_or_else(|| "каталог данных недоступен".to_string())
+}
+
+/// Восстановление размера главного окна из настроек (ui.win_w/ui.win_h).
+/// Значения зажаты в разумные рамки, чтобы мусор в БД не увёл окно
+/// за экран.
+#[tauri::command]
+fn apply_window_size(
+    app: tauri::AppHandle,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    use tauri::Manager as _;
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "главное окно не найдено".to_string())?;
+    let width = width.clamp(400.0, 10_000.0);
+    let height = height.clamp(300.0, 10_000.0);
+    window
+        .set_size(tauri::Size::Logical(tauri::LogicalSize::new(width, height)))
+        .map_err(|error| format!("не удалось изменить размер окна: {error}"))
+}
+
 fn main() {
     // Фича-флаг --no-tray: GUI без tray (закрытие окна = выход).
     let with_tray = !std::env::args().any(|arg| arg == "--no-tray");
@@ -857,7 +946,12 @@ fn main() {
             get_bottle,
             save_bottle,
             delete_bottle,
-            open_editor
+            open_editor,
+            change_password,
+            get_setting,
+            set_setting,
+            data_dir,
+            apply_window_size
         ])
         .setup(move |app| {
             if with_tray {

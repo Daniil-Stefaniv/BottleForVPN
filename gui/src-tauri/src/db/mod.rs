@@ -157,6 +157,32 @@ impl Vault {
             .execute_batch(&sql)
             .map_err(|e| format!("не удалось сменить мастер-пароль: {e}"))
     }
+
+    /// Читает значение meta-ключа (`ui.*` — состояние окна, Task 18).
+    /// Отсутствующий ключ — `None`.
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(format!("не удалось прочитать настройку {key}: {other}")),
+            })
+    }
+
+    /// Пишет значение meta-ключа (создаёт или перезаписывает).
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![key, value],
+            )
+            .map_err(|e| format!("не удалось записать настройку {key}: {e}"))?;
+        Ok(())
+    }
 }
 
 /// `PRAGMA key` с экранированной passphras'ой (одинарные кавычки
@@ -336,5 +362,34 @@ mod tests {
         assert!(!Vault::exists(&path));
         Vault::create(&path, "pw").unwrap();
         assert!(Vault::exists(&path));
+    }
+
+    /// meta-ключи (настройки `ui.*`, Task 18): отсутствующий — None,
+    /// запись читается, перезапись перезаписывает.
+    #[test]
+    fn meta_get_set_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(VAULT_FILE_NAME);
+        let vault = Vault::create(&path, "pw").expect("создание");
+
+        assert_eq!(vault.get_meta("ui.tab").expect("чтение"), None);
+        vault.set_meta("ui.tab", "host").expect("запись");
+        assert_eq!(
+            vault.get_meta("ui.tab").expect("чтение"),
+            Some("host".to_string())
+        );
+        vault.set_meta("ui.tab", "env").expect("перезапись");
+        assert_eq!(
+            vault.get_meta("ui.tab").expect("чтение"),
+            Some("env".to_string())
+        );
+
+        // Значение переживает переоткрытие хранилища.
+        drop(vault);
+        let reopened = Vault::unlock(&path, "pw").expect("переоткрытие");
+        assert_eq!(
+            reopened.get_meta("ui.tab").expect("чтение"),
+            Some("env".to_string())
+        );
     }
 }
