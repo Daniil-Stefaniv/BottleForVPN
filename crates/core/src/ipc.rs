@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::profile::{BottleKind, BottleProfile};
+use crate::profile::BottleProfile;
 use crate::protocol::ForwardPort;
 
 /// Имя канала демона (Windows named pipe).
@@ -88,48 +88,17 @@ pub async fn uds_exchange(
     }
 }
 
-/// Запрос CLI к демону.
-///
-/// `Create` крупнее остальных вариантов из-за встроенного профиля;
-/// это редкое сообщение control-канала, боксирование не выполняется
-/// (тот же прецедент, что у `CliReply::Show`).
-#[allow(clippy::large_enum_variant)]
+/// Запрос CLI к демону (0.3): только служебные команды. Управление
+/// бутылками переехало в приложение «Погребок» (протокол [`GuiRequest`]);
+/// legacy-варианты List/Show/Create/Delete/Start/Stop/Status удалены
+/// с провода — CLI отвечает на них надгробием локально, не касаясь демона.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CliRequest {
-    /// Список бутылок из хранилища (с известным состоянием).
-    List,
-    /// Показать профиль и/или рантайм-состояние бутылки.
-    Show { id: String },
-    /// Поднять бутылку. `credentials` — логин/пароль для OpenVPN
-    /// `auth-user-pass`, если демон запросил их ответом
-    /// [`CliReply::NeedCredentials`]; не хранятся, живут только в рамках
-    /// этого запуска (передаются агенту в `Up`).
-    Start {
-        id: String,
-        /// Креды VPN этой сессии запуска; `None` — без авторизации.
-        #[serde(default)]
-        credentials: Option<VpnCredentials>,
-    },
-    /// Опустить бутылку.
-    Stop { id: String },
-    /// Рантайм-состояние всех поднятых бутылок.
-    Status,
     /// Экспортировать журналы в ZIP; `dest` — путь пользователя,
     /// `None` — имя по умолчанию в каталоге данных.
     LogsExport { dest: Option<PathBuf> },
     /// Диагностика окружения (WSL, аплаенс, служба, профили, порты).
     Doctor,
-    /// Создать бутылку из профиля; `force` разрешает перезапись
-    /// существующего id (профиль и конфиг пользователя теряются).
-    Create {
-        /// Профиль (для env `vpn.config` — путь к исходному конфигу,
-        /// демон копирует его в хранилище).
-        profile: BottleProfile,
-        /// Перезаписать существующий профиль этого id.
-        force: bool,
-    },
-    /// Удалить бутылку (отказ, если она активна).
-    Delete { id: String },
     /// Пере-импорт аплаенса из rootfs (отказ при живых бутылках).
     /// `force` — полный сброс: все бутылки останавливаются принудительно,
     /// WSL гасится целиком (`wsl --shutdown`), регистрация дистрибуции
@@ -139,10 +108,10 @@ pub enum CliRequest {
         #[serde(default)]
         force: bool,
     },
-    /// Остановить все бутылки и завершить процесс демона (кнопка
-    /// «Остановить всё» в GUI / `bottle daemon stop`).
+    /// Остановить все бутылки и завершить процесс демона
+    /// (`pogrebok daemon stop`).
     ShutdownDaemon,
-    /// Снять сиротские маршруты через службу (bottle routes cleanup).
+    /// Снять сиротские маршруты через службу (pogrebok routes cleanup).
     RoutesCleanup,
 }
 
@@ -159,43 +128,22 @@ pub struct VpnCredentials {
 
 /// Ответ демона CLI.
 ///
-/// `Show` крупнее остальных вариантов из-за встроенного профиля;
-/// это редкое сообщение control-канала, поэтому размер оправдан
-/// и боксирование не выполняется.
-#[allow(clippy::large_enum_variant)]
+/// `Started`/`Stopped`/`Error` — это ещё и внутренний тип результата
+/// менеджера бутылок (старт/стоп по [`GuiRequest`]); остальные варианты —
+/// ответы на служебные [`CliRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CliReply {
-    /// Ответ на `List`: бутылки хранилища.
-    List { bottles: Vec<BottleSummary> },
-    /// Ответ на `Show`: профиль с диска и/или рантайм-состояние;
-    /// отсутствующая половина — `None`.
-    Show {
-        profile: Option<BottleProfile>,
-        runtime: Option<RuntimeState>,
-    },
-    /// Бутылка поднята (ответ на `Start`).
+    /// Бутылка поднята (результат менеджера; CLI 0.3 старт не шлёт).
     Started { id: String },
-    /// Ответ на `Start`: конфиг OpenVPN требует `auth-user-pass`, а креды
-    /// в запросе не переданы — клиент должен спросить логин/пароль у
-    /// пользователя (CLI — скрытым вводом, GUI — диалогом) и повторить
-    /// `Start` с `credentials`.
-    NeedCredentials { id: String },
-    /// Бутылка опущена (ответ на `Stop`); `warning` — предупреждение
+    /// Бутылка опущена (результат менеджера); `warning` — предупреждение
     /// о неочищенных эффектах (host-бутылка: VPN-клиент остаётся
     /// работать — спека §7.2, шаг 6). Отсутствующее поле в старом
     /// кадре десериализуется как `None`.
     Stopped { id: String, warning: Option<String> },
-    /// Ответ на `Status`.
-    Status { bottles: Vec<RuntimeState> },
     /// Ответ на `LogsExport`: путь к созданному ZIP-архиву.
     Path(String),
     /// Ответ на `Doctor`: строки проверок.
     DoctorReport { items: Vec<CheckItem> },
-    /// Ответ на `Create`: бутылка создана (профиль и конфиг записаны).
-    Created { id: String },
-    /// Ответ на `Delete`: файлы профиля удалены; `warning` — например,
-    /// конфигурационного файла уже не было.
-    Deleted { id: String, warning: Option<String> },
     /// Ответ на `Upgrade`: версия аплаенса до (`None` — не подключались
     /// в этой сессии) и после пере-импорта.
     Upgraded {
@@ -207,19 +155,6 @@ pub enum CliReply {
     Done { warning: Option<String> },
     /// Ошибка выполнения команды.
     Error { message: String },
-}
-
-/// Строка списка бутылок: профиль с диска + известное состояние, если есть.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BottleSummary {
-    /// Идентификатор бутылки.
-    pub id: String,
-    /// Человекочитаемое имя.
-    pub name: String,
-    /// Тип бутылки (env/host).
-    pub kind: BottleKind,
-    /// Текущее состояние (`up`/...); `None` = не запущена/неизвестно.
-    pub state: Option<String>,
 }
 
 /// Состояние бутылки в рантайме.
@@ -457,18 +392,6 @@ mod tests {
         }
     }
 
-    fn sample_runtime(id: &str, state: BottleState) -> RuntimeState {
-        RuntimeState {
-            id: id.to_string(),
-            state,
-            socks5: Some(1080),
-            forwards: vec![crate::protocol::ForwardPort {
-                port: 33389,
-                target: "10.20.30.15:3389".to_string(),
-            }],
-        }
-    }
-
     #[test]
     fn daemon_pipe_value_is_the_wire_contract() {
         assert_eq!(DAEMON_PIPE, r"\\.\pipe\bottled");
@@ -477,41 +400,11 @@ mod tests {
     #[test]
     fn round_trip_every_request_variant() {
         let requests = vec![
-            CliRequest::List,
-            CliRequest::Show {
-                id: "office-a".to_string(),
-            },
-            CliRequest::Start {
-                id: "office-a".to_string(),
-                credentials: None,
-            },
-            CliRequest::Start {
-                id: "office-a".to_string(),
-                credentials: Some(VpnCredentials {
-                    username: "user@corp".to_string(),
-                    password: "s3cret".to_string(),
-                }),
-            },
-            CliRequest::Stop {
-                id: "office-a".to_string(),
-            },
-            CliRequest::Status,
             CliRequest::LogsExport { dest: None },
             CliRequest::LogsExport {
                 dest: Some(PathBuf::from(r"C:\tmp\logs.zip")),
             },
             CliRequest::Doctor,
-            CliRequest::Create {
-                profile: sample_profile(),
-                force: false,
-            },
-            CliRequest::Create {
-                profile: sample_profile(),
-                force: true,
-            },
-            CliRequest::Delete {
-                id: "office-a".to_string(),
-            },
             CliRequest::Upgrade { force: false },
             CliRequest::Upgrade { force: true },
             CliRequest::ShutdownDaemon,
@@ -524,52 +417,8 @@ mod tests {
 
     #[test]
     fn round_trip_every_reply_variant() {
-        let summary = |state: Option<&str>| BottleSummary {
-            id: "office-a".to_string(),
-            name: "Офис А".to_string(),
-            kind: BottleKind::Env,
-            state: state.map(str::to_string),
-        };
-
         let replies = vec![
-            CliReply::List {
-                bottles: vec![
-                    summary(Some("up")),
-                    summary(None),
-                    BottleSummary {
-                        id: "corp-vpn".to_string(),
-                        name: "Корп VPN".to_string(),
-                        kind: BottleKind::Host,
-                        state: Some("stopped".to_string()),
-                    },
-                ],
-            },
-            CliReply::List { bottles: vec![] },
-            CliReply::Show {
-                profile: Some(sample_profile()),
-                runtime: Some(sample_runtime("office-a", BottleState::Up)),
-            },
-            CliReply::Show {
-                profile: Some(sample_profile()),
-                runtime: None,
-            },
-            CliReply::Show {
-                profile: None,
-                runtime: Some(sample_runtime(
-                    "office-a",
-                    BottleState::Failed {
-                        reason: "туннель не поднялся".to_string(),
-                    },
-                )),
-            },
-            CliReply::Show {
-                profile: None,
-                runtime: None,
-            },
             CliReply::Started {
-                id: "office-a".to_string(),
-            },
-            CliReply::NeedCredentials {
                 id: "office-a".to_string(),
             },
             CliReply::Stopped {
@@ -580,30 +429,6 @@ mod tests {
                 id: "corp-vpn".to_string(),
                 warning: Some("VPN-клиент оставлен запущенным".to_string()),
             },
-            CliReply::Status {
-                bottles: vec![
-                    sample_runtime("office-a", BottleState::Up),
-                    sample_runtime(
-                        "corp-vpn",
-                        BottleState::Failed {
-                            reason: "туннель не поднялся".to_string(),
-                        },
-                    ),
-                    sample_runtime(
-                        "office-b",
-                        BottleState::Degraded {
-                            reason: "агент аплаенса не отвечает".to_string(),
-                        },
-                    ),
-                    RuntimeState {
-                        id: "empty".to_string(),
-                        state: BottleState::Stopped,
-                        socks5: None,
-                        forwards: vec![],
-                    },
-                ],
-            },
-            CliReply::Status { bottles: vec![] },
             CliReply::Path(r"C:\tmp\bottleforapps-logs-20261004-1200.zip".to_string()),
             CliReply::DoctorReport {
                 items: vec![
@@ -623,17 +448,6 @@ mod tests {
                         detail: "агент не отвечает".to_string(),
                     },
                 ],
-            },
-            CliReply::Created {
-                id: "office-a".to_string(),
-            },
-            CliReply::Deleted {
-                id: "office-a".to_string(),
-                warning: None,
-            },
-            CliReply::Deleted {
-                id: "office-a".to_string(),
-                warning: Some("файл конфигурации отсутствовал".to_string()),
             },
             CliReply::Upgraded {
                 previous: Some("0.1.0".to_string()),
@@ -715,21 +529,6 @@ mod tests {
             CliReply::Stopped {
                 id: "office-a".to_string(),
                 warning: None
-            }
-        );
-    }
-
-    /// Поле `credentials` в `Start` опционально на проводе: кадр старой
-    /// формы (без поля) читается как `credentials: None`.
-    #[test]
-    fn start_without_credentials_field_deserializes_as_none() {
-        let request: CliRequest =
-            serde_json::from_str(r#"{"Start":{"id":"office-a"}}"#).expect("старая форма кадра");
-        assert_eq!(
-            request,
-            CliRequest::Start {
-                id: "office-a".to_string(),
-                credentials: None
             }
         );
     }

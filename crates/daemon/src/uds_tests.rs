@@ -24,8 +24,10 @@ fn socket_mode(path: &std::path::Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+/// Служебная команда (Doctor) проходит реальный круг по UDS: без
+/// менеджера демон отвечает понятной ошибкой, а не молчанием.
 #[tokio::test]
-async fn uds_serves_legacy_tombstone_over_real_roundtrip() {
+async fn uds_serves_service_command_over_real_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = daemon_socket_path(tmp.path());
     let daemon = gui_daemon(tmp.path(), "tok1");
@@ -42,7 +44,7 @@ async fn uds_serves_legacy_tombstone_over_real_roundtrip() {
 
     let reply = uds_exchange(
         &socket,
-        &CliRequest::List,
+        &CliRequest::Doctor,
         Duration::from_secs(5),
         Duration::from_secs(5),
     )
@@ -50,9 +52,9 @@ async fn uds_serves_legacy_tombstone_over_real_roundtrip() {
     .expect("обмен по UDS");
 
     let CliReply::Error { message } = reply else {
-        panic!("ожидали tombstone Error, получили {reply:?}");
+        panic!("ожидали Error без менеджера, получили {reply:?}");
     };
-    assert!(message.contains("0.3"), "надгробие 0.3: {message}");
+    assert!(message.contains("менеджер"), "понятная ошибка: {message}");
 
     shutdown.cancel();
     server.await.unwrap().expect("serve завершился без ошибки");
@@ -102,13 +104,13 @@ async fn uds_serve_replaces_stale_socket_file() {
 
     let reply = uds_exchange(
         &socket,
-        &CliRequest::List,
+        &CliRequest::Doctor,
         Duration::from_secs(5),
         Duration::from_secs(5),
     )
     .await
     .expect("stale-файл пережат, обмен прошёл");
-    assert!(matches!(reply, CliReply::Error { .. }), "legacy — надгробие: {reply:?}");
+    assert!(matches!(reply, CliReply::Error { .. }), "Doctor без менеджера: {reply:?}");
 
     shutdown.cancel();
     server.await.unwrap().expect("serve завершился без ошибки");
@@ -150,13 +152,13 @@ async fn uds_second_serve_on_live_socket_is_refused() {
     // Первый демон продолжает отвечать (сокет не тронут).
     let reply = uds_exchange(
         &socket,
-        &CliRequest::List,
+        &CliRequest::Doctor,
         Duration::from_secs(5),
         Duration::from_secs(5),
     )
     .await
     .expect("живой демон отвечает после попытки перебинда");
-    assert!(matches!(reply, CliReply::Error { .. }), "legacy — надгробие: {reply:?}");
+    assert!(matches!(reply, CliReply::Error { .. }), "Doctor без менеджера: {reply:?}");
 
     shutdown.cancel();
     first.await.unwrap().expect("serve завершился без ошибки");
@@ -182,7 +184,7 @@ async fn uds_serves_parallel_clients() {
         async move {
             uds_exchange(
                 &socket,
-                &CliRequest::List,
+                &CliRequest::Doctor,
                 Duration::from_secs(5),
                 Duration::from_secs(5),
             )
@@ -196,7 +198,7 @@ async fn uds_serves_parallel_clients() {
         Duration::from_secs(3),
         uds_exchange(
             &socket,
-            &CliRequest::List,
+            &CliRequest::Doctor,
             Duration::from_secs(2),
             Duration::from_secs(2),
         ),
@@ -204,7 +206,7 @@ async fn uds_serves_parallel_clients() {
     .await
     .expect("второй клиент обслужен параллельно с первым")
     .expect("обмен второго клиента");
-    assert!(matches!(second_reply, CliReply::Error { .. }), "legacy — надгробие: {second_reply:?}");
+    assert!(matches!(second_reply, CliReply::Error { .. }), "Doctor без менеджера: {second_reply:?}");
     assert!(first.await.is_ok());
 
     shutdown.cancel();

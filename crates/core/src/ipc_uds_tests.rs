@@ -37,7 +37,7 @@ async fn uds_exchange_round_trips_reply() {
 
     let reply = uds_exchange(
         &path,
-        &CliRequest::List,
+        &CliRequest::Doctor,
         Duration::from_secs(5),
         Duration::from_millis(50),
     )
@@ -61,7 +61,7 @@ async fn uds_exchange_without_server_is_daemon_unavailable() {
     let path = dir.path().join("missing.sock");
     let error = uds_exchange(
         &path,
-        &CliRequest::List,
+        &CliRequest::Doctor,
         Duration::from_secs(5),
         Duration::from_millis(80),
     )
@@ -88,7 +88,7 @@ async fn uds_exchange_times_out_on_silent_server() {
     let started = std::time::Instant::now();
     let error = uds_exchange(
         &path,
-        &CliRequest::List,
+        &CliRequest::Doctor,
         Duration::from_millis(300),
         Duration::from_millis(50),
     )

@@ -1,11 +1,11 @@
-//! Legacy-диспетчер команд CLI и named-pipe транспорт демона.
+//! Диспетчер служебных команд CLI и named-pipe транспорт демона.
 //!
 //! Протокол 0.3 (GUI↔демон) разбирает [`crate::session`]; сюда попадают
-//! кадры старого [`CliRequest`], которые шлёт CLI `bottle`. В 0.3
-//! команды управления бутылками (`List`/`Show`/`Start`/`Stop`/`Status`/
-//! `Create`/`Delete`) удалены — диспетчер отвечает понятным надгробием;
-//! служебные команды (`Doctor`/`LogsExport`/`Upgrade`/`RoutesCleanup`/
-//! `ShutdownDaemon`) продолжают работать до сокращения CLI.
+//! кадры [`CliRequest`], которые шлёт CLI `pogrebok`. В 0.3 команды
+//! управления бутылками удалены с провода целиком: CLI отвечает на них
+//! надгробием локально (не касаясь демона), а здесь остались только
+//! служебные `Doctor`/`LogsExport`/`Upgrade`/`RoutesCleanup`/
+//! `ShutdownDaemon`.
 //!
 //! Транспорт (Windows named pipe `\\.\pipe\bottled`, [`serve`])
 //! обслуживает клиентов параллельно: принятое соединение уходит в свою
@@ -33,28 +33,13 @@ use tokio_util::sync::CancellationToken;
 /// и dev-сборки без аплаенса).
 const MANAGER_NOT_WIRED: &str = "менеджер бутылок не подключён";
 
-/// Надгробие команд управления бутылками (0.3: они переехали в GUI —
-/// GUI хранит профили в своей БД и синхронизирует реестр демона).
-const REMOVED_IN_03: &str =
-    "команда удалена в 0.3: управление бутылками — в приложении «Погребок»";
-
-/// Диспетчер legacy-команд CLI: служебные команды исполняются,
-/// команды управления бутылками отвечают [`REMOVED_IN_03`].
+/// Диспетчер служебных команд CLI (0.3).
 pub async fn dispatch(
     daemon: &Daemon,
     shutdown: Option<&tokio_util::sync::CancellationToken>,
     req: CliRequest,
 ) -> CliReply {
     match req {
-        CliRequest::List
-        | CliRequest::Show { .. }
-        | CliRequest::Start { .. }
-        | CliRequest::Stop { .. }
-        | CliRequest::Status
-        | CliRequest::Create { .. }
-        | CliRequest::Delete { .. } => CliReply::Error {
-            message: REMOVED_IN_03.to_string(),
-        },
         CliRequest::Doctor => match (&daemon.manager, &daemon.wsl) {
             (Some(manager), Some(wsl)) => CliReply::DoctorReport {
                 items: crate::doctor::run(wsl.as_ref(), &daemon.registry, manager).await,
@@ -263,62 +248,22 @@ mod tests {
     #[cfg(windows)]
     use bottle_core::ipc::GuiRequest;
 
-    /// Надгробия (0.3): legacy-команды управления бутылками отвечают
-    /// понятным отказом, а не паникой или молчанием.
+    /// Doctor без подключённого менеджера — понятная ошибка (dev-сборки).
     #[tokio::test]
-    async fn legacy_management_commands_answer_tombstone() {
+    async fn doctor_without_manager_is_clear_error() {
         let tmp = tempfile::tempdir().unwrap();
         let daemon = crate::test_daemon(tmp.path(), "tok", None);
-        let tombstoned = [
-            CliRequest::List,
-            CliRequest::Show { id: "a".into() },
-            CliRequest::Start {
-                id: "a".into(),
-                credentials: None,
-            },
-            CliRequest::Stop { id: "a".into() },
-            CliRequest::Status,
-            CliRequest::Delete { id: "a".into() },
-        ];
-        for req in tombstoned {
-            let reply = dispatch(&daemon, None, req.clone()).await;
-            let CliReply::Error { message } = reply else {
-                panic!("ожидали tombstone-Error на {req:?}, получили {reply:?}");
-            };
-            assert!(message.contains("0.3"), "{message}");
-            assert!(message.contains("Погребок"), "{message}");
-        }
 
-        // Create — тоже надгробие (с профилем внутри варианта).
-        let profile = bottle_core::profile::BottleProfile {
-            id: "a".to_string(),
-            name: "A".to_string(),
-            kind: bottle_core::profile::BottleKind::Env,
-            vpn: bottle_core::profile::VpnConfig::Env {
-                protocol: bottle_core::profile::TunnelProtocol::WireGuard,
-                config: "a.conf".to_string(),
-            },
-            expose: bottle_core::profile::ExposeConfig {
-                socks5: 0,
-                forwards: vec![],
-                dns: None,
-                launch: None,
-            },
+        let reply = dispatch(&daemon, None, CliRequest::Doctor).await;
+
+        let CliReply::Error { message } = reply else {
+            panic!("ожидали Error без менеджера, получили {reply:?}");
         };
-        let reply = dispatch(
-            &daemon,
-            None,
-            CliRequest::Create {
-                profile,
-                force: false,
-            },
-        )
-        .await;
-        assert!(matches!(reply, CliReply::Error { .. }));
+        assert!(message.contains("менеджер"), "{message}");
     }
 
     /// Сервисные команды живут: routes cleanup без службы — Done с
-    /// предупреждением, не tombstone.
+    /// предупреждением, не ошибка.
     #[tokio::test]
     async fn routes_cleanup_without_service_warns() {
         let tmp = tempfile::tempdir().unwrap();
@@ -467,12 +412,13 @@ mod tests {
             serde_json::from_value(reply).expect("GuiReply");
         assert_eq!(reply, bottle_core::ipc::GuiReply::Ok);
 
-        // Legacy List — надгробие.
-        let reply = exchange(&mut client, &CliRequest::List).await;
+        // Служебный Doctor по legacy-кадру: без менеджера — понятная
+        // ошибка, но кадр распознаётся и исполняется.
+        let reply = exchange(&mut client, &CliRequest::Doctor).await;
         let reply: CliReply = serde_json::from_value(reply).expect("CliReply");
         assert!(
-            matches!(&reply, CliReply::Error { message } if message.contains("0.3")),
-            "List — надгробие: {reply:?}"
+            matches!(&reply, CliReply::Error { message } if message.contains("менеджер")),
+            "Doctor без менеджера: {reply:?}"
         );
 
         shutdown.cancel();
@@ -495,11 +441,11 @@ mod tests {
 
         for round in 0..2 {
             let mut client = connect_client(&pipe_name).await;
-            let reply = exchange(&mut client, &CliRequest::List).await;
+            let reply = exchange(&mut client, &CliRequest::Doctor).await;
             let reply: CliReply = serde_json::from_value(reply).expect("CliReply");
             assert!(
-                matches!(&reply, CliReply::Error { message } if message.contains("0.3")),
-                "раунд {round}: tombstone List"
+                matches!(&reply, CliReply::Error { message } if message.contains("менеджер")),
+                "раунд {round}: Doctor без менеджера"
             );
             // Клиент отключается в конце итерации; его экземпляр канала
             // уходит с задачей, следующий клиент берёт свежий ожидающий
@@ -514,8 +460,8 @@ mod tests {
     ///
     /// Первый держит длинный `StartBottle` (фейк-менеджер с задержкой
     /// подключения к аплаенсу 2 с), второй за это время получает ответ
-    /// на legacy List (мгновенное надгробие): таймаут ассерта меньше
-    /// задержки, поэтому последовательное обслуживание тест проваливает.
+    /// на служебный Doctor (мгновенно): таймаут ассерта меньше задержки,
+    /// поэтому последовательное обслуживание тест проваливает.
     #[cfg(windows)]
     #[tokio::test]
     async fn pipe_answers_second_client_while_start_is_in_flight() {
@@ -610,7 +556,7 @@ mod tests {
             let pipe_name = pipe_name.clone();
             async move {
                 let mut client = connect_client(&pipe_name).await;
-                exchange(&mut client, &CliRequest::List).await
+                exchange(&mut client, &CliRequest::Doctor).await
             }
         });
         let reply = tokio::time::timeout(SECOND_CLIENT_TIMEOUT, second)
@@ -618,7 +564,10 @@ mod tests {
             .expect("второй клиент обслужен, пока первый висит в start")
             .expect("задача второго клиента");
         let reply: CliReply = serde_json::from_value(reply).expect("CliReply");
-        assert!(matches!(reply, CliReply::Error { .. }), "tombstone List");
+        assert!(
+            matches!(reply, CliReply::Error { .. } | CliReply::DoctorReport { .. }),
+            "Doctor обслужен параллельно: {reply:?}"
+        );
 
         start.await.expect("первый клиент дождался ответа");
         shutdown.cancel();
