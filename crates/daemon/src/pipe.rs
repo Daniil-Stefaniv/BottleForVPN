@@ -288,7 +288,10 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!(r"\\.\pipe\pogrebok-daemon-test-{label}-{}-{n}", std::process::id())
+        format!(
+            r"\\.\pipe\pogrebok-daemon-test-{label}-{}-{n}",
+            std::process::id()
+        )
     }
 
     /// Подключается к тестовому каналу с повторами: между созданием
@@ -335,7 +338,8 @@ mod tests {
         let mut read_codec = bottle_core::frame::LengthJsonCodec::<serde_json::Value>::new();
         let mut buf = bytes::BytesMut::new();
         loop {
-            if let Some(reply) = read_codec.decode(&mut buf).expect("ответ разбирается") {
+            if let Some(reply) = read_codec.decode(&mut buf).expect("ответ разбирается")
+            {
                 return reply;
             }
             let mut chunk = [0u8; 4096];
@@ -388,8 +392,7 @@ mod tests {
 
         // До Hello управление закрыто.
         let reply = exchange(&mut client, &GuiRequest::Stats).await;
-        let reply: bottle_core::ipc::GuiReply =
-            serde_json::from_value(reply).expect("GuiReply");
+        let reply: bottle_core::ipc::GuiReply = serde_json::from_value(reply).expect("GuiReply");
         assert!(
             matches!(&reply, bottle_core::ipc::GuiReply::Error { message } if message.starts_with("AUTH")),
             "до Hello — AUTH: {reply:?}"
@@ -403,13 +406,11 @@ mod tests {
             },
         )
         .await;
-        let reply: bottle_core::ipc::GuiReply =
-            serde_json::from_value(reply).expect("GuiReply");
+        let reply: bottle_core::ipc::GuiReply = serde_json::from_value(reply).expect("GuiReply");
         assert_eq!(reply, bottle_core::ipc::GuiReply::Ok);
 
         let reply = exchange(&mut client, &GuiRequest::SyncProfiles { profiles: vec![] }).await;
-        let reply: bottle_core::ipc::GuiReply =
-            serde_json::from_value(reply).expect("GuiReply");
+        let reply: bottle_core::ipc::GuiReply = serde_json::from_value(reply).expect("GuiReply");
         assert_eq!(reply, bottle_core::ipc::GuiReply::Ok);
 
         // Служебный Doctor по legacy-кадру: без менеджера — понятная
@@ -538,8 +539,7 @@ mod tests {
             },
         )
         .await;
-        let reply: bottle_core::ipc::GuiReply =
-            serde_json::from_value(reply).expect("GuiReply");
+        let reply: bottle_core::ipc::GuiReply = serde_json::from_value(reply).expect("GuiReply");
         assert_eq!(reply, bottle_core::ipc::GuiReply::Ok);
         let start = tokio::spawn(async move {
             exchange(
@@ -565,7 +565,10 @@ mod tests {
             .expect("задача второго клиента");
         let reply: CliReply = serde_json::from_value(reply).expect("CliReply");
         assert!(
-            matches!(reply, CliReply::Error { .. } | CliReply::DoctorReport { .. }),
+            matches!(
+                reply,
+                CliReply::Error { .. } | CliReply::DoctorReport { .. }
+            ),
             "Doctor обслужен параллельно: {reply:?}"
         );
 

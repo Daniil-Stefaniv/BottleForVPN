@@ -1582,8 +1582,8 @@ mod tests {
     use super::*;
     use crate::error::DaemonError;
     use crate::manager::BottleManager;
-    use bottle_core::ipc::FullProfile;
     use crate::svc_client::SvcTransport;
+    use bottle_core::ipc::FullProfile;
 
     // ------------------------------------------------------------------
     // Фейки.
@@ -2554,10 +2554,7 @@ mod tests {
             host,
         );
 
-        let reply = manager
-            .start("corp")
-            .await
-            .expect("start через менеджера");
+        let reply = manager.start("corp").await.expect("start через менеджера");
         assert_eq!(reply, CliReply::Started { id: "corp".into() });
 
         let bottles = manager.status().await;
@@ -2775,10 +2772,7 @@ mod tests {
         manager.start("corp").await.expect("первая бутылка");
         // Вторая бутылка резолвится в другой адрес (B).
         resolver.set(vec![ip("198.51.100.20")]);
-        manager
-            .start("partner")
-            .await
-            .expect("вторая бутылка");
+        manager.start("partner").await.expect("вторая бутылка");
         let corp_socks5 = manager
             .status()
             .await

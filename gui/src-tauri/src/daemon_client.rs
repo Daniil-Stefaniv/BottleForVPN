@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bottle_core::frame::LengthJsonCodec;
-use bottle_core::ipc::{DaemonEvent, FullProfile, GuiReply, GuiRequest, AUTH_ERR};
 #[cfg(windows)]
 use bottle_core::ipc::DAEMON_PIPE;
+use bottle_core::ipc::{DaemonEvent, FullProfile, GuiReply, GuiRequest, AUTH_ERR};
 use bytes::BytesMut;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -134,7 +134,13 @@ impl DaemonClient {
             reader: FramedRead::new(read_half, LengthJsonCodec::<Value>::new()),
             writer: write_half,
         };
-        send_frame(&mut conn.writer, &GuiRequest::Hello { token: token.into() }).await?;
+        send_frame(
+            &mut conn.writer,
+            &GuiRequest::Hello {
+                token: token.into(),
+            },
+        )
+        .await?;
         match read_reply(&mut conn.reader).await? {
             GuiReply::Ok => {
                 *self.inner.control.lock().await = Some(conn);
@@ -170,7 +176,9 @@ impl DaemonClient {
         match self.request(GuiRequest::SyncProfiles { profiles }).await? {
             GuiReply::Ok => Ok(()),
             GuiReply::Error { message } => Err(message),
-            other => Err(format!("неожиданный ответ демона на SyncProfiles: {other:?}")),
+            other => Err(format!(
+                "неожиданный ответ демона на SyncProfiles: {other:?}"
+            )),
         }
     }
 
@@ -182,7 +190,13 @@ impl DaemonClient {
             use tauri::Emitter as _;
             let _ = app.emit(name, payload);
         });
-        tokio::spawn(run_event_loop(inner, token, emit, default_backoff, MAX_RECONNECTS));
+        tokio::spawn(run_event_loop(
+            inner,
+            token,
+            emit,
+            default_backoff,
+            MAX_RECONNECTS,
+        ));
     }
 }
 
@@ -244,9 +258,14 @@ async fn subscribe_once(
         .await
         .map_err(SubError::Transport)?;
     let (read_half, mut write_half) = tokio::io::split(pipe);
-    send_frame(&mut write_half, &GuiRequest::Subscribe { token: token.into() })
-        .await
-        .map_err(SubError::Transport)?;
+    send_frame(
+        &mut write_half,
+        &GuiRequest::Subscribe {
+            token: token.into(),
+        },
+    )
+    .await
+    .map_err(SubError::Transport)?;
     let mut reader = FramedRead::new(read_half, LengthJsonCodec::<Value>::new());
 
     // Первый кадр — ответ на Subscribe (Ok / AUTH-ошибка).
@@ -273,7 +292,9 @@ async fn subscribe_once(
                 }
             },
             Some(Err(error)) => {
-                return Err(SubError::Transport(format!("ошибка чтения событий: {error}")));
+                return Err(SubError::Transport(format!(
+                    "ошибка чтения событий: {error}"
+                )));
             }
             None => return Ok(()), // демон закрыл соединение — реконнект
         }
@@ -302,9 +323,7 @@ async fn open(endpoint: &Endpoint, window: Duration) -> Result<Box<dyn Pipe>, St
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
                 );
                 if !stale || tokio::time::Instant::now() >= deadline {
-                    return Err(
-                        "не удалось подключиться к демону — запущен ли он?".to_string()
-                    );
+                    return Err("не удалось подключиться к демону — запущен ли он?".to_string());
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -339,8 +358,9 @@ async fn read_reply(
     reader: &mut FramedRead<ReadHalf<Box<dyn Pipe>>, LengthJsonCodec<Value>>,
 ) -> Result<GuiReply, String> {
     match tokio::time::timeout(REPLY_TIMEOUT, reader.next()).await {
-        Ok(Some(Ok(value))) => serde_json::from_value(value)
-            .map_err(|error| format!("битый ответ демона: {error}")),
+        Ok(Some(Ok(value))) => {
+            serde_json::from_value(value).map_err(|error| format!("битый ответ демона: {error}"))
+        }
         Ok(Some(Err(error))) => Err(format!("ошибка обмена с демоном: {error}")),
         Ok(None) => Err("демон закрыл соединение без ответа".to_string()),
         Err(_) => Err(format!("демон не ответил за {} с", REPLY_TIMEOUT.as_secs())),
@@ -424,12 +444,10 @@ mod tests {
                 let counter = Arc::clone(&sub_counter);
                 tokio::spawn(async move {
                     let (read_half, mut write_half) = tokio::io::split(stream);
-                    let mut reader =
-                        FramedRead::new(read_half, LengthJsonCodec::<Value>::new());
+                    let mut reader = FramedRead::new(read_half, LengthJsonCodec::<Value>::new());
                     while let Some(frame) = reader.next().await {
                         let Ok(value) = frame else { return };
-                        let Ok(req) = serde_json::from_value::<GuiRequest>(value.clone())
-                        else {
+                        let Ok(req) = serde_json::from_value::<GuiRequest>(value.clone()) else {
                             return;
                         };
                         // Подписка: проверка токена, Ok, сценарий событий.
@@ -483,9 +501,7 @@ mod tests {
                                 .ok();
                                 return;
                             }
-                            GuiRequest::Stats => {
-                                GuiReply::Stats(Box::new(sample_stats()))
-                            }
+                            GuiRequest::Stats => GuiReply::Stats(Box::new(sample_stats())),
                             GuiRequest::SyncProfiles { .. } => GuiReply::Ok,
                             _ => GuiReply::Error {
                                 message: "не поддержано фейком".to_string(),
@@ -548,7 +564,11 @@ mod tests {
         // Сервер увидел Hello, Stats и SyncProfiles в этом порядке.
         let hello = server.requests.recv().await.expect("Hello у сервера");
         let first = server.requests.recv().await.expect("Stats у сервера");
-        let second = server.requests.recv().await.expect("SyncProfiles у сервера");
+        let second = server
+            .requests
+            .recv()
+            .await
+            .expect("SyncProfiles у сервера");
         assert!(hello.get("Hello").is_some(), "{hello}");
         assert_eq!(
             serde_json::from_value::<GuiRequest>(first).unwrap(),
@@ -608,9 +628,7 @@ mod tests {
             5,
         ));
 
-        async fn recv(
-            rx: &mut mpsc::UnboundedReceiver<(String, Value)>,
-        ) -> (String, Value) {
+        async fn recv(rx: &mut mpsc::UnboundedReceiver<(String, Value)>) -> (String, Value) {
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("событие за таймаут")

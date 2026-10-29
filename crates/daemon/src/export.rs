@@ -123,7 +123,11 @@ fn timestamp(now: SystemTime) -> String {
 /// бутылок, профили. Содержимое конфигов не включается (секреты,
 /// спека §10): env-профиль представлен метаданными, имя файла
 /// конфига — не секрет.
-fn system_txt(profiles: &[BottleProfile], appliance_version: Option<&str>, runtime: &[RuntimeState]) -> String {
+fn system_txt(
+    profiles: &[BottleProfile],
+    appliance_version: Option<&str>,
+    runtime: &[RuntimeState],
+) -> String {
     let mut out = String::new();
     out.push_str("Погребок — сводка системы\n");
     out.push_str(&format!("Версия демона: {}\n", env!("CARGO_PKG_VERSION")));
@@ -298,7 +302,11 @@ mod tests {
         let (tmp, data_root, profiles) = env_fixture();
         let logs_dir = data_root.join("logs");
         fs::create_dir_all(&logs_dir).unwrap();
-        fs::write(logs_dir.join("pogrebok-daemon.1970-01-01"), "строка журнала").unwrap();
+        fs::write(
+            logs_dir.join("pogrebok-daemon.1970-01-01"),
+            "строка журнала",
+        )
+        .unwrap();
 
         let dest = tmp.path().join("export.zip");
         let result = export_logs(&data_root, &profiles, None, Some(dest.clone())).await;

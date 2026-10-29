@@ -81,8 +81,7 @@ pub fn import_legacy_from(vault: &Vault, dir: &Path) -> Result<ImportReport, Str
 
 /// Импорт одного файла профиля; причина отказа — строкой для отчёта.
 fn import_one(vault: &Vault, path: &Path) -> Result<String, String> {
-    let text =
-        fs::read_to_string(path).map_err(|e| format!("файл не читается: {e}"))?;
+    let text = fs::read_to_string(path).map_err(|e| format!("файл не читается: {e}"))?;
     let profile = parse_profile(&text).map_err(|e| format!("битый профиль: {e}"))?;
     let id = profile.id.clone();
 
@@ -113,9 +112,7 @@ fn count_toml(dir: &Path) -> usize {
         .map(|entries| {
             entries
                 .flatten()
-                .filter(|entry| {
-                    entry.path().extension().and_then(|e| e.to_str()) == Some("toml")
-                })
+                .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("toml"))
                 .count()
         })
         .unwrap_or(0)
@@ -234,7 +231,11 @@ mod tests {
         let report = import_legacy_from(&vault, tmp2.path()).unwrap();
         assert!(report.imported.is_empty());
         assert_eq!(report.skipped.len(), 1);
-        assert!(report.skipped[0].1.contains("конфиг"), "{}", report.skipped[0].1);
+        assert!(
+            report.skipped[0].1.contains("конфиг"),
+            "{}",
+            report.skipped[0].1
+        );
     }
 
     /// Сброс: удаляются БД и спутники WAL/SHM; повторный сброс — не

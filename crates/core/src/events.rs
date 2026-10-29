@@ -54,31 +54,106 @@ pub struct EventDef {
 /// Ядро реестра событий (спека §6). Шаблоны подставляют параметры из
 /// `ctx` по плейсхолдерам `{name}`; секреты в шаблонах запрещены.
 pub const REGISTRY: &[EventDef] = &[
-    EventDef { code: "db.unlocked", level: Level::Info, template: "Хранилище разблокировано" },
-    EventDef { code: "db.unlock_failed", level: Level::Warn, template: "Неверный мастер-пароль (попытка {n})" },
-    EventDef { code: "db.rekeyed", level: Level::Info, template: "Мастер-пароль изменён" },
-    EventDef { code: "db.corrupt", level: Level::Fatal, template: "Хранилище повреждено: {detail}" },
-    EventDef { code: "daemon.spawned", level: Level::Info, template: "Демон запущен (pid {pid})" },
-    EventDef { code: "daemon.exited", level: Level::Error, template: "Демон завершился неожиданно (код {code})" },
-    EventDef { code: "daemon.shutdown", level: Level::Info, template: "Демон остановлен по команде пользователя" },
-    EventDef { code: "profiles.synced", level: Level::Debug, template: "Демону передано профилей: {count}" },
-    EventDef { code: "bottle.created", level: Level::Info, template: "Бутылка {id} создана" },
-    EventDef { code: "bottle.updated", level: Level::Info, template: "Бутылка {id} изменена" },
-    EventDef { code: "bottle.deleted", level: Level::Info, template: "Бутылка {id} удалена" },
-    EventDef { code: "bottle.credentials_updated", level: Level::Info, template: "Обновлены логин и пароль бутылки {id}" },
-    EventDef { code: "bottle.start.requested", level: Level::Info, template: "Пользователь запустил бутылку {id}" },
-    EventDef { code: "bottle.stop.requested", level: Level::Info, template: "Пользователь остановил бутылку {id}" },
-    EventDef { code: "bottle.up", level: Level::Info, template: "{id} поднята (socks5 :{port})" },
-    EventDef { code: "bottle.failed", level: Level::Error, template: "{id}: {reason}" },
-    EventDef { code: "wsl.imported", level: Level::Info, template: "Апплайенс импортирован" },
-    EventDef { code: "svc.route_added", level: Level::Debug, template: "Маршрут {cidr} добавлен" },
+    EventDef {
+        code: "db.unlocked",
+        level: Level::Info,
+        template: "Хранилище разблокировано",
+    },
+    EventDef {
+        code: "db.unlock_failed",
+        level: Level::Warn,
+        template: "Неверный мастер-пароль (попытка {n})",
+    },
+    EventDef {
+        code: "db.rekeyed",
+        level: Level::Info,
+        template: "Мастер-пароль изменён",
+    },
+    EventDef {
+        code: "db.corrupt",
+        level: Level::Fatal,
+        template: "Хранилище повреждено: {detail}",
+    },
+    EventDef {
+        code: "daemon.spawned",
+        level: Level::Info,
+        template: "Демон запущен (pid {pid})",
+    },
+    EventDef {
+        code: "daemon.exited",
+        level: Level::Error,
+        template: "Демон завершился неожиданно (код {code})",
+    },
+    EventDef {
+        code: "daemon.shutdown",
+        level: Level::Info,
+        template: "Демон остановлен по команде пользователя",
+    },
+    EventDef {
+        code: "profiles.synced",
+        level: Level::Debug,
+        template: "Демону передано профилей: {count}",
+    },
+    EventDef {
+        code: "bottle.created",
+        level: Level::Info,
+        template: "Бутылка {id} создана",
+    },
+    EventDef {
+        code: "bottle.updated",
+        level: Level::Info,
+        template: "Бутылка {id} изменена",
+    },
+    EventDef {
+        code: "bottle.deleted",
+        level: Level::Info,
+        template: "Бутылка {id} удалена",
+    },
+    EventDef {
+        code: "bottle.credentials_updated",
+        level: Level::Info,
+        template: "Обновлены логин и пароль бутылки {id}",
+    },
+    EventDef {
+        code: "bottle.start.requested",
+        level: Level::Info,
+        template: "Пользователь запустил бутылку {id}",
+    },
+    EventDef {
+        code: "bottle.stop.requested",
+        level: Level::Info,
+        template: "Пользователь остановил бутылку {id}",
+    },
+    EventDef {
+        code: "bottle.up",
+        level: Level::Info,
+        template: "{id} поднята (socks5 :{port})",
+    },
+    EventDef {
+        code: "bottle.failed",
+        level: Level::Error,
+        template: "{id}: {reason}",
+    },
+    EventDef {
+        code: "wsl.imported",
+        level: Level::Info,
+        template: "Апплайенс импортирован",
+    },
+    EventDef {
+        code: "svc.route_added",
+        level: Level::Debug,
+        template: "Маршрут {cidr} добавлен",
+    },
 ];
 
 /// Рендерит событие по коду: уровень из реестра и описание с
 /// подставленными из `ctx` значениями. `None` — код не из реестра.
 /// Подстановка — простая замена `{name}` строковым представлением
 /// значения (строки без кавычек, остальное — компактный JSON).
-pub fn render(code: &str, ctx: serde_json::Map<String, serde_json::Value>) -> Option<(Level, String)> {
+pub fn render(
+    code: &str,
+    ctx: serde_json::Map<String, serde_json::Value>,
+) -> Option<(Level, String)> {
     let def = REGISTRY.iter().find(|d| d.code == code)?;
     let mut desc = def.template.to_string();
     for (key, value) in &ctx {
@@ -97,10 +172,9 @@ pub fn render(code: &str, ctx: serde_json::Map<String, serde_json::Value>) -> Op
 /// Текущая метка времени: RFC3339 UTC с миллисекундами
 /// (`2026-10-21T21:12:04.331Z`).
 pub fn now_ts() -> String {
-    const FORMAT: &[time::format_description::FormatItem<'static>] =
-        time::macros::format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
-        );
+    const FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+    );
     time::OffsetDateTime::now_utc()
         .format(FORMAT)
         .expect("дата форматируется")

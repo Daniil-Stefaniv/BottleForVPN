@@ -94,6 +94,7 @@ mod launch;
 mod logging;
 #[allow(dead_code)]
 mod manager;
+mod paths;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pipe;
 #[allow(dead_code)]
@@ -102,7 +103,6 @@ mod ps_query;
 mod registry;
 mod session;
 mod stats;
-mod paths;
 #[allow(dead_code)]
 mod svc_client;
 #[cfg(unix)]
@@ -141,7 +141,9 @@ async fn main() -> ExitCode {
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
     let rootfs = resolve_rootfs(args.rootfs, &args.data_dir, exe_dir.as_deref());
-    if let Err(error) = serve_daemon(args.data_dir, rootfs, args.gui_token, shutdown_on_ctrl_c()).await {
+    if let Err(error) =
+        serve_daemon(args.data_dir, rootfs, args.gui_token, shutdown_on_ctrl_c()).await
+    {
         tracing::error!(%error, "pogrebok-daemon завершился с ошибкой");
         eprintln!("pogrebok-daemon: {error}");
         return ExitCode::FAILURE;
@@ -298,7 +300,8 @@ where
     I: Iterator<Item = OsString>,
 {
     let flag_value = |args: &mut I, flag: &str| -> Result<OsString, String> {
-        args.next().ok_or_else(|| format!("для {flag} нужно значение"))
+        args.next()
+            .ok_or_else(|| format!("для {flag} нужно значение"))
     };
     let strip = |arg: &OsString, flag: &str| -> Option<OsString> {
         arg.to_str()
@@ -444,9 +447,15 @@ mod tests {
             Some(PathBuf::from("/tmp/rootfs.tar.gz"))
         );
         assert_eq!(
-            parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir", "/tmp/bfa", "--rootfs=/tmp/r.tar"]))
-                .unwrap()
-                .rootfs,
+            parse_cli_args(args(&[
+                "--gui-token",
+                TOKEN,
+                "--data-dir",
+                "/tmp/bfa",
+                "--rootfs=/tmp/r.tar"
+            ]))
+            .unwrap()
+            .rootfs,
             Some(PathBuf::from("/tmp/r.tar"))
         );
     }
@@ -455,7 +464,8 @@ mod tests {
     /// [`resolve_rootfs`] разбирается с данными/exe-каталогом.
     #[test]
     fn rootfs_absent_is_none_after_parse() {
-        let parsed = parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir", "/tmp/bfa"])).unwrap();
+        let parsed =
+            parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir", "/tmp/bfa"])).unwrap();
         assert_eq!(parsed.rootfs, None);
     }
 
@@ -463,8 +473,14 @@ mod tests {
     fn flags_without_value_are_error() {
         assert!(parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir"])).is_err());
         assert!(
-            parse_cli_args(args(&["--gui-token", TOKEN, "--data-dir", "/tmp/bfa", "--rootfs"]))
-                .is_err(),
+            parse_cli_args(args(&[
+                "--gui-token",
+                TOKEN,
+                "--data-dir",
+                "/tmp/bfa",
+                "--rootfs"
+            ]))
+            .is_err(),
             "для --rootfs нужен путь"
         );
     }
@@ -486,11 +502,17 @@ mod tests {
             .expect("валидный токен принят");
         assert_eq!(parsed.gui_token, TOKEN);
         // Форма через `=`.
-        let parsed =
-            parse_cli_args(args(&["--gui-token=ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23"]))
-                .expect("форма через =");
+        let parsed = parse_cli_args(args(&[
+            "--gui-token=ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23ab10cd23",
+        ]))
+        .expect("форма через =");
         assert_eq!(parsed.gui_token, TOKEN);
-        for bad in ["короткий", &TOKEN.to_uppercase(), &TOKEN[..63], &format!("{TOKEN}0")] {
+        for bad in [
+            "короткий",
+            &TOKEN.to_uppercase(),
+            &TOKEN[..63],
+            &format!("{TOKEN}0"),
+        ] {
             assert!(
                 parse_cli_args(args(&["--gui-token", bad])).is_err(),
                 "невалидный токен отклонён: {bad}"

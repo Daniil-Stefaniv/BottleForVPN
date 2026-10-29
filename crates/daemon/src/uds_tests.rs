@@ -110,7 +110,10 @@ async fn uds_serve_replaces_stale_socket_file() {
     )
     .await
     .expect("stale-файл пережат, обмен прошёл");
-    assert!(matches!(reply, CliReply::Error { .. }), "Doctor без менеджера: {reply:?}");
+    assert!(
+        matches!(reply, CliReply::Error { .. }),
+        "Doctor без менеджера: {reply:?}"
+    );
 
     shutdown.cancel();
     server.await.unwrap().expect("serve завершился без ошибки");
@@ -158,7 +161,10 @@ async fn uds_second_serve_on_live_socket_is_refused() {
     )
     .await
     .expect("живой демон отвечает после попытки перебинда");
-    assert!(matches!(reply, CliReply::Error { .. }), "Doctor без менеджера: {reply:?}");
+    assert!(
+        matches!(reply, CliReply::Error { .. }),
+        "Doctor без менеджера: {reply:?}"
+    );
 
     shutdown.cancel();
     first.await.unwrap().expect("serve завершился без ошибки");
@@ -206,13 +212,15 @@ async fn uds_serves_parallel_clients() {
     .await
     .expect("второй клиент обслужен параллельно с первым")
     .expect("обмен второго клиента");
-    assert!(matches!(second_reply, CliReply::Error { .. }), "Doctor без менеджера: {second_reply:?}");
+    assert!(
+        matches!(second_reply, CliReply::Error { .. }),
+        "Doctor без менеджера: {second_reply:?}"
+    );
     assert!(first.await.is_ok());
 
     shutdown.cancel();
     server.await.unwrap().expect("serve завершился без ошибки");
 }
-
 
 // ---------------------------------------------------------------------
 // Протокол 0.3: GUI↔демон поверх UDS — auth-токен, Sync, Subscribe.
@@ -306,7 +314,10 @@ async fn control_requires_hello_and_rejects_bad_token() {
         "неверный токен — AUTH-ошибка: {reply:?}"
     );
     let closed: Option<bottle_core::ipc::GuiReply> = client.recv().await;
-    assert!(closed.is_none(), "соединение закрыто после неверного токена");
+    assert!(
+        closed.is_none(),
+        "соединение закрыто после неверного токена"
+    );
 
     // Верный токен — Ok; SyncProfiles принимается.
     let mut client = GuiClient::connect(&socket).await;
@@ -392,4 +403,3 @@ async fn subscribe_streams_state_changed() {
     shutdown.cancel();
     server.await.unwrap().expect("serve завершился без ошибки");
 }
-

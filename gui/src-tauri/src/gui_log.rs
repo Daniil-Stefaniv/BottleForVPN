@@ -81,13 +81,16 @@ impl GuiLog {
             desc,
             ctx: events::sanitize_ctx(code, ctx),
         };
-        let line = serde_json::to_string(&event)
-            .map_err(|e| format!("событие не сериализуется: {e}"))?;
+        let line =
+            serde_json::to_string(&event).map_err(|e| format!("событие не сериализуется: {e}"))?;
 
         let mut inner = self.inner.lock().expect("мьютекс журнала не отравлен");
         if let Some(writer) = inner.writer.as_mut() {
             // Ошибка записи не роняет GUI: журнал деградирует до буфера.
-            if writeln!(writer, "{line}").and_then(|()| writer.flush()).is_err() {
+            if writeln!(writer, "{line}")
+                .and_then(|()| writer.flush())
+                .is_err()
+            {
                 inner.writer = None;
             }
         }
@@ -154,8 +157,16 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");
         assert!(lines[0].contains(r#""src":"gui""#), "{}", lines[0]);
-        assert!(lines[0].contains(r#""event":"bottle.created""#), "{}", lines[0]);
-        assert!(lines[0].contains("Бутылка office-a создана"), "{}", lines[0]);
+        assert!(
+            lines[0].contains(r#""event":"bottle.created""#),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("Бутылка office-a создана"),
+            "{}",
+            lines[0]
+        );
 
         let recent = log.recent();
         assert_eq!(recent.len(), 2);
@@ -174,7 +185,13 @@ mod tests {
         assert!(error.contains("неизвестный код"), "{error}");
         assert!(log.recent().is_empty());
         let text = std::fs::read_to_string(
-            dir.path().read_dir().unwrap().next().unwrap().unwrap().path(),
+            dir.path()
+                .read_dir()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
         )
         .unwrap();
         assert!(text.is_empty(), "{text}");
@@ -185,7 +202,8 @@ mod tests {
     fn ring_buffer_caps_at_limit() {
         let log = GuiLog::memory_only();
         for n in 0..RING_LIMIT + 100 {
-            log.emit("db.unlock_failed", ctx(&[("n", n.into())])).unwrap();
+            log.emit("db.unlock_failed", ctx(&[("n", n.into())]))
+                .unwrap();
         }
         let recent = log.recent();
         assert_eq!(recent.len(), RING_LIMIT);

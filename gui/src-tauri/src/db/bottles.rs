@@ -120,29 +120,27 @@ impl Vault {
     /// Полный профиль бутылки (профиль + текст конфига + креды);
     /// `None` — нет такой.
     pub fn get_full(&self, id: &str) -> Result<Option<FullProfile>, String> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT b.id, b.name, b.kind, b.vpn_json, b.expose_json,
+        let row = self.conn.query_row(
+            "SELECT b.id, b.name, b.kind, b.vpn_json, b.expose_json,
                         c.config_text, r.username, r.password
                  FROM bottles b
                  LEFT JOIN configs c ON c.bottle_id = b.id
                  LEFT JOIN credentials r ON r.bottle_id = b.id
                  WHERE b.id = ?1",
-                [id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                },
-            );
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        );
         let (id, name, kind, vpn_json, expose_json, config_text, username, password) = match row {
             Ok(row) => row,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
@@ -259,14 +257,11 @@ impl Vault {
 
 /// Записывает профиль + конфиг + креды внутри открытой транзакции
 /// (create и update — один и тот же upsert-путь).
-fn write_profile(
-    tx: &rusqlite::Transaction<'_>,
-    p: &FullProfile,
-) -> Result<(), String> {
+fn write_profile(tx: &rusqlite::Transaction<'_>, p: &FullProfile) -> Result<(), String> {
     let profile = &p.profile;
     let kind = kind_str(profile.kind);
-    let vpn_json = serde_json::to_string(&profile.vpn)
-        .map_err(|e| format!("vpn не сериализуется: {e}"))?;
+    let vpn_json =
+        serde_json::to_string(&profile.vpn).map_err(|e| format!("vpn не сериализуется: {e}"))?;
     let expose_json = serde_json::to_string(&profile.expose)
         .map_err(|e| format!("expose не сериализуется: {e}"))?;
     let now = super::now_utc();
@@ -294,11 +289,8 @@ fn write_profile(
         None => {
             // Конфиг снят (host-бутылка после правки из env): строка
             // не должна остаться призраком.
-            tx.execute(
-                "DELETE FROM configs WHERE bottle_id = ?1",
-                [&profile.id],
-            )
-            .map_err(|e| format!("не удалось снять конфиг: {e}"))?;
+            tx.execute("DELETE FROM configs WHERE bottle_id = ?1", [&profile.id])
+                .map_err(|e| format!("не удалось снять конфиг: {e}"))?;
         }
     }
     if let Some(creds) = &p.credentials {
@@ -329,8 +321,8 @@ fn assemble_full(
     username: Option<String>,
     password: Option<String>,
 ) -> Result<FullProfile, String> {
-    let vpn: VpnConfig = serde_json::from_str(vpn_json)
-        .map_err(|e| format!("битый vpn_json бутылки {id}: {e}"))?;
+    let vpn: VpnConfig =
+        serde_json::from_str(vpn_json).map_err(|e| format!("битый vpn_json бутылки {id}: {e}"))?;
     let expose: ExposeConfig = serde_json::from_str(expose_json)
         .map_err(|e| format!("битый expose_json бутылки {id}: {e}"))?;
     Ok(FullProfile {
@@ -528,7 +520,10 @@ mod tests {
         assert!(vault.get_full("office-a").unwrap().is_none());
         assert!(vault.get_credentials("office-a").unwrap().is_none());
         assert!(vault.list_bottles().unwrap().is_empty());
-        assert!(vault.delete_bottle("office-a").unwrap_err().contains("не найдена"));
+        assert!(vault
+            .delete_bottle("office-a")
+            .unwrap_err()
+            .contains("не найдена"));
     }
 
     /// update_bottle: профиль и конфиг перезаписываются; credentials:

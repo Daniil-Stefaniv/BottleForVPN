@@ -98,7 +98,9 @@ fn parse_ps_time(text: &str) -> Option<f64> {
     let seconds: f64 = match fields.as_slice() {
         [m, s] => m.parse::<f64>().ok()? * 60.0 + s.parse::<f64>().ok()?,
         [h, m, s] => {
-            h.parse::<f64>().ok()? * 3600.0 + m.parse::<f64>().ok()? * 60.0 + s.parse::<f64>().ok()?
+            h.parse::<f64>().ok()? * 3600.0
+                + m.parse::<f64>().ok()? * 60.0
+                + s.parse::<f64>().ok()?
         }
         _ => return None,
     };
@@ -114,7 +116,10 @@ mod tests {
     fn ps_line_parses_rss_and_time() {
         assert_eq!(parse_ps_line("  12345 00:01:23\n"), Some((12345, 83.0)));
         assert_eq!(parse_ps_line("999 01:00:00"), Some((999, 3600.0)));
-        assert_eq!(parse_ps_line("1 2-03:04:05"), Some((1, 2.0 * 86400.0 + 3.0 * 3600.0 + 4.0 * 60.0 + 5.0)));
+        assert_eq!(
+            parse_ps_line("1 2-03:04:05"),
+            Some((1, 2.0 * 86400.0 + 3.0 * 3600.0 + 4.0 * 60.0 + 5.0))
+        );
         assert_eq!(parse_ps_line("12 00:42"), Some((12, 42.0)));
         assert_eq!(parse_ps_line("мусор"), None);
         assert_eq!(parse_ps_line(""), None);

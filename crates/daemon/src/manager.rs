@@ -55,8 +55,8 @@ use tokio::task::JoinSet;
 use crate::appliance::{ensure_appliance, ApplianceHandle, WslRunner};
 use crate::error::DaemonError;
 use crate::host_manager::{HostManager, HostParts, HostTiming};
-use crate::registry::SharedRegistry;
 use crate::paths::atomic_write;
+use crate::registry::SharedRegistry;
 
 /// Нижняя граница диапазона автоподбора портов (dynamic, RFC 6335).
 pub const PORT_DYNAMIC_MIN: u16 = 49152;
@@ -386,7 +386,11 @@ impl BottleManager {
 
     /// Создаёт менеджера над реестром и подключением; host-часть —
     /// продакшн-инъекции ([`crate::host_manager::HostParts::real`]).
-    pub fn new(registry: SharedRegistry, data_root: PathBuf, connect: Arc<dyn AgentConnect>) -> Self {
+    pub fn new(
+        registry: SharedRegistry,
+        data_root: PathBuf,
+        connect: Arc<dyn AgentConnect>,
+    ) -> Self {
         Self::new_with_host(
             registry,
             data_root,
@@ -723,7 +727,10 @@ impl BottleManager {
         {
             if let Some(text) = &full.config_text {
                 if bottle_core::profile::openvpn_config_needs_auth(text) {
-                    tracing::info!(id, "конфиг требует auth-user-pass, а сохранённых кредов нет");
+                    tracing::info!(
+                        id,
+                        "конфиг требует auth-user-pass, а сохранённых кредов нет"
+                    );
                     return Ok(CliReply::Error {
                         message: format!(
                             "бутылка «{id}»: нет сохранённого логина/пароля — \
@@ -781,7 +788,12 @@ impl BottleManager {
         let marker_alive = runtime.get(id).is_some_and(|r| r.generation == generation);
         match outcome {
             Ok(made) if marker_alive => {
-                let socks5_port = made.listeners.socks5.local_addr().ok().map(|addr| addr.port());
+                let socks5_port = made
+                    .listeners
+                    .socks5
+                    .local_addr()
+                    .ok()
+                    .map(|addr| addr.port());
                 runtime.insert(
                     id.to_string(),
                     Runtime {
@@ -796,10 +808,7 @@ impl BottleManager {
                 tracing::info!(id, "бутылка поднята");
                 let mut ctx = serde_json::Map::new();
                 ctx.insert("id".to_string(), id.into());
-                ctx.insert(
-                    "port".to_string(),
-                    socks5_port.unwrap_or_default().into(),
-                );
+                ctx.insert("port".to_string(), socks5_port.unwrap_or_default().into());
                 self.emit_event("bottle.up", ctx);
                 if let Some(command) = &profile.expose.launch {
                     crate::launch::spawn_launch(command);
@@ -2213,7 +2222,10 @@ mod tests {
                 password: "s3cret".to_string(),
             }),
         });
-        let reply = manager.start("yorus-new").await.expect("start с кредами ок");
+        let reply = manager
+            .start("yorus-new")
+            .await
+            .expect("start с кредами ок");
         assert_eq!(
             reply,
             CliReply::Started {
@@ -2267,7 +2279,10 @@ mod tests {
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
         let manager = manager_with(&registry, data.path(), fake);
 
-        let error = manager.start("ghost").await.expect_err("пустой реестр — ошибка");
+        let error = manager
+            .start("ghost")
+            .await
+            .expect_err("пустой реестр — ошибка");
         let text = error.to_string();
         assert!(text.contains("ghost"), "назван id: {text}");
         assert!(
@@ -2328,10 +2343,7 @@ mod tests {
         let fake = FakeAgent::spawn(UpBehavior::PortBusyOnce).await;
         let manager = manager_with(&registry, data.path(), fake.clone());
 
-        let reply = manager
-            .start("office-a")
-            .await
-            .expect("start после ретрая");
+        let reply = manager.start("office-a").await.expect("start после ретрая");
         assert_eq!(
             reply,
             CliReply::Started {
@@ -2372,10 +2384,7 @@ mod tests {
 
         // Первый Up — PORT_BUSY; повтор сохраняет фиксированный порт
         // (без повторного bind) и перевыбирает динамический.
-        let reply = manager
-            .start("fixed-a")
-            .await
-            .expect("start после ретрая");
+        let reply = manager.start("fixed-a").await.expect("start после ретрая");
         assert_eq!(
             reply,
             CliReply::Started {
@@ -2421,10 +2430,7 @@ mod tests {
         let fake = FakeAgent::spawn(UpBehavior::PortBusyAlways).await;
         let manager = manager_with(&registry, data.path(), fake.clone());
 
-        let reply = manager
-            .start("fixed-b")
-            .await
-            .expect("ответ, не сбой");
+        let reply = manager.start("fixed-b").await.expect("ответ, не сбой");
         let CliReply::Error { message } = reply else {
             panic!("ожидали Error, получили {reply:?}");
         };
@@ -2699,10 +2705,7 @@ mod tests {
             .stop("office-a")
             .await
             .expect("stop во время старта (Down ещё NOT_FOUND)");
-        let reply = manager
-            .start("office-a")
-            .await
-            .expect("restart отвечает");
+        let reply = manager.start("office-a").await.expect("restart отвечает");
         let CliReply::Error { message } = reply else {
             panic!("ожидали Error (ALREADY_UP), получили {reply:?}")
         };
@@ -2818,10 +2821,7 @@ mod tests {
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
         let manager = manager_with(&registry, data.path(), fake.clone());
 
-        let reply = manager
-            .start("corp-vpn")
-            .await
-            .expect("ответ, не сбой");
+        let reply = manager.start("corp-vpn").await.expect("ответ, не сбой");
         let CliReply::Error { message } = reply else {
             panic!("ожидали Error, получили {reply:?}");
         };
@@ -2852,10 +2852,7 @@ mod tests {
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
         let manager = manager_with(&registry, data.path(), fake.clone());
 
-        let reply = manager
-            .start("office-a")
-            .await
-            .expect("ответ, не сбой");
+        let reply = manager.start("office-a").await.expect("ответ, не сбой");
         let CliReply::Error { message } = reply else {
             panic!("ожидали Error, получили {reply:?}");
         };
@@ -2863,10 +2860,7 @@ mod tests {
             message.contains("конфиг не задан"),
             "причина — отсутствие конфига: {message}"
         );
-        assert!(
-            message.contains("office-a"),
-            "назван id бутылки: {message}"
-        );
+        assert!(message.contains("office-a"), "назван id бутылки: {message}");
 
         let bottles = manager.status().await;
         assert!(matches!(&bottles[0].state, BottleState::Failed { .. }));
@@ -2884,10 +2878,7 @@ mod tests {
         let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
         let manager = manager_with(&registry, tmp.path(), fake);
-        manager
-            .start("office-a")
-            .await
-            .expect("бутылка поднята");
+        manager.start("office-a").await.expect("бутылка поднята");
         let daemon = crate::test_daemon(tmp.path(), "tok", Some(manager));
         daemon
             .registry
@@ -2934,10 +2925,7 @@ mod tests {
         ))
         .await;
         let manager = manager_with(&registry, tmp.path(), fake);
-        let reply = manager
-            .start("office-a")
-            .await
-            .expect("ответ, не сбой");
+        let reply = manager.start("office-a").await.expect("ответ, не сбой");
         assert!(matches!(reply, CliReply::Error { .. }), "start провалился");
         assert!(manager
             .status()
@@ -2977,10 +2965,7 @@ mod tests {
         let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
         let manager = manager_with(&registry, tmp.path(), fake);
-        manager
-            .start("office-a")
-            .await
-            .expect("бутылка поднята");
+        manager.start("office-a").await.expect("бутылка поднята");
         let daemon = crate::test_daemon(tmp.path(), "tok", Some(manager));
 
         let reply = crate::pipe::dispatch(
@@ -3007,10 +2992,7 @@ mod tests {
         let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
         let manager = manager_with(&registry, tmp.path(), fake);
-        manager
-            .start("office-a")
-            .await
-            .expect("бутылка поднята");
+        manager.start("office-a").await.expect("бутылка поднята");
         let first = manager.stop("office-a").await.expect("первый stop");
         assert_eq!(
             first,
@@ -3084,15 +3066,12 @@ mod tests {
         let registry = registry_with(&env_profile("office-a", "wg.conf"));
         let fake = FakeAgent::spawn(UpBehavior::Ready).await;
         let (events, mut rx) = tokio::sync::broadcast::channel(8);
-        let log: crate::logging::SharedEventLog = std::sync::Arc::new(std::sync::Mutex::new(
-            Some(crate::logging::EventLog::open(tmp.path()).unwrap()),
-        ));
-        let manager = BottleManager::new(
-            registry.clone(),
-            tmp.path().to_path_buf(),
-            Arc::new(fake),
-        )
-        .with_event_sink(events.clone(), log.clone());
+        let log: crate::logging::SharedEventLog = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            crate::logging::EventLog::open(tmp.path()).unwrap(),
+        )));
+        let manager =
+            BottleManager::new(registry.clone(), tmp.path().to_path_buf(), Arc::new(fake))
+                .with_event_sink(events.clone(), log.clone());
 
         manager.start("office-a").await.expect("бутылка поднята");
 
@@ -3116,10 +3095,7 @@ mod tests {
             registry,
             tmp.path().join("m2"),
             Arc::new(
-                FakeAgent::spawn(UpBehavior::TunnelFailed(
-                    "туннель не поднялся".to_string(),
-                ))
-                .await,
+                FakeAgent::spawn(UpBehavior::TunnelFailed("туннель не поднялся".to_string())).await,
             ),
         )
         .with_event_sink(events, log);
@@ -3496,5 +3472,4 @@ mod tests {
         // Агент ни при чём: бутылка в аплаенсе жива, Down не уходил.
         assert!(fake.journal.downs().is_empty());
     }
-
 }

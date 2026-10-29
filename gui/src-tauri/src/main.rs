@@ -69,7 +69,10 @@ pub fn quit_confirm_text(active: &[String]) -> String {
     if active.is_empty() {
         QUESTION.to_string()
     } else {
-        format!("{QUESTION}\nАктивные бутылки будут остановлены: {}.", active.join(", "))
+        format!(
+            "{QUESTION}\nАктивные бутылки будут остановлены: {}.",
+            active.join(", ")
+        )
     }
 }
 
@@ -242,7 +245,10 @@ struct DaemonLink {
 
 /// Control-запрос демону свежим соединением (демон обслуживает
 /// параллельные подключения; соединение закрывается после ответа).
-async fn control_request(token: &str, req: bottle_core::ipc::GuiRequest) -> Result<bottle_core::ipc::GuiReply, String> {
+async fn control_request(
+    token: &str,
+    req: bottle_core::ipc::GuiRequest,
+) -> Result<bottle_core::ipc::GuiReply, String> {
     let client = daemon_client::DaemonClient::new()
         .ok_or_else(|| "каталог данных недоступен".to_string())?;
     client.connect(token).await?;
@@ -498,11 +504,9 @@ fn build_full_profile(
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
     if !valid_id {
-        return Err(
-            "идентификатор: строчные латинские буквы, цифры и дефис; \
+        return Err("идентификатор: строчные латинские буквы, цифры и дефис; \
              начинается с буквы или цифры"
-                .to_string(),
-        );
+            .to_string());
     }
     let name = args.name.trim();
     if name.is_empty() {
@@ -517,14 +521,13 @@ fn build_full_profile(
                 .unwrap_or(bottle_core::profile::TunnelProtocol::WireGuard);
             // Правка без нового файла: имя и текст конфига — прежние.
             let previous = existing.and_then(|full| match &full.profile.vpn {
-                VpnConfig::Env { config, .. } => {
-                    Some((config.clone(), full.config_text.clone()))
-                }
+                VpnConfig::Env { config, .. } => Some((config.clone(), full.config_text.clone())),
                 VpnConfig::Host { .. } => None,
             });
             let (config_name, text) = match &args.config_path {
                 Some(path) if !path.trim().is_empty() => {
-                    let text = read_config.take().expect("read_config вызывается раз")(path)?;
+                    let text =
+                        read_config.take().expect("read_config вызывается раз")(path)?;
                     // Имя файла — по обоим разделителям: приложение живёт
                     // на Windows (пути с `\`), тесты гоняются и на Unix.
                     let file_name = path
@@ -537,8 +540,7 @@ fn build_full_profile(
                 }
                 _ => previous.unwrap_or_default(),
             };
-            let text =
-                text.ok_or_else(|| "укажите файл конфигурации туннеля".to_string())?;
+            let text = text.ok_or_else(|| "укажите файл конфигурации туннеля".to_string())?;
             (
                 VpnConfig::Env {
                     protocol,
@@ -839,10 +841,7 @@ fn change_password(
 
 /// Читает настройку из meta (`ui.tab`, `ui.win_w`, …). Отсутствующая — None.
 #[tauri::command]
-fn get_setting(
-    vault: tauri::State<'_, VaultState>,
-    key: &str,
-) -> Result<Option<String>, String> {
+fn get_setting(vault: tauri::State<'_, VaultState>, key: &str) -> Result<Option<String>, String> {
     let guard = vault.vault.lock().expect("vault не отравлен");
     guard
         .as_ref()
@@ -852,11 +851,7 @@ fn get_setting(
 
 /// Пишет настройку в meta.
 #[tauri::command]
-fn set_setting(
-    vault: tauri::State<'_, VaultState>,
-    key: &str,
-    value: &str,
-) -> Result<(), String> {
+fn set_setting(vault: tauri::State<'_, VaultState>, key: &str, value: &str) -> Result<(), String> {
     let guard = vault.vault.lock().expect("vault не отравлен");
     guard
         .as_ref()
@@ -876,11 +871,7 @@ fn data_dir() -> Result<String, String> {
 /// Значения зажаты в разумные рамки, чтобы мусор в БД не увёл окно
 /// за экран.
 #[tauri::command]
-fn apply_window_size(
-    app: tauri::AppHandle,
-    width: f64,
-    height: f64,
-) -> Result<(), String> {
+fn apply_window_size(app: tauri::AppHandle, width: f64, height: f64) -> Result<(), String> {
     use tauri::Manager as _;
     let window = app
         .get_webview_window("main")
@@ -1035,10 +1026,7 @@ mod tests {
         );
         assert_eq!(full.profile.expose.forwards.len(), 1);
         assert_eq!(full.profile.expose.forwards[0].listen, 0);
-        assert_eq!(
-            full.profile.expose.dns,
-            Some("10.20.30.1".parse().unwrap())
-        );
+        assert_eq!(full.profile.expose.dns, Some("10.20.30.1".parse().unwrap()));
         assert!(full.credentials.is_none());
     }
 
@@ -1055,10 +1043,8 @@ mod tests {
     /// (пользователь не перевыбирал файл).
     #[test]
     fn build_env_edit_keeps_stored_config() {
-        let existing = build_full_profile(&args_env(), None, |_| {
-            Ok("OLD CONFIG".to_string())
-        })
-        .unwrap();
+        let existing =
+            build_full_profile(&args_env(), None, |_| Ok("OLD CONFIG".to_string())).unwrap();
         let mut args = args_env();
         args.is_edit = true;
         args.config_path = None;

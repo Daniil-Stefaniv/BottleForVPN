@@ -312,8 +312,9 @@ mod tests {
     #[test]
     fn emit_writes_event_and_broadcasts() {
         let tmp = tempfile::tempdir().unwrap();
-        let log: SharedEventLog =
-            std::sync::Arc::new(std::sync::Mutex::new(Some(EventLog::open(tmp.path()).unwrap())));
+        let log: SharedEventLog = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            EventLog::open(tmp.path()).unwrap(),
+        )));
         let (events, mut rx) = tokio::sync::broadcast::channel(8);
 
         let mut ctx = serde_json::Map::new();
@@ -328,7 +329,10 @@ mod tests {
         );
 
         let line = fs::read_to_string(tmp.path().join("events.jsonl")).unwrap();
-        assert!(line.contains(r#""event":"bottle.up""#), "код в файле: {line}");
+        assert!(
+            line.contains(r#""event":"bottle.up""#),
+            "код в файле: {line}"
+        );
         assert!(line.contains(r#""port":1080"#), "порт в ctx: {line}");
         assert!(line.contains("office-a"), "описание в файле: {line}");
 
@@ -345,8 +349,9 @@ mod tests {
     #[test]
     fn log_line_never_contains_secret_patterns() {
         let tmp = tempfile::tempdir().unwrap();
-        let log: SharedEventLog =
-            std::sync::Arc::new(std::sync::Mutex::new(Some(EventLog::open(tmp.path()).unwrap())));
+        let log: SharedEventLog = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            EventLog::open(tmp.path()).unwrap(),
+        )));
         let (events, _rx) = tokio::sync::broadcast::channel::<bottle_core::ipc::DaemonEvent>(8);
 
         let mut ctx = serde_json::Map::new();

@@ -603,6 +603,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "scenario"
+version = "0.3.0"
+dependencies = [
+ "bottle-core",
+ "bytes",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"

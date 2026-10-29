@@ -97,8 +97,8 @@ impl Vault {
             fs::create_dir_all(dir)
                 .map_err(|e| format!("не удалось создать каталог {}: {e}", dir.display()))?;
         }
-        let conn = Connection::open(path)
-            .map_err(|e| format!("не удалось создать хранилище: {e}"))?;
+        let conn =
+            Connection::open(path).map_err(|e| format!("не удалось создать хранилище: {e}"))?;
         apply_key(&conn, password).map_err(|e| format!("не удалось задать ключ: {e}"))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| format!("не удалось создать схему хранилища: {e}"))?;
@@ -246,7 +246,11 @@ fn now_utc() -> String {
         .as_secs();
     let days = (secs / 86_400) as i64;
     let secs_of_day = secs % 86_400;
-    let (hour, minute, second) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    let (hour, minute, second) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -293,10 +297,7 @@ mod tests {
         drop(vault);
 
         assert!(
-            matches!(
-                Vault::unlock(&path, first),
-                Err(UnlockError::WrongPassword)
-            ),
+            matches!(Vault::unlock(&path, first), Err(UnlockError::WrongPassword)),
             "старый пароль не подходит"
         );
         Vault::unlock(&path, second).expect("новый пароль открывает");

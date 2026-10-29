@@ -20,9 +20,7 @@ use std::sync::Arc;
 
 use bottle_core::events::Src;
 use bottle_core::frame::LengthJsonCodec;
-use bottle_core::ipc::{
-    CliReply, CliRequest, DaemonStats, GuiReply, GuiRequest, AUTH_ERR,
-};
+use bottle_core::ipc::{CliReply, CliRequest, DaemonStats, GuiReply, GuiRequest, AUTH_ERR};
 use bytes::BytesMut;
 use tokio::io::{split, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_stream::StreamExt;
@@ -83,49 +81,50 @@ pub(crate) async fn handle_connection<S>(
             break;
         }
 
-        let reply: serde_json::Value = if let Ok(req) = serde_json::from_value::<GuiRequest>(frame.clone()) {
-            match req {
-                GuiRequest::Hello { token } => {
-                    if token == daemon.gui_token {
-                        authed = true;
-                        to_value(&GuiReply::Ok)
-                    } else {
-                        let _ = send_value(
-                            &mut write_half,
-                            &GuiReply::Error {
-                                message: format!("{AUTH_ERR}: неверный токен"),
-                            },
-                        )
-                        .await;
-                        break;
+        let reply: serde_json::Value =
+            if let Ok(req) = serde_json::from_value::<GuiRequest>(frame.clone()) {
+                match req {
+                    GuiRequest::Hello { token } => {
+                        if token == daemon.gui_token {
+                            authed = true;
+                            to_value(&GuiReply::Ok)
+                        } else {
+                            let _ = send_value(
+                                &mut write_half,
+                                &GuiReply::Error {
+                                    message: format!("{AUTH_ERR}: неверный токен"),
+                                },
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                    // Служебные команды доступны без токена (их шлёт CLI,
+                    // у которого токена нет — спека §5).
+                    GuiRequest::Doctor | GuiRequest::LogsExport { .. } => {
+                        to_value(&gui_dispatch(&daemon, Some(&shutdown), req).await)
+                    }
+                    _ if !authed => to_value(&GuiReply::Error {
+                        message: format!("{AUTH_ERR}: сначала Hello с токеном"),
+                    }),
+                    _ => {
+                        let reply = tokio::select! {
+                            reply = gui_dispatch(&daemon, Some(&shutdown), req) => reply,
+                            () = shutdown.cancelled() => break,
+                        };
+                        to_value(&reply)
                     }
                 }
-                // Служебные команды доступны без токена (их шлёт CLI,
-                // у которого токена нет — спека §5).
-                GuiRequest::Doctor | GuiRequest::LogsExport { .. } => {
-                    to_value(&gui_dispatch(&daemon, Some(&shutdown), req).await)
-                }
-                _ if !authed => to_value(&GuiReply::Error {
-                    message: format!("{AUTH_ERR}: сначала Hello с токеном"),
-                }),
-                _ => {
-                    let reply = tokio::select! {
-                        reply = gui_dispatch(&daemon, Some(&shutdown), req) => reply,
-                        () = shutdown.cancelled() => break,
-                    };
-                    to_value(&reply)
-                }
-            }
-        } else if let Ok(req) = serde_json::from_value::<CliRequest>(frame) {
-            let reply = tokio::select! {
-                reply = crate::pipe::dispatch(&daemon, Some(&shutdown), req) => reply,
-                () = shutdown.cancelled() => break,
+            } else if let Ok(req) = serde_json::from_value::<CliRequest>(frame) {
+                let reply = tokio::select! {
+                    reply = crate::pipe::dispatch(&daemon, Some(&shutdown), req) => reply,
+                    () = shutdown.cancelled() => break,
+                };
+                to_value(&reply)
+            } else {
+                tracing::warn!("кадр не распознан ни как GuiRequest, ни как CliRequest");
+                break;
             };
-            to_value(&reply)
-        } else {
-            tracing::warn!("кадр не распознан ни как GuiRequest, ни как CliRequest");
-            break;
-        };
 
         if send_value(&mut write_half, &reply).await.is_err() {
             break;
@@ -246,9 +245,7 @@ pub(crate) async fn gui_dispatch(
                     .any(|state| state.id == id && crate::pipe::is_active_state(&state.state));
                 if active {
                     return GuiReply::Error {
-                        message: format!(
-                            "бутылка {id} активна — остановите её перед удалением"
-                        ),
+                        message: format!("бутылка {id} активна — остановите её перед удалением"),
                     };
                 }
             }
@@ -411,7 +408,9 @@ async fn wsl_state(_daemon: &Daemon) -> String {
 mod tests {
     use super::*;
     use bottle_core::ipc::FullProfile;
-    use bottle_core::profile::{BottleKind, BottleProfile, ExposeConfig, TunnelProtocol, VpnConfig};
+    use bottle_core::profile::{
+        BottleKind, BottleProfile, ExposeConfig, TunnelProtocol, VpnConfig,
+    };
 
     fn full_profile(id: &str) -> FullProfile {
         FullProfile {
@@ -452,7 +451,8 @@ mod tests {
         assert_eq!(reply, GuiReply::Ok);
         assert_eq!(daemon.registry.read().expect("реестр").ids(), ["a", "b"]);
 
-        let bottle_core::ipc::DaemonEvent::Log(event) = rx.recv().await.expect("событие sync") else {
+        let bottle_core::ipc::DaemonEvent::Log(event) = rx.recv().await.expect("событие sync")
+        else {
             panic!("ожидали Log-событие");
         };
         assert_eq!(event.event, "profiles.synced");
@@ -496,12 +496,7 @@ mod tests {
         assert_eq!(reply, GuiReply::Ok);
         assert_eq!(daemon.registry.read().expect("реестр").ids(), ["a", "b"]);
 
-        let reply = gui_dispatch(
-            &daemon,
-            None,
-            GuiRequest::RemoveProfile { id: "a".into() },
-        )
-        .await;
+        let reply = gui_dispatch(&daemon, None, GuiRequest::RemoveProfile { id: "a".into() }).await;
         assert_eq!(reply, GuiReply::Ok);
         assert_eq!(daemon.registry.read().expect("реестр").ids(), ["b"]);
 

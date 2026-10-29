@@ -214,7 +214,15 @@ pub async fn upgrade_appliance(
     connect_timeout: Duration,
     force: bool,
 ) -> Result<String, DaemonError> {
-    upgrade_appliance_with_port(wsl, data_root, rootfs_tar, connect_timeout, AGENT_PORT, force).await
+    upgrade_appliance_with_port(
+        wsl,
+        data_root,
+        rootfs_tar,
+        connect_timeout,
+        AGENT_PORT,
+        force,
+    )
+    .await
 }
 
 /// Реализация [`upgrade_appliance`] с настраиваемым портом агента
@@ -248,7 +256,8 @@ async fn upgrade_appliance_with_port(
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let handle = ensure_appliance_with_port(wsl, data_root, rootfs_tar, connect_timeout, port).await?;
+    let handle =
+        ensure_appliance_with_port(wsl, data_root, rootfs_tar, connect_timeout, port).await?;
     Ok(handle.appliance_version)
 }
 
@@ -368,7 +377,10 @@ async fn provision_token(
     );
 
     write_token_into_vm(wsl, &token).await?;
-    crate::paths::atomic_write(&crate::paths::appliance_token_path(data_root), token.as_bytes())?;
+    crate::paths::atomic_write(
+        &crate::paths::appliance_token_path(data_root),
+        token.as_bytes(),
+    )?;
     Ok(token)
 }
 
@@ -411,7 +423,10 @@ async fn read_token_from_vm(wsl: &dyn WslRunner, data_root: &Path) -> Result<Str
         tracing::warn!("файл токена в VM пуст");
         return Err(DaemonError::ApplianceTokenLost);
     }
-    crate::paths::atomic_write(&crate::paths::appliance_token_path(data_root), token.as_bytes())?;
+    crate::paths::atomic_write(
+        &crate::paths::appliance_token_path(data_root),
+        token.as_bytes(),
+    )?;
     tracing::info!("локальная копия токена аплаенса восстановлена из VM");
     Ok(token.to_string())
 }
@@ -1123,10 +1138,7 @@ mod tests {
         let import = position(&calls, "--import");
         let import_args = calls[import].args();
         assert_eq!(import_args[1], DISTRIBUTION);
-        assert_eq!(
-            import_args[2],
-            root.join(VM_DIR_NAME).to_str().unwrap()
-        );
+        assert_eq!(import_args[2], root.join(VM_DIR_NAME).to_str().unwrap());
         assert_eq!(import_args[3], rootfs.to_str().unwrap());
 
         let token_write = position(&calls, "cat > /etc/bottle-agent/token");
@@ -1412,7 +1424,11 @@ mod tests {
     async fn existing_install_reuses_local_token_without_import() {
         let (_tmp, root, rootfs) = test_data();
         const LOCAL_TOKEN: &str = "deadbeefcafe0123";
-        std::fs::write(crate::paths::appliance_token_path(&root), format!("{LOCAL_TOKEN}\n")).unwrap();
+        std::fs::write(
+            crate::paths::appliance_token_path(&root),
+            format!("{LOCAL_TOKEN}\n"),
+        )
+        .unwrap();
 
         let wsl = FakeWsl::new(true);
         wsl.token.set(LOCAL_TOKEN.to_string());
