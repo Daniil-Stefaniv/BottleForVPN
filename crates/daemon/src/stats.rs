@@ -134,12 +134,27 @@ mod tests {
         assert_eq!(cpu1, 0.0, "первый замер — базовая точка");
 
         // Нагрузить CPU, затем второй замер: дельта положительна.
-        let until = Instant::now() + std::time::Duration::from_millis(150);
+        // `ps time` отдаёт ЦЕЛЫЕ секунды: короткая нагрузка может не
+        // переступить границу секунды (флаки на CI), поэтому крутимся,
+        // пока счётчик CPU реально не сдвинется (дедлайн 10 с).
+        let baseline = query_process(pid).await.expect("ps доступен").1;
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut advanced = false;
         let mut x = 0u64;
-        while Instant::now() < until {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+        while Instant::now() < deadline {
+            let burst = Instant::now() + std::time::Duration::from_millis(100);
+            while Instant::now() < burst {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            }
+            if let Some((_, cpu)) = query_process(pid).await {
+                if cpu > baseline {
+                    advanced = true;
+                    break;
+                }
+            }
         }
         std::hint::black_box(x);
+        assert!(advanced, "счётчик CPU ps сдвинулся под нагрузкой");
         let (_rss2, cpu2) = sampler.sample(pid).await;
         assert!(cpu2 > 0.0, "после нагрузки дельта CPU положительна: {cpu2}");
     }

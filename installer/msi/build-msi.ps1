@@ -1,4 +1,4 @@
-# Сборка MSI Pogrebok (Windows + WiX v4/v5 CLI; CI: windows-раннер).
+﻿# Сборка MSI Pogrebok (Windows + WiX v4/v5 CLI; CI: windows-раннер).
 #
 # Формирует artifacts/Pogrebok-<version>-win-x64.msi + SHA256.
 # Версия — из [workspace.package].version (cargo metadata); требует

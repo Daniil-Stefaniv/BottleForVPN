@@ -1,4 +1,4 @@
-# Сборка portable-дистрибутива Погребка (Windows, CI или локально).
+﻿# Сборка portable-дистрибутива Погребка (Windows, CI или локально).
 #
 # Формирует dist/portable/Pogrebok/: pogrebok-gui.exe, pogrebok.exe,
 # pogrebok-daemon.exe, pogrebok-svc.exe (для --install по желанию

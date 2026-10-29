@@ -15,6 +15,9 @@
 // блокировки, главное окно, Диагностика); до них используют только тесты.
 #![allow(dead_code)]
 
+// PathBuf нужен только unix-эндпоинту (Endpoint::Socket); на Windows
+// эндпоинт — фиксированное имя named pipe.
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

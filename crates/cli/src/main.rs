@@ -503,7 +503,7 @@ mod client {
                     }
                     tokio::time::sleep(CONNECT_RETRY_PAUSE).await;
                 }
-                Err(error) => Err(ClientError::Io(error)),
+                Err(error) => return Err(ClientError::Io(error)),
             }
         }
     }

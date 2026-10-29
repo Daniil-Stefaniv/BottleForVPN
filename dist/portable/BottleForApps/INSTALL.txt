@@ -1,0 +1,25 @@
+﻿BottleForApps 0.2.0 — portable-вариант (без прав администратора).
+
+Что здесь лежит:
+  bottle.exe      — CLI (bottle create/list/start/stop/doctor/logs export/upgrade)
+  bottled.exe     — демон (запустите его в терминале; работает в вашей сессии)
+  bottle-svc.exe  — служба маршрутов для host-бутылок (НЕ обязательна)
+  bottle-gui.exe  — графический интерфейс (список бутылок, старт/стоп, doctor)
+  appliance/      — rootfs аплаенса WSL (используется bottled отсюда)
+
+Требования:
+  - WSL включён в системе ЗАРАНЕЕ (wsl --install --no-distribution + перезагрузка);
+    portable-вариант сам WSL не устанавливает.
+
+Ограничения portable:
+  - Только env-бутылки (WireGuard/OpenVPN в изолированных окружениях WSL).
+  - Host-бутылки (фирменные VPN-клиенты) требуют службу маршрутов:
+    запустите от администратора  bottle-svc.exe --install
+
+Начало работы:
+  1) bottled.exe            (демон; держите окно открытым)
+  2) bottle doctor          (проверка окружения)
+  3) bottle create my-vpn --name "Мой VPN" --kind env --protocol wireguard --config C:\path\wg.conf
+  4) bottle start my-vpn
+
+Диагностика: bottle doctor, bottle logs export.
