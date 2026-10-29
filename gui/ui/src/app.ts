@@ -310,7 +310,7 @@ function openCredsDialog(id: string): void {
   });
 }
 
-/** «Запустить демона»: спавн bottled, затем подключение и sync. */
+/** «Запустить демона»: спавн pogrebok-daemon, затем подключение и sync. */
 async function onStartDaemon(): Promise<void> {
   if (daemonApi === null) {
     return;

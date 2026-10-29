@@ -7,7 +7,7 @@
 //! служебные `Doctor`/`LogsExport`/`Upgrade`/`RoutesCleanup`/
 //! `ShutdownDaemon`.
 //!
-//! Транспорт (Windows named pipe `\\.\pipe\bottled`, [`serve`])
+//! Транспорт (Windows named pipe `\\.\pipe\pogrebok-daemon`, [`serve`])
 //! обслуживает клиентов параллельно: принятое соединение уходит в свою
 //! задачу `tokio::spawn`, а цикл сразу пересоздаёт экземпляр канала для
 //! следующих подключений. Одновременно обслуживается столько клиентов,
@@ -82,7 +82,7 @@ pub async fn dispatch(
                     return CliReply::Error {
                         message: format!(
                             "остановите бутылки перед обновлением: {} \
-                             (или `bottle upgrade --force` — они будут остановлены)",
+                             (или `pogrebok upgrade --force` — они будут остановлены)",
                             live.join(", ")
                         ),
                     };
@@ -282,13 +282,13 @@ mod tests {
     }
 
     /// Имя тестового канала: уникально в пределах прогона (параллельные
-    /// тесты не конфликтуют ни между собой, ни с боевым `bottled`).
+    /// тесты не конфликтуют ни между собой, ни с боевым `pogrebok-daemon`).
     #[cfg(windows)]
     fn unique_pipe_name(label: &str) -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!(r"\\.\pipe\bottled-test-{label}-{}-{n}", std::process::id())
+        format!(r"\\.\pipe\pogrebok-daemon-test-{label}-{}-{n}", std::process::id())
     }
 
     /// Подключается к тестовому каналу с повторами: между созданием

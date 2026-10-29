@@ -1,4 +1,4 @@
-# Апплайенс BottleForApps (Alpine rootfs)
+# Апплайенс Погребка (Alpine rootfs)
 
 Корневая файловая система для WSL2-дистрибутива, в котором живёт `bottle-agent`.
 После `wsl --import` агент стартует автоматически через boot-команду из
@@ -28,40 +28,41 @@
 ```
 
 Скрипт (требуется docker; локально — Colima, в CI — ubuntu): генерирует
-version-файл, собирает multi-stage образ `bottleforapps-appliance:latest`
+version-файл, собирает multi-stage образ `pogrebok-appliance:latest`
 под `--platform linux/amd64`, гоняет smoke-проверку и экспортирует rootfs
-контейнера в **`artifacts/bottleforapps-rootfs.tar.gz`** (путь и размер
+контейнера в **`artifacts/pogrebok-rootfs.tar.gz`** (путь и размер
 печатается в конце). CI-джоба `appliance-build` загружает артефакт тем же
 скриптом.
 
 ## Ручная проверка на Windows
 
 ```powershell
-wsl --import bottleforapps <каталог-для-distro> artifacts\bottleforapps-rootfs.tar.gz
-wsl -d bottleforapps -- cat /etc/bottle-appliance-version
-# control-сервер: wsl -d bottleforapps -- netstat -tln  (0.0.0.0:7777)
-wsl --unregister bottleforapps   # удалить по окончании
+wsl --import pogrebok <каталог-для-distro> artifacts\pogrebok-rootfs.tar.gz
+wsl -d pogrebok -- cat /etc/bottle-appliance-version
+# control-сервер: wsl -d pogrebok -- netstat -tln  (0.0.0.0:7777)
+wsl --unregister pogrebok   # удалить по окончании
 ```
 
 Токен control-протокола лежит в дистрибутиве в `/etc/bottle-agent/token`.
 
 ## Куда rootfs попадает в дистрибутивы (M3)
 
-- **MSI**: `ProgramFiles\BottleForApps\appliance\bottleforapps-rootfs.tar.gz` —
+- **MSI**: `ProgramFiles\Pogrebok\appliance\pogrebok-rootfs.tar.gz` —
   демон находит его через цепочку разрешения `<data>/appliance/` →
   `<каталог exe>/appliance/` (`resolve_rootfs` в
   `crates/daemon/src/main.rs`); копирование в каталог данных не нужно.
 - **Portable** (`scripts/build-portable.ps1`, Windows/CI): rootfs лежит
-  рядом с exe в `BottleForApps/appliance/` — тот же второй приоритет
+  рядом с exe в `Pogrebok/appliance/` — тот же второй приоритет
   цепочки; права администратора не нужны.
 
 ## Portable-сборка
 
 ```powershell
-powershell -File scripts/build-portable.ps1 -RootfsPath artifacts\bottleforapps-rootfs.tar.gz
+powershell -File scripts/build-portable.ps1 -RootfsPath artifacts\pogrebok-rootfs.tar.gz
 ```
 
-Собирает release-бинарники (msvc), раскладывает `bottle.exe`/`bottled.exe`/
-`bottle-svc.exe` + `appliance/` + русский `INSTALL.txt` и упаковывает в
-`artifacts/BottleForApps-portable-<version>-win-x64.zip` (+ `.sha256`).
+Собирает release-бинарники (msvc), раскладывает `pogrebok-gui.exe`/
+`pogrebok.exe`/`pogrebok-daemon.exe`/`pogrebok-svc.exe` + `appliance/` +
+русский `INSTALL.txt` и упаковывает в
+`artifacts/Pogrebok-portable-<version>-win-x64.zip` (+ `.sha256`).
 Версия читается из `[workspace.package].version` (cargo metadata).

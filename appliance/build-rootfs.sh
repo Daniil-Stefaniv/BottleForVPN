@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Сборка rootfs-апплайенса BottleForApps:
-# Alpine + bottle-agent (musl, x86_64) + сетевые пакеты => artifacts/bottleforapps-rootfs.tar.gz
+# Сборка rootfs-апплайенса Погребка:
+# Alpine + bottle-agent (musl, x86_64) + сетевые пакеты => artifacts/pogrebok-rootfs.tar.gz
 #
 # Работает локально (docker через Colima, платформа linux/amd64 через Rosetta)
 # и в CI (ubuntu-latest, нативный amd64).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="bottleforapps-appliance:latest"
+IMAGE="pogrebok-appliance:latest"
 PLATFORM="linux/amd64"
 ARTIFACT_DIR="$ROOT_DIR/artifacts"
-ARTIFACT="$ARTIFACT_DIR/bottleforapps-rootfs.tar.gz"
+ARTIFACT="$ARTIFACT_DIR/pogrebok-rootfs.tar.gz"
 
 # --- 1. version-файл из [workspace.package] корневого Cargo.toml -------------
 # Та же версия попадает в agent (CARGO_PKG_VERSION) через version.workspace = true.
@@ -43,7 +43,7 @@ docker run --rm --platform "$PLATFORM" --entrypoint /bin/sh "$IMAGE" \
 echo "==> экспорт rootfs"
 cid="$(docker create "$IMAGE" /bin/true)"
 mkdir -p "$ARTIFACT_DIR"
-tmp_artifact="$(mktemp "$ARTIFACT_DIR/bottleforapps-rootfs.tar.gz.XXXXXX")"
+tmp_artifact="$(mktemp "$ARTIFACT_DIR/pogrebok-rootfs.tar.gz.XXXXXX")"
 cleanup() {
     docker rm -f "$cid" > /dev/null 2>&1 || true
     rm -f "$tmp_artifact"

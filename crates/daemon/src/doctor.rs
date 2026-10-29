@@ -1,4 +1,4 @@
-//! Диагностика `bottle doctor`: проверки окружения с итогами
+//! Диагностика `pogrebok doctor`: проверки окружения с итогами
 //! ok/warn/fail и русскими пояснениями (спека §4.4, §15). Проверки —
 //! чистые функции над собранными данными; сборщик [`run`] обращается
 //! к WSL/менеджеру/хранилищу. Принцип (Review Focus M3 #4): чистая
@@ -256,7 +256,7 @@ pub fn check_service(present: bool) -> CheckItem {
             code: "service".to_string(),
             status: CheckStatus::Warn,
             detail: "Служба маршрутов не установлена — только env-бутылки; \
-                     для host-бутылок выполните от администратора: bottle-svc --install"
+                     для host-бутылок выполните от администратора: pogrebok-svc --install"
                 .to_string(),
         }
     }
@@ -411,7 +411,7 @@ mod tests {
     fn wsl_enabled_with_distributions_is_ok() {
         let items = check_wsl(
             &Ok("Version: 2.5".into()),
-            &Ok("Ubuntu\nbottleforapps".into()),
+            &Ok("Ubuntu\npogrebok".into()),
             &None,
         );
         assert_eq!(items[0].status, CheckStatus::Ok);
@@ -425,7 +425,7 @@ mod tests {
         let wslconfig = Some("[wsl2]\nnetworkingMode=mirrored\n".to_string());
         let items = check_wsl(
             &Ok("Version: 2.5".into()),
-            &Ok("bottleforapps".into()),
+            &Ok("pogrebok".into()),
             &wslconfig,
         );
         let mirrored = items.iter().find(|item| item.code == "wsl-networking");
@@ -467,7 +467,7 @@ mod tests {
         let wslconfig = Some("[wsl2]\nmemory=4GB\n".to_string());
         let items = check_wsl(
             &Ok("Version: 2.5".into()),
-            &Ok("bottleforapps".into()),
+            &Ok("pogrebok".into()),
             &wslconfig,
         );
         assert!(
@@ -523,7 +523,7 @@ mod tests {
         let item = check_service(false);
         assert_eq!(item.status, CheckStatus::Warn);
         assert!(
-            item.detail.contains("bottle-svc --install"),
+            item.detail.contains("pogrebok-svc --install"),
             "подсказка установки: {}",
             item.detail
         );

@@ -39,7 +39,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
       - run: cargo test --workspace
-      # Поведенческий тест маршрутов bottle-svc: реальный ActiveStore,
+      # Поведенческий тест маршрутов pogrebok-svc: реальный ActiveStore,
       # add/del точечного маршрута через шлюз по умолчанию (раннер
       # под администратором).
       - run: cargo test -p svc --test routes_win -- --ignored
@@ -57,13 +57,13 @@ jobs:
             dotnet tool install --global wix
             if ($LASTEXITCODE -ne 0) { throw 'не удалось установить WiX' }
           }
-          New-Item -ItemType File -Force bottleforapps-rootfs.tar.gz, bottle-gui.exe | Out-Null
+          New-Item -ItemType File -Force pogrebok-rootfs.tar.gz, pogrebok-gui.exe | Out-Null
           wix build -arch x64 `
             -d ProductVersion=0.0.0-smoke `
             -d BuildDir="$((Resolve-Path target/release/).Path)\" `
-            -d RootfsPath="$((Resolve-Path bottleforapps-rootfs.tar.gz).Path)" `
-            -d GuiExePath="$((Resolve-Path bottle-gui.exe).Path)" `
-            -o msi-smoke.msi installer/msi/BottleForApps.wxs
+            -d RootfsPath="$((Resolve-Path pogrebok-rootfs.tar.gz).Path)" `
+            -d GuiExePath="$((Resolve-Path pogrebok-gui.exe).Path)" `
+            -o msi-smoke.msi installer/msi/Pogrebok.wxs
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path msi-smoke.msi)) { throw 'wix build не прошёл' }
 
   # macOS-гейт (M4 Task 8, Review Focus #5): три таргета зелёные в
@@ -108,21 +108,22 @@ jobs:
       - run: bash appliance/build-rootfs.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: bottleforapps-rootfs
-          path: artifacts/bottleforapps-rootfs.tar.gz
+          name: pogrebok-rootfs
+          path: artifacts/pogrebok-rootfs.tar.gz
 
-  # GUI (Tauri, M4 Task 2): ESLint, тесты Rust-моста и сборка bottle-gui
-  # на обеих ОС. Артефакт — бинарь release; бандлы (.app/MSI-встраивание)
-  # собирают релизные джобы (Task 6/11), здесь достаточно --no-bundle.
+  # GUI (Tauri, M4 Task 2): ESLint, тесты Rust-моста и сборка
+  # pogrebok-gui на обеих ОС. Артефакт — бинарь release; бандлы
+  # (.app/MSI-встраивание) собирают релизные джобы (Task 6/11), здесь
+  # достаточно --no-bundle.
   gui-build:
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
-            binary: bottle-gui.exe
+            binary: pogrebok-gui.exe
           - os: macos-14
-            binary: bottle-gui
+            binary: pogrebok-gui
     runs-on: ${{ matrix.os }}
     # Windows + macOS (×2/×10): только теги и ручной запуск.
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -152,19 +153,23 @@ jobs:
       - name: Тесты Rust-моста run_bottle
         working-directory: gui/src-tauri
         run: cargo test
-      - name: Сборка bottle-gui (release, без бандла)
+      - name: Сборка pogrebok-gui (release, без бандла)
         working-directory: gui
         run: npx tauri build --no-bundle
       - uses: actions/upload-artifact@v4
         with:
-          name: bottle-gui-${{ matrix.os }}
+          name: pogrebok-gui-${{ matrix.os }}
           path: gui/src-tauri/target/release/${{ matrix.binary }}
 
 
-  # Полный вертикальный срез env-бутылки на Windows: bottled + bottle CLI
-  # + импорт аплаенса + WG-туннель (стенд-сервер в той же WSL-VM) + SOCKS5.
+  # Полный вертикальный срез env-бутылки на Windows: pogrebok-daemon +
+  # pogrebok CLI + импорт аплаенса + WG-туннель (стенд-сервер в той же
+  # WSL-VM) + SOCKS5.
   # Спека §15: WSL2 на CI-раннерах ограничен, поэтому до приёмки M2 фейл
   # джобы не роняет пайплайн (фолбэк — agent-integration на Linux-раннере).
+  # ВНИМАНИЕ (0.3): сценарий ci-wsl-integration.ps1 построен на CLI
+  # управления бутылками (create/start/stop), которое в 0.3 уехало в
+  # GUI — джобу предстоит переписать на протокол GUI↔демон (см. README).
   wsl-integration:
     runs-on: windows-latest
     needs: appliance-build
@@ -185,20 +190,20 @@ jobs:
       - name: Скачать артефакт rootfs
         uses: actions/download-artifact@v4
         with:
-          name: bottleforapps-rootfs
-      - name: Собрать bottled и bottle
+          name: pogrebok-rootfs
+      - name: Собрать pogrebok-daemon и pogrebok
         run: cargo build --release -p daemon -p cli
       - name: WSL-интеграционный сценарий (env-бутылка + WG-стенд)
         shell: cmd
         run: >
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci-wsl-integration.ps1
-          -Rootfs "%GITHUB_WORKSPACE%\bottleforapps-rootfs.tar.gz"
-          -Bottled "%GITHUB_WORKSPACE%\target\release\bottled.exe"
-          -Bottle "%GITHUB_WORKSPACE%\target\release\bottle.exe"
+          -Rootfs "%GITHUB_WORKSPACE%\pogrebok-rootfs.tar.gz"
+          -Bottled "%GITHUB_WORKSPACE%\target\release\pogrebok-daemon.exe"
+          -Bottle "%GITHUB_WORKSPACE%\target\release\pogrebok.exe"
           -DataDir "%RUNNER_TEMP%\bfa-ci-data"
 
   # Релизная сборка (по тегу v*): rootfs из appliance-build, GUI из
-  # gui-build (bottle-gui.exe — в MSI с ярлыком и в portable-zip),
+  # gui-build (pogrebok-gui.exe — в MSI с ярлыком и в portable-zip),
   # SHA256SUMS; публикация GitHub Release с русским текстом.
   release-build:
     runs-on: windows-latest
@@ -215,11 +220,11 @@ jobs:
       - name: Скачать rootfs аплаенса
         uses: actions/download-artifact@v4
         with:
-          name: bottleforapps-rootfs
+          name: pogrebok-rootfs
       - name: Скачать GUI (windows)
         uses: actions/download-artifact@v4
         with:
-          name: bottle-gui-windows-latest
+          name: pogrebok-gui-windows-latest
       - name: Тег обязан совпадать с версией workspace и GUI
         shell: pwsh
         run: |
@@ -233,15 +238,15 @@ jobs:
           if ($guiConf.version -ne $version) {
             throw "версия GUI ($($guiConf.version)) не совпадает с workspace ($version) — синхронизируйте gui/src-tauri/tauri.conf.json и gui/package.json"
           }
-          if (-not (Test-Path 'bottle-gui.exe')) { throw 'артефакт bottle-gui.exe не скачался' }
+          if (-not (Test-Path 'pogrebok-gui.exe')) { throw 'артефакт pogrebok-gui.exe не скачался' }
       - name: Собрать release-бинарники
         run: cargo build --release -p daemon -p cli -p svc
       - name: Portable-сборка
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1 -RootfsPath bottleforapps-rootfs.tar.gz -GuiExePath bottle-gui.exe
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1 -RootfsPath pogrebok-rootfs.tar.gz -GuiExePath pogrebok-gui.exe
       - name: MSI-сборка
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/msi/build-msi.ps1 -RootfsPath bottleforapps-rootfs.tar.gz -GuiExePath bottle-gui.exe
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/msi/build-msi.ps1 -RootfsPath pogrebok-rootfs.tar.gz -GuiExePath pogrebok-gui.exe
       - name: SHA256SUMS
         shell: pwsh
         run: |
@@ -265,18 +270,18 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body: |
-            BottleForApps ${{ github.ref_name }}
+            Погребок ${{ github.ref_name }}
 
             - MSI (полная установка: служба маршрутов, WSL, PATH, GUI с ярлыком в меню Пуск; один UAC)
-            - Portable ZIP (без прав администратора; только env-бутылки; bottle-gui.exe в комплекте)
+            - Portable ZIP (без прав администратора; только env-бутылки; pogrebok-gui.exe в комплекте)
 
             Внимание: установщики не подписаны — SmartScreen покажет
             предупреждение («Все равно выполнить»). Контрольные суммы —
             в SHA256SUMS.txt.
 
-            Первые шаги после установки MSI: запустите BottleForApps из
-            меню Пуск (GUI сам предложит поднять демон) или bottled.exe,
-            затем «Диагностика» в GUI / `bottle doctor`.
+            Первые шаги после установки MSI: запустите «Погребок» из
+            меню Пуск (приложение само предложит поднять демон),
+            затем «Диагностика» в приложении / `pogrebok doctor`.
             Portable: распакуйте и читайте INSTALL.txt.
           files: |
             artifacts/*.msi
@@ -303,17 +308,17 @@ jobs:
       - name: Проверки установленного
         shell: pwsh
         run: |
-          $dir = 'C:\Program Files\BottleForApps'
-          foreach ($f in 'bottle.exe','bottled.exe','bottle-svc.exe','bottle-gui.exe','appliance\bottleforapps-rootfs.tar.gz') {
+          $dir = 'C:\Program Files\Pogrebok'
+          foreach ($f in 'pogrebok.exe','pogrebok-daemon.exe','pogrebok-svc.exe','pogrebok-gui.exe','appliance\pogrebok-rootfs.tar.gz') {
             if (-not (Test-Path (Join-Path $dir $f))) { throw "нет файла: $f" }
           }
-          if (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\BottleForApps.lnk")) {
-            throw 'нет ярлыка BottleForApps в меню Пуск'
+          if (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Погребок.lnk")) {
+            throw 'нет ярлыка Погребка в меню Пуск'
           }
-          sc.exe query BottleForAppsRouteHelper
-          if ($LASTEXITCODE -ne 0) { throw 'служба BottleForAppsRouteHelper не установлена' }
-          & "$dir\bottle.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw 'bottle --version не работает' }
+          sc.exe query PogrebokRouteHelper
+          if ($LASTEXITCODE -ne 0) { throw 'служба PogrebokRouteHelper не установлена' }
+          & "$dir\pogrebok.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'pogrebok --version не работает' }
       - name: msiexec uninstall и чистота
         shell: cmd
         run: |
@@ -322,8 +327,8 @@ jobs:
       - name: Проверка удаления
         shell: pwsh
         run: |
-          if (Test-Path 'C:\Program Files\BottleForApps') { throw 'каталог Program Files\BottleForApps пережил uninstall' }
-          sc.exe query BottleForAppsRouteHelper | Out-Null
+          if (Test-Path 'C:\Program Files\Pogrebok') { throw 'каталог Program Files\Pogrebok пережил uninstall' }
+          sc.exe query PogrebokRouteHelper | Out-Null
           $svcSurvived = $LASTEXITCODE -eq 0
           # sc.exe на отсутствующей службе выходит с 1060 — это ожидаемо,
           # но Actions роняет шаг по ненулевому $LASTEXITCODE в конце
@@ -335,17 +340,20 @@ jobs:
         run: |
           $zip = (Get-ChildItem *.zip).FullName
           Expand-Archive $zip -DestinationPath portable
-          $bottle = (Get-ChildItem portable -Recurse -Filter bottle.exe | Select-Object -First 1).FullName
-          & $bottle --version
-          if ($LASTEXITCODE -ne 0) { throw 'portable bottle --version не работает' }
+          $cli = (Get-ChildItem portable -Recurse -Filter pogrebok.exe | Select-Object -First 1).FullName
+          & $cli --version
+          if ($LASTEXITCODE -ne 0) { throw 'portable pogrebok --version не работает' }
           # doctor portable-ветки: демон в фоне, служба НЕ ставилась —
           # только проверяем, что CLI отвечает отчётом, не крашится.
-          $bottled = $bottle -replace 'bottle\.exe$','bottled.exe'
-          $proc = Start-Process $bottled -PassThru -WindowStyle Hidden
+          # Демону 0.3 нужен --gui-token (его шлёт GUI); для smoke
+          # передаём явный тестовый токен.
+          $daemon = $cli -replace 'pogrebok\.exe$','pogrebok-daemon.exe'
+          $token = '0' * 64
+          $proc = Start-Process $daemon -ArgumentList '--gui-token', $token -PassThru -WindowStyle Hidden
           try {
             Start-Sleep -Seconds 5
-            & $bottle doctor
-            if ($LASTEXITCODE -eq -1) { throw 'bottle doctor аварийно завершился' }
+            & $cli doctor
+            if ($LASTEXITCODE -eq -1) { throw 'pogrebok doctor аварийно завершился' }
           } finally {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           }

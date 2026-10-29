@@ -51,11 +51,11 @@ describe("parseCliReply", () => {
 });
 
 describe("isDaemonUnavailable", () => {
-  it("узнаёт ошибку «запущен ли bottled» по тексту CLI", () => {
+  it("узнаёт ошибку «запущен ли pogrebok-daemon» по тексту CLI", () => {
     expect(
       isDaemonUnavailable(
         new Error(
-          "Не удалось подключиться к демону BottleForApps — запущен ли bottled?",
+          "Не удалось подключиться к демону Погребка — запущен ли pogrebok-daemon?",
         ),
       ),
     ).toBe(true);

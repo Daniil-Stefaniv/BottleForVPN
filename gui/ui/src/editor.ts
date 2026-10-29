@@ -226,7 +226,7 @@ function buildDom(root: HTMLElement): EditorRefs {
       </fieldset>
       <fieldset class="form-section" id="e-section-host" hidden>
         <legend>VPN</legend>
-        <p class="section-hint">Фирменный клиент на хосте; маршруты ставит служба bottle-svc.</p>
+        <p class="section-hint">Фирменный клиент на хосте; маршруты ставит служба pogrebok-svc.</p>
         <div class="form-grid">
           ${field("VPN-клиент", "e-vpn", `<input id="e-vpn" placeholder="C:\\vpn\\anyconnect.exe" />`, true)}
           ${field("Аргументы клиента", "e-vpn-args", `<input id="e-vpn-args" />`)}

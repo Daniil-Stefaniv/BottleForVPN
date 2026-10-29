@@ -1,5 +1,5 @@
-//! Экспорт журналов (`bottle logs export`): ZIP с журналами демона
-//! (`<data>/logs`) и службы (`%PROGRAMDATA%\BottleForApps\logs`) и
+//! Экспорт журналов (`pogrebok logs export`): ZIP с журналами демона
+//! (`<data>/logs`) и службы (`%PROGRAMDATA%\Pogrebok\logs`) и
 //! сводкой `system.txt` — версии, состояния бутылок, профили без
 //! содержимого конфигов (спека §10).
 
@@ -20,7 +20,7 @@ use crate::manager::BottleManager;
 const SVC_LOGS_PREFIX: &str = "svc";
 
 /// Собирает ZIP журналов: журнал демона `<data>/logs/*`, журнал службы
-/// `%PROGRAMDATA%\BottleForApps\logs/*` (если есть), сводка
+/// `%PROGRAMDATA%\Pogrebok\logs/*` (если есть), сводка
 /// `system.txt`. `dest` — путь пользователя или имя по умолчанию в
 /// каталоге данных. Возвращает путь к созданному архиву.
 pub async fn export_logs(
@@ -83,18 +83,18 @@ fn add_log_files<W: Write + io::Seek>(
     Ok(())
 }
 
-/// Каталог журналов службы на этой машине (`%PROGRAMDATA%\BottleForApps\
+/// Каталог журналов службы на этой машине (`%PROGRAMDATA%\Pogrebok\
 /// logs`); `None` вне Windows/без PROGRAMDATA — журналов службы нет.
 fn svc_logs_dir() -> Option<PathBuf> {
     let programdata = std::env::var_os("PROGRAMDATA")?;
-    Some(Path::new(&programdata).join("BottleForApps").join("logs"))
+    Some(Path::new(&programdata).join("Pogrebok").join("logs"))
 }
 
-/// Имя архива по умолчанию: `<data>/bottleforapps-logs-<YYYYMMDD>-<HHMM>.zip`
+/// Имя архива по умолчанию: `<data>/pogrebok-logs-<YYYYMMDD>-<HHMM>.zip`
 /// (UTC — отметка информационная, локальная зона недоступна без
 /// зависимостей).
 fn default_dest(data_root: &Path, now: SystemTime) -> PathBuf {
-    data_root.join(format!("bottleforapps-logs-{}.zip", timestamp(now)))
+    data_root.join(format!("pogrebok-logs-{}.zip", timestamp(now)))
 }
 
 /// Отметка времени `YYYYMMDD-HHMM` из unix-секунд (UTC); дата —
@@ -125,7 +125,7 @@ fn timestamp(now: SystemTime) -> String {
 /// конфига — не секрет.
 fn system_txt(profiles: &[BottleProfile], appliance_version: Option<&str>, runtime: &[RuntimeState]) -> String {
     let mut out = String::new();
-    out.push_str("BottleForApps — сводка системы\n");
+    out.push_str("Погребок — сводка системы\n");
     out.push_str(&format!("Версия демона: {}\n", env!("CARGO_PKG_VERSION")));
     out.push_str(&format!("Версия протокола: {PROTOCOL_VERSION}\n"));
     out.push_str(&format!(
@@ -255,13 +255,13 @@ mod tests {
         let epoch = UNIX_EPOCH + Duration::from_secs(0);
         assert_eq!(
             default_dest(Path::new("/data"), epoch),
-            Path::new("/data").join("bottleforapps-logs-19700101-0000.zip")
+            Path::new("/data").join("pogrebok-logs-19700101-0000.zip")
         );
         // 2026-10-04 12:34:56 UTC = 1791117296.
         let fixed = UNIX_EPOCH + Duration::from_secs(1_791_117_296);
         assert_eq!(
             default_dest(Path::new("/data"), fixed),
-            Path::new("/data").join("bottleforapps-logs-20261004-1234.zip")
+            Path::new("/data").join("pogrebok-logs-20261004-1234.zip")
         );
     }
 
@@ -298,7 +298,7 @@ mod tests {
         let (tmp, data_root, profiles) = env_fixture();
         let logs_dir = data_root.join("logs");
         fs::create_dir_all(&logs_dir).unwrap();
-        fs::write(logs_dir.join("bottled.1970-01-01"), "строка журнала").unwrap();
+        fs::write(logs_dir.join("pogrebok-daemon.1970-01-01"), "строка журнала").unwrap();
 
         let dest = tmp.path().join("export.zip");
         let result = export_logs(&data_root, &profiles, None, Some(dest.clone())).await;
@@ -307,7 +307,7 @@ mod tests {
         assert_eq!(path, dest, "использован путь пользователя");
         let names = zip_entry_names(&dest);
         assert!(
-            names.contains(&"logs/bottled.1970-01-01".to_string()),
+            names.contains(&"logs/pogrebok-daemon.1970-01-01".to_string()),
             "журнал демона внутри: {names:?}"
         );
         assert!(
@@ -315,7 +315,7 @@ mod tests {
             "сводка внутри: {names:?}"
         );
         assert_eq!(
-            zip_entry_content(&dest, "logs/bottled.1970-01-01"),
+            zip_entry_content(&dest, "logs/pogrebok-daemon.1970-01-01"),
             "строка журнала"
         );
     }
@@ -352,7 +352,7 @@ mod tests {
             path.file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with("bottleforapps-logs-"),
+                .starts_with("pogrebok-logs-"),
             "имя с отметкой: {}",
             path.display()
         );

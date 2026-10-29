@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 
 /// Имя канала службы маршрутов (Windows named pipe).
-pub const SVC_PIPE: &str = r"\\.\pipe\bottleforapps-routes";
+pub const SVC_PIPE: &str = r"\\.\pipe\pogrebok-routes";
 
 /// Запрос демона к службе маршрутов.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn svc_pipe_value_is_the_wire_contract() {
-        assert_eq!(SVC_PIPE, r"\\.\pipe\bottleforapps-routes");
+        assert_eq!(SVC_PIPE, r"\\.\pipe\pogrebok-routes");
     }
 
     #[test]

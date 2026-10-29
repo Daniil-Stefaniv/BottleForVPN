@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "bottle-core"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "dirs 5.0.1",
@@ -318,30 +318,6 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml 0.8.2",
- "tracing",
-]
-
-[[package]]
-name = "bottle-gui"
-version = "0.2.7"
-dependencies = [
- "bottle-core",
- "bytes",
- "dirs 5.0.1",
- "getrandom 0.3.4",
- "libc",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tauri-plugin-single-instance",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tokio-util",
  "tracing",
 ]
 
@@ -2689,6 +2665,30 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide 0.8.9",
+]
+
+[[package]]
+name = "pogrebok-gui"
+version = "0.3.0"
+dependencies = [
+ "bottle-core",
+ "bytes",
+ "dirs 5.0.1",
+ "getrandom 0.3.4",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

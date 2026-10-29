@@ -1,4 +1,4 @@
-//! `bottle-svc` — служба маршрутов BottleForApps (Windows).
+//! `pogrebok-svc` — служба маршрутов Погребка (Windows).
 //!
 //! Привилегированная служба, удерживающая точечные host-маршруты
 //! (`/32`/`/128`) env-бутылок через физический шлюз. Без аргументов
@@ -17,14 +17,14 @@ use tokio_util::sync::CancellationToken;
 // daemon: cfg_attr-allow вместо cfg на каждом использовании).
 /// Имя службы в реестре SCM (спека §11 наследует имя из v1-спеки).
 #[cfg_attr(not(windows), allow(dead_code))]
-const SERVICE_NAME: &str = "BottleForAppsRouteHelper";
+const SERVICE_NAME: &str = "PogrebokRouteHelper";
 /// Отображаемое имя службы.
 #[cfg_attr(not(windows), allow(dead_code))]
-const SERVICE_DISPLAY_NAME: &str = "BottleForApps Route Helper";
+const SERVICE_DISPLAY_NAME: &str = "Pogrebok Route Helper";
 /// Русское описание службы для реестра SCM.
 #[cfg_attr(not(windows), allow(dead_code))]
 const SERVICE_DESCRIPTION: &str =
-    "Служба маршрутов BottleForApps: точечные маршруты host-бутылок через физический шлюз";
+    "Служба маршрутов Погребка: точечные маршруты host-бутылок через физический шлюз";
 
 /// Режим запуска, выбираемый аргументами командной строки.
 #[derive(Debug)]
@@ -43,8 +43,8 @@ fn main() -> ExitCode {
     let mode = match parse_cli_args(std::env::args_os().skip(1)) {
         Ok(mode) => mode,
         Err(message) => {
-            eprintln!("bottle-svc: {message}");
-            eprintln!("использование: bottle-svc [run|--console|--install|--uninstall]");
+            eprintln!("pogrebok-svc: {message}");
+            eprintln!("использование: pogrebok-svc [run|--console|--install|--uninstall]");
             return ExitCode::FAILURE;
         }
     };
@@ -83,7 +83,7 @@ where
 
 /// Запускает выбранный режим. Обвязка SCM доступна только на Windows:
 /// на других платформах консольный режим служит dev-проверкой каркаса
-/// (как у `bottled`), служебные режимы — отказ с русским текстом.
+/// (как у `pogrebok-daemon`), служебные режимы — отказ с русским текстом.
 #[cfg(windows)]
 fn dispatch(mode: Mode) -> ExitCode {
     match mode {
@@ -100,7 +100,7 @@ fn dispatch(mode: Mode) -> ExitCode {
         Mode::Console => run_console(),
         Mode::Run | Mode::Install | Mode::Uninstall => {
             eprintln!(
-                "bottle-svc: операции службы доступны только на Windows; \
+                "pogrebok-svc: операции службы доступны только на Windows; \
                  для отладки запустите с --console"
             );
             ExitCode::FAILURE
@@ -112,9 +112,9 @@ fn dispatch(mode: Mode) -> ExitCode {
 /// pipe-сервер), остановка по Ctrl+C.
 fn run_console() -> ExitCode {
     init_logging();
-    println!("bottle-svc: консольный режим отладки (без SCM)");
+    println!("pogrebok-svc: консольный режим отладки (без SCM)");
     println!(
-        "bottle-svc: журнал маршрутов: {}",
+        "pogrebok-svc: журнал маршрутов: {}",
         svc::journal::default_journal_path().display()
     );
 
@@ -125,7 +125,7 @@ fn run_console() -> ExitCode {
         Ok(runtime) => runtime,
         Err(error) => {
             tracing::error!(%error, "не удалось создать tokio runtime");
-            eprintln!("bottle-svc: не удалось создать tokio runtime: {error}");
+            eprintln!("pogrebok-svc: не удалось создать tokio runtime: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -134,16 +134,16 @@ fn run_console() -> ExitCode {
     let watcher = shutdown.clone();
     runtime.spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            println!("получен Ctrl+C, останавливаю bottle-svc");
+            println!("получен Ctrl+C, останавливаю pogrebok-svc");
             watcher.cancel();
         }
     });
     let outcome = runtime.block_on(run_server(shutdown));
     if let Err(error) = outcome {
-        eprintln!("bottle-svc: {error}");
+        eprintln!("pogrebok-svc: {error}");
         return ExitCode::FAILURE;
     }
-    println!("bottle-svc остановлен");
+    println!("pogrebok-svc остановлен");
     ExitCode::SUCCESS
 }
 
@@ -175,20 +175,20 @@ async fn run_server(shutdown: CancellationToken) -> Result<(), String> {
 }
 
 /// Инициализирует логирование службы: файловый JSONL-журнал в
-/// `%PROGRAMDATA%\BottleForApps\logs` + stderr (виден только в
+/// `%PROGRAMDATA%\Pogrebok\logs` + stderr (виден только в
 /// `--console`). Сбой файла не фатален — служба работает со
 /// stderr-логами.
 fn init_logging() {
     let dir = svc::logging::default_logs_dir();
-    if let Err(error) = svc::logging::init_file_logging(&dir, "bottle-svc") {
-        eprintln!("bottle-svc: файловый журнал недоступен ({error}); пишу только в stderr");
+    if let Err(error) = svc::logging::init_file_logging(&dir, "pogrebok-svc") {
+        eprintln!("pogrebok-svc: файловый журнал недоступен ({error}); пишу только в stderr");
         init_tracing();
     }
 }
 
 /// Инициализирует логирование (fallback без файлового журнала):
 /// уровень из `RUST_LOG`, по умолчанию `info` (единый паттерн с
-/// `bottled`).
+/// `pogrebok-daemon`).
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -249,7 +249,7 @@ mod win_service {
                     },
                     other => other.to_string(),
                 };
-                eprintln!("bottle-svc: не удалось запуститься как служба: {detail}");
+                eprintln!("pogrebok-svc: не удалось запуститься как служба: {detail}");
                 eprintln!("для отладки вне SCM запустите с --console");
                 ExitCode::FAILURE
             }
@@ -330,7 +330,7 @@ mod win_service {
                 tracing::error!(%error, "не удалось перевести службу в Running");
                 return None;
             }
-            tracing::info!("служба маршрутов BottleForApps запущена");
+            tracing::info!("служба маршрутов Погребка запущена");
             run_server(shutdown).await.err()
         });
 
@@ -365,7 +365,7 @@ mod win_service {
                 ExitCode::SUCCESS
             }
             Err(message) => {
-                eprintln!("bottle-svc: {message}");
+                eprintln!("pogrebok-svc: {message}");
                 ExitCode::FAILURE
             }
         }
@@ -385,7 +385,7 @@ mod win_service {
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
             executable_path,
-            // SCM запускает службу как `bottle-svc.exe run`.
+            // SCM запускает службу как `pogrebok-svc.exe run`.
             launch_arguments: vec![OsString::from("run")],
             dependencies: vec![],
             // LocalSystem: операции над маршрутами требуют SYSTEM.
@@ -420,7 +420,7 @@ mod win_service {
                 ExitCode::SUCCESS
             }
             Err(message) => {
-                eprintln!("bottle-svc: {message}");
+                eprintln!("pogrebok-svc: {message}");
                 ExitCode::FAILURE
             }
         }
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn unknown_first_token_reported_before_extra_check() {
-        // «bottle-svc bogus extra»: ругань на первый токен, а не на
+        // «pogrebok-svc bogus extra»: ругань на первый токен, а не на
         // «лишний аргумент extra».
         let error = parse_cli_args(args(&["bogus", "extra"])).unwrap_err();
         assert!(

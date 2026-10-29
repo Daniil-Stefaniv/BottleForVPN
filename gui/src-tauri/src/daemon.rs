@@ -1,7 +1,7 @@
-//! Спавн демона `bottled` из GUI (рулинг D1, единственное место, где GUI
-//! запускает не-CLI): кнопка «Запустить демона» поднимает bottled и
-//! показывает его журнал в окне. Демон переживёт выход GUI — kill_on_drop
-//! НЕ ставим (Task 5: «GUI выходит; демон живёт»).
+//! Спавн демона `pogrebok-daemon` из GUI (рулинг D1, единственное место,
+//! где GUI запускает не-CLI): кнопка «Запустить демона» поднимает демона
+//! и показывает его журнал в окне. Демон переживёт выход GUI —
+//! kill_on_drop НЕ ставим (Task 5: «GUI выходит; демон живёт»).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -10,13 +10,13 @@ use serde::Serialize;
 use tokio::process::{Child, Command};
 
 /// Переменная окружения для подмены пути к демону в dev-режиме и тестах.
-pub const BOTTLED_BIN_ENV: &str = "BOTTLE_GUI_BOTTLED_BIN";
+pub const DAEMON_BIN_ENV: &str = "POGREBOK_GUI_DAEMON_BIN";
 
 /// Хвост журнала демона, который держит GUI (кольцо ~32 КиБ).
 const LOG_LIMIT: usize = 32 * 1024;
 
 /// `CREATE_NO_WINDOW` (Windows): GUI — windows-подсистема без консоли,
-/// спавн консольного `bottled.exe` иначе создаёт видимое окно cmd.
+/// спавн консольного `pogrebok-daemon.exe` иначе создаёт видимое окно cmd.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -63,12 +63,12 @@ impl DaemonHandle {
         &self.token
     }
 
-    /// Запускает демона `bottled` (резолв как у CLI: env → рядом с exe →
-    /// PATH) с токеном авторизации; повторный вызов при живом процессе —
-    /// ошибка.
+    /// Запускает демона `pogrebok-daemon` (резолв как у CLI: env → рядом
+    /// с exe → PATH) с токеном авторизации; повторный вызов при живом
+    /// процессе — ошибка.
     pub async fn start(&self) -> Result<(), String> {
         self.start_custom(
-            resolve_bottled_path(),
+            resolve_daemon_path(),
             vec!["--gui-token".to_string(), self.token.clone()],
         )
         .await
@@ -86,7 +86,7 @@ impl DaemonHandle {
             .args(&args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        // Без CREATE_NO_WINDOW старт консольного bottled из GUI
+        // Без CREATE_NO_WINDOW старт консольного pogrebok-daemon из GUI
         // показывал бы окно cmd.
         #[cfg(windows)]
         command.creation_flags(CREATE_NO_WINDOW);
@@ -106,9 +106,9 @@ impl DaemonHandle {
         };
         if already_running {
             // Дубль не бросаем: без kill_on_drop дроп = detach,
-            // осиротевший второй bottled пережил бы отказ (I1).
+            // осиротевший второй демон пережил бы отказ (I1).
             // Короткая грация: дать дублю начать запись лога/файлов
-            // старта (старт bottled длинный, 150 мс роли не играют).
+            // старта (старт демона длинный, 150 мс роли не играют).
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -218,8 +218,8 @@ impl LogHandle {
 
 /// Резолвит исполняемый файл демона: env (dev/тесты) → рядом с GUI
 /// (MSI/.app, D5) → PATH.
-fn resolve_bottled_path() -> PathBuf {
-    if let Ok(path) = std::env::var(BOTTLED_BIN_ENV) {
+fn resolve_daemon_path() -> PathBuf {
+    if let Ok(path) = std::env::var(DAEMON_BIN_ENV) {
         if !path.is_empty() {
             return PathBuf::from(path);
         }
@@ -228,19 +228,19 @@ fn resolve_bottled_path() -> PathBuf {
         .ok()
         .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
     if let Some(dir) = exe_dir {
-        let candidate = dir.join(bottled_binary_name());
+        let candidate = dir.join(daemon_binary_name());
         if candidate.is_file() {
             return candidate;
         }
     }
-    PathBuf::from(bottled_binary_name())
+    PathBuf::from(daemon_binary_name())
 }
 
-fn bottled_binary_name() -> &'static str {
+fn daemon_binary_name() -> &'static str {
     if cfg!(windows) {
-        "bottled.exe"
+        "pogrebok-daemon.exe"
     } else {
-        "bottled"
+        "pogrebok-daemon"
     }
 }
 
@@ -424,10 +424,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_bottled_binary_is_error() {
+    async fn missing_daemon_binary_is_error() {
         let daemon = DaemonHandle::default();
         let error = daemon
-            .start_custom("bottled-no-such-binary-xyz", vec![])
+            .start_custom("pogrebok-daemon-no-such-binary-xyz", vec![])
             .await
             .expect_err("отсутствующий бинарь — ошибка");
         assert!(error.contains("не удалось запустить"), "{error}");

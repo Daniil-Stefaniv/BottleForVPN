@@ -1,6 +1,6 @@
 //! Файловые журналы службы: JSONL с ежедневной ротацией и хранением
 //! 30 дней (спека «Диагностические журналы») в
-//! `%PROGRAMDATA%\BottleForApps\logs` — процесс службы работает под
+//! `%PROGRAMDATA%\Pogrebok\logs` — процесс службы работает под
 //! SYSTEM и не имеет консоли, файл — единственный надёжный сток
 //! (stderr-слой сохраняется для `--console`).
 
@@ -20,13 +20,13 @@ pub const RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Период фоновой чистки устаревших файлов (сутки: ротация ежедневная).
 const PRUNE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Каталог журналов по умолчанию: `%PROGRAMDATA%\BottleForApps\logs`
+/// Каталог журналов по умолчанию: `%PROGRAMDATA%\Pogrebok\logs`
 /// (служба под SYSTEM); вне Windows — временный каталог (паттерн
 /// [`crate::journal::default_journal_path`]).
 pub fn default_logs_dir() -> PathBuf {
     match std::env::var_os("PROGRAMDATA") {
-        Some(programdata) => Path::new(&programdata).join("BottleForApps").join("logs"),
-        None => std::env::temp_dir().join("BottleForApps").join("logs"),
+        Some(programdata) => Path::new(&programdata).join("Pogrebok").join("logs"),
+        None => std::env::temp_dir().join("Pogrebok").join("logs"),
     }
 }
 
@@ -175,11 +175,11 @@ mod tests {
     #[test]
     fn prune_deletes_only_this_base_files_older_than_retention() {
         let tmp = tempfile::tempdir().unwrap();
-        let old = file_with_age(tmp.path(), "bottle-svc.2025-01-01", DAY * 31);
-        let fresh = file_with_age(tmp.path(), "bottle-svc.today", DAY * 29);
+        let old = file_with_age(tmp.path(), "pogrebok-svc.2025-01-01", DAY * 31);
+        let fresh = file_with_age(tmp.path(), "pogrebok-svc.today", DAY * 29);
         let foreign = file_with_age(tmp.path(), "routes.jsonl", DAY * 31);
 
-        let removed = prune_old_logs(tmp.path(), "bottle-svc", RETENTION, SystemTime::now());
+        let removed = prune_old_logs(tmp.path(), "pogrebok-svc", RETENTION, SystemTime::now());
 
         assert_eq!(removed, 1, "удалён ровно один устаревший файл");
         assert!(!old.exists(), "31 день — удалён");
@@ -196,11 +196,11 @@ mod tests {
     #[test]
     fn init_creates_today_file_and_writes_events() {
         let tmp = tempfile::tempdir().unwrap();
-        init_file_logging(tmp.path(), "bottle-svc").expect("инициализация журнала");
+        init_file_logging(tmp.path(), "pogrebok-svc").expect("инициализация журнала");
 
         tracing::info!("тестовая запись журнала");
 
-        let expected = tmp.path().join(format!("bottle-svc.{}", today()));
+        let expected = tmp.path().join(format!("pogrebok-svc.{}", today()));
         let content = fs::read_to_string(&expected).unwrap_or_else(|error| {
             panic!("файл {} существует и читается: {error}", expected.display())
         });
@@ -212,9 +212,9 @@ mod tests {
 
     /// Каталог по умолчанию повторяет прецедент журнала маршрутов:
     /// PROGRAMDATA → каталог данных, иначе временный каталог (dev);
-    /// точка монтирования — подкаталог `BottleForApps/logs`.
+    /// точка монтирования — подкаталог `Pogrebok/logs`.
     #[test]
     fn default_logs_dir_mounts_logs_subdirectory() {
-        assert!(default_logs_dir().ends_with(Path::new("BottleForApps").join("logs")));
+        assert!(default_logs_dir().ends_with(Path::new("Pogrebok").join("logs")));
     }
 }

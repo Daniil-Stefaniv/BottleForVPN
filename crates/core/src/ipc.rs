@@ -12,7 +12,7 @@ use crate::profile::BottleProfile;
 use crate::protocol::ForwardPort;
 
 /// Имя канала демона (Windows named pipe).
-pub const DAEMON_PIPE: &str = r"\\.\pipe\bottled";
+pub const DAEMON_PIPE: &str = r"\\.\pipe\pogrebok-daemon";
 
 /// Имя UDS-сокета демона внутри каталога данных (macOS/Unix, M4 D3).
 pub const DAEMON_SOCK_FILE: &str = "daemon.sock";
@@ -24,9 +24,9 @@ pub fn daemon_socket_path(data_dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Каталог данных по умолчанию (CLI и демон считают одинаково):
-/// локальный каталог данных пользователя + `BottleForApps`.
+/// локальный каталог данных пользователя + `Pogrebok`.
 pub fn default_data_dir() -> Option<std::path::PathBuf> {
-    dirs::data_local_dir().map(|base| base.join("BottleForApps"))
+    dirs::data_local_dir().map(|base| base.join("Pogrebok"))
 }
 
 /// UDS-клиент CLI↔демона (macOS/Unix, M4 Task 7): подключение с
@@ -59,7 +59,7 @@ pub async fn uds_exchange(
                 );
                 if !stale || tokio::time::Instant::now() >= deadline {
                     return Err(
-                        "Не удалось подключиться к демону BottleForApps — запущен ли bottled?"
+                        "Не удалось подключиться к демону Погребка — запущен ли pogrebok-daemon?"
                             .to_string(),
                     );
                 }
@@ -394,7 +394,16 @@ mod tests {
 
     #[test]
     fn daemon_pipe_value_is_the_wire_contract() {
-        assert_eq!(DAEMON_PIPE, r"\\.\pipe\bottled");
+        assert_eq!(DAEMON_PIPE, r"\\.\pipe\pogrebok-daemon");
+        assert!(DAEMON_PIPE.contains("pogrebok"), "ребрендинг 0.3");
+    }
+
+    /// Каталог данных 0.3 — `Pogrebok` (ребрендинг); миграция 0.2.x
+    /// читает старый `BottleForApps` отдельно (gui/src-tauri/db/migrate).
+    #[test]
+    fn default_data_dir_is_pogrebok() {
+        let dir = default_data_dir().expect("каталог данных определим");
+        assert_eq!(dir.file_name().expect("имя каталога"), "Pogrebok");
     }
 
     #[test]
@@ -429,7 +438,7 @@ mod tests {
                 id: "corp-vpn".to_string(),
                 warning: Some("VPN-клиент оставлен запущенным".to_string()),
             },
-            CliReply::Path(r"C:\tmp\bottleforapps-logs-20261004-1200.zip".to_string()),
+            CliReply::Path(r"C:\tmp\pogrebok-logs-20261004-1200.zip".to_string()),
             CliReply::DoctorReport {
                 items: vec![
                     CheckItem {

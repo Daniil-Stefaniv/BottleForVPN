@@ -191,7 +191,7 @@ export function parseCliReply(output: BottleOutput): CliReply {
 /** Признак «демон не запущен» по ошибке обмена (инструкция для пользователя). */
 export function isDaemonUnavailable(error: unknown): boolean {
   return (
-    error instanceof Error && error.message.includes("запущен ли bottled")
+    error instanceof Error && error.message.includes("запущен ли pogrebok-daemon")
   );
 }
 

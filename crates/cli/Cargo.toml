@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "bottle"
+name = "pogrebok"
 path = "src/main.rs"
 
 [dependencies]

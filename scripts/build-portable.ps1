@@ -1,12 +1,12 @@
-﻿# Сборка portable-дистрибутива BottleForApps (Windows, CI или локально).
+# Сборка portable-дистрибутива Погребка (Windows, CI или локально).
 #
-# Формирует dist/portable/BottleForApps/: bottle.exe, bottled.exe,
-# bottle-svc.exe (для --install по желанию админа), appliance/
-# bottleforapps-rootfs.tar.gz и INSTALL.txt; упаковывает в
-# artifacts/BottleForApps-portable-<version>-win-x64.zip + SHA256.
+# Формирует dist/portable/Pogrebok/: pogrebok-gui.exe, pogrebok.exe,
+# pogrebok-daemon.exe, pogrebok-svc.exe (для --install по желанию
+# админа), appliance/pogrebok-rootfs.tar.gz и INSTALL.txt; упаковывает в
+# artifacts/Pogrebok-portable-<version>-win-x64.zip + SHA256.
 #
 # Параметры:
-#   -RootfsPath  путь к собранному bottleforapps-rootfs.tar.gz
+#   -RootfsPath  путь к собранному pogrebok-rootfs.tar.gz
 #                (артефакт джобы appliance-build; обязателен)
 #   -OutDir      каталог для артефактов (по умолчанию artifacts)
 #
@@ -17,7 +17,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$RootfsPath,
 
-    # GUI (M4): путь к bottle-gui.exe (артефакт джобы gui-build).
+    # GUI (M4): путь к pogrebok-gui.exe (артефакт джобы gui-build).
     [Parameter(Mandatory = $true)]
     [string]$GuiExePath,
 
@@ -30,7 +30,7 @@ if (-not (Test-Path $RootfsPath)) {
     throw "rootfs не найден: $RootfsPath (артефакт appliance-build обязателен)"
 }
 if (-not (Test-Path $GuiExePath)) {
-    throw "bottle-gui.exe не найден: $GuiExePath (артефакт gui-build обязателен)"
+    throw "pogrebok-gui.exe не найден: $GuiExePath (артефакт gui-build обязателен)"
 }
 
 # Версия workspace из cargo metadata.
@@ -46,26 +46,26 @@ cargo build --release -p daemon -p cli -p svc
 if ($LASTEXITCODE -ne 0) { throw "cargo build --release не удался" }
 
 # Раскладка portable.
-$layout = "dist/portable/BottleForApps"
+$layout = "dist/portable/Pogrebok"
 if (Test-Path $layout) { Remove-Item -Recurse -Force $layout }
 New-Item -ItemType Directory -Force -Path "$layout/appliance" | Out-Null
 
-Copy-Item "target/release/bottle.exe"     $layout
-Copy-Item "target/release/bottled.exe"    $layout
-Copy-Item "target/release/bottle-svc.exe" $layout
-Copy-Item $RootfsPath "$layout/appliance/bottleforapps-rootfs.tar.gz"
-Copy-Item $GuiExePath "$layout/bottle-gui.exe"
+Copy-Item "target/release/pogrebok.exe"        $layout
+Copy-Item "target/release/pogrebok-daemon.exe" $layout
+Copy-Item "target/release/pogrebok-svc.exe"    $layout
+Copy-Item $RootfsPath "$layout/appliance/pogrebok-rootfs.tar.gz"
+Copy-Item $GuiExePath "$layout/pogrebok-gui.exe"
 
 # INSTALL.txt: русский, portable = env-only (спека §11).
 @(
-    "BottleForApps $version — portable-вариант (без прав администратора)."
+    "Погребок $version — portable-вариант (без прав администратора)."
     ""
     "Что здесь лежит:"
-    "  bottle.exe      — CLI (bottle create/list/start/stop/doctor/logs export/upgrade)"
-    "  bottled.exe     — демон (запустите его в терминале; работает в вашей сессии)"
-    "  bottle-svc.exe  — служба маршрутов для host-бутылок (НЕ обязательна)"
-    "  bottle-gui.exe  — графический интерфейс (список бутылок, старт/стоп, doctor)"
-    "  appliance/      — rootfs аплаенса WSL (используется bottled отсюда)"
+    "  pogrebok-gui.exe    — приложение «Погребок» (бутылки, демон, диагностика)"
+    "  pogrebok-daemon.exe — демон (запускается из приложения кнопкой «Запустить демона»)"
+    "  pogrebok.exe        — служебный CLI (doctor / logs export / upgrade / routes cleanup)"
+    "  pogrebok-svc.exe    — служба маршрутов для host-бутылок (НЕ обязательна)"
+    "  appliance/          — rootfs аплаенса WSL (используется демоном отсюда)"
     ""
     "Требования:"
     "  - WSL включён в системе ЗАРАНЕЕ (wsl --install --no-distribution + перезагрузка);"
@@ -74,20 +74,19 @@ Copy-Item $GuiExePath "$layout/bottle-gui.exe"
     "Ограничения portable:"
     "  - Только env-бутылки (WireGuard/OpenVPN в изолированных окружениях WSL)."
     "  - Host-бутылки (фирменные VPN-клиенты) требуют службу маршрутов:"
-    "    запустите от администратора  bottle-svc.exe --install"
+    "    запустите от администратора  pogrebok-svc.exe --install"
     ""
     "Начало работы:"
-    "  1) bottled.exe            (демон; держите окно открытым)"
-    "  2) bottle doctor          (проверка окружения)"
-    "  3) bottle create my-vpn --name `"Мой VPN`" --kind env --protocol wireguard --config C:\path\wg.conf"
-    "  4) bottle start my-vpn"
+    "  1) pogrebok-gui.exe   (приложение; при первом запуске — мастер-пароль)"
+    "  2) кнопка «Запустить демона» в окне приложения"
+    "  3) вкладка «Диагностика» → Doctor (проверка окружения)"
     ""
-    "Диагностика: bottle doctor, bottle logs export."
+    "Диагностика: pogrebok doctor, pogrebok logs export."
 ) | Set-Content -Encoding UTF8 "$layout/INSTALL.txt"
 
 # ZIP + SHA256.
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$zip = "$OutDir/BottleForApps-portable-$version-win-x64.zip"
+$zip = "$OutDir/Pogrebok-portable-$version-win-x64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path "$layout/*" -DestinationPath $zip
 

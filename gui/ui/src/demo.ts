@@ -212,12 +212,12 @@ const STATS: DaemonStatsWire = {
 const DOCTOR = {
   DoctorReport: {
     items: [
-      { code: "daemon.alive", status: "Ok", detail: "демон bottled отвечает (v0.3.0-demo)" },
+      { code: "daemon.alive", status: "Ok", detail: "демон pogrebok-daemon отвечает (v0.3.0-demo)" },
       { code: "wsl.appliance", status: "Ok", detail: "апплайенс Погребка импортирован, rootfs актуален" },
       { code: "wsl.running", status: "Ok", detail: "виртуальная машина запущена" },
       { code: "agent.ping", status: "Ok", detail: "bottle-agent внутри VM отвечает за 12 мс" },
       { code: "ports.conflict", status: "Warn", detail: "порт 13389 занят двумя профилями — при старте обоих будет конфликт" },
-      { code: "svc.routes", status: "Fail", detail: "служба маршрутов bottle-svc не установлена — host-бутылки недоступны" },
+      { code: "svc.routes", status: "Fail", detail: "служба маршрутов pogrebok-svc не установлена — host-бутылки недоступны" },
       { code: "store.profiles", status: "Ok", detail: "4 профиля в БД, битых записей нет" },
     ],
   },
@@ -231,7 +231,7 @@ export function mountDemo(down: boolean, view?: string | null): void {
     listBottles: async () => PROFILES.map((row) => ({ ...row })),
     daemonConnect: async () => {
       if (!daemonAlive) {
-        throw new Error("не удалось подключиться к демону — запущен ли bottled?");
+        throw new Error("не удалось подключиться к демону — запущен ли pogrebok-daemon?");
       }
       // Как живой демон после SyncProfiles: полная картина состояний.
       for (const id of runtime.keys()) {
@@ -282,7 +282,7 @@ export function mountDemo(down: boolean, view?: string | null): void {
     },
     daemonStats: async () => {
       if (!daemonAlive) {
-        throw new Error("не удалось подключиться к демону — запущен ли bottled?");
+        throw new Error("не удалось подключиться к демону — запущен ли pogrebok-daemon?");
       }
       return { ...STATS };
     },
@@ -450,9 +450,9 @@ export function mountDemo(down: boolean, view?: string | null): void {
     status: async () => ({
       running: daemonAlive,
       log_tail:
-        "2026-10-22T16:02:14Z INFO  bottled: слушаю named pipe \\\\.\\pipe\\bottle\n" +
-        "2026-10-22T16:02:15Z INFO  bottled: апплайенс Погребка найден, версия 0.3.0\n" +
-        "2026-10-22T16:02:15Z INFO  bottled: GUI подключился, профили синхронизированы: 4",
+        "2026-10-22T16:02:14Z INFO  pogrebok-daemon: слушаю named pipe \\\\.\\pipe\\bottle\n" +
+        "2026-10-22T16:02:15Z INFO  pogrebok-daemon: апплайенс Погребка найден, версия 0.3.0\n" +
+        "2026-10-22T16:02:15Z INFO  pogrebok-daemon: GUI подключился, профили синхронизированы: 4",
     }),
   });
   setRevealInDir(async () => {});

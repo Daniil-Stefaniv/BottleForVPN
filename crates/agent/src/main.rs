@@ -18,7 +18,7 @@ use agent::relay_run::{parse_forward_spec, run_relay};
 use agent::token::load_or_create_token;
 use bottle_core::protocol::ForwardPort;
 
-/// Агент BottleForApps внутри WSL-апплайенса.
+/// Агент Погребка внутри WSL-апплайенса.
 #[derive(Debug, Parser)]
 #[command(name = "bottle-agent", version)]
 struct Cli {

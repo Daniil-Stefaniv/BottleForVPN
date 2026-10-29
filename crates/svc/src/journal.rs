@@ -41,7 +41,7 @@ use crate::routes::{run_ps, RouteCmd};
 pub type SessionId = u64;
 
 /// Имя файла журнала маршрутов внутри каталога данных
-/// (`%PROGRAMDATA%\BottleForApps`, спека §8).
+/// (`%PROGRAMDATA%\Pogrebok`, спека §8).
 pub const JOURNAL_FILE_NAME: &str = "routes.jsonl";
 
 /// Операция над live-set'ом маршрутов — единица состояния журнала.
@@ -515,13 +515,13 @@ where
     report
 }
 
-/// Путь журнала по умолчанию: `%PROGRAMDATA%\BottleForApps\routes.jsonl`
+/// Путь журнала по умолчанию: `%PROGRAMDATA%\Pogrebok\routes.jsonl`
 /// (спека §8); вне Windows (`--console` в dev-режиме, PROGRAMDATA нет) —
 /// временный каталог, чтобы консольный режим работал на хосте разработки.
 pub fn default_journal_path() -> PathBuf {
     match std::env::var_os("PROGRAMDATA") {
         Some(programdata) => Path::new(&programdata)
-            .join("BottleForApps")
+            .join("Pogrebok")
             .join(JOURNAL_FILE_NAME),
         None => std::env::temp_dir().join(JOURNAL_FILE_NAME),
     }

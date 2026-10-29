@@ -1,13 +1,14 @@
-; BottleForApps — NSIS-установщик (exe). Семантика зеркалит MSI
-; (installer/msi/BottleForApps.wxs, спека §11): полная установка в
-; Program Files, machine PATH, служба маршрутов (bottle-svc --install),
+; Погребок — NSIS-установщик (exe). Семантика зеркалит MSI
+; (installer/msi/Pogrebok.wxs, спека §11): полная установка в
+; Program Files, machine PATH, служба маршрутов (pogrebok-svc --install),
 ; включение компонентов WSL (3010 «нужна перезагрузка» = успех),
 ; ярлык GUI в меню Пуск, один UAC (RequestExecutionLevel admin).
 ;
 ; Сборка (Linux/macOS через makensis 3.x):
-;   makensis /DVERSION=0.2.0 /DINPUT_DIR=<каталог с bottle.exe, bottled.exe,
-;     bottle-svc.exe, bottle-gui.exe, appliance\bottleforapps-rootfs.tar.gz>
-;     /DOUTFILE=<путь выходного exe> BottleForApps.nsi
+;   makensis /DVERSION=0.3.0 /DINPUT_DIR=<каталог с pogrebok.exe,
+;     pogrebok-daemon.exe, pogrebok-svc.exe, pogrebok-gui.exe,
+;     appliance\pogrebok-rootfs.tar.gz>
+;     /DOUTFILE=<путь выходного exe> Pogrebok.nsi
 
 Unicode true
 ManifestDPIAware true
@@ -16,13 +17,13 @@ CRCCheck on
 XPStyle on
 
 !ifndef VERSION
-  !define VERSION "0.2.0"
+  !define VERSION "0.3.0"
 !endif
 !ifndef INPUT_DIR
   !define INPUT_DIR "."
 !endif
 !ifndef OUTFILE
-  !define OUTFILE "BottleForApps-${VERSION}-win-x64-setup.exe"
+  !define OUTFILE "Pogrebok-${VERSION}-win-x64-setup.exe"
 !endif
 
 !include "MUI2.nsh"
@@ -36,14 +37,14 @@ ${StrStr}
 ${StrRep}
 ${UnStrRep}
 
-Name "BottleForApps"
+Name "Погребок"
 OutFile "${OUTFILE}"
-InstallDir "$PROGRAMFILES64\BottleForApps"
-InstallDirRegKey HKLM "Software\BottleForApps" "InstallDir"
+InstallDir "$PROGRAMFILES64\Pogrebok"
+InstallDirRegKey HKLM "Software\Pogrebok" "InstallDir"
 RequestExecutionLevel admin
-BrandingText "BottleForApps ${VERSION}"
+BrandingText "Погребок ${VERSION}"
 
-!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\BottleForApps"
+!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pogrebok"
 !define ENV_KEY "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
 !ifndef HWND_BROADCAST
   !define HWND_BROADCAST 0xFFFF
@@ -108,37 +109,37 @@ Function .onInit
   ; Обновление: если старая версия установлена — тихо сносим её сначала.
   ReadRegStr $0 HKLM "${UNINSTALL_KEY}" "UninstallString"
   ${If} $0 != ""
-    MessageBox MB_YESNO|MB_ICONQUESTION "BottleForApps уже установлен. Удалить предыдущую версию и продолжить?" /SD IDYES IDYES +2
+    MessageBox MB_YESNO|MB_ICONQUESTION "Погребок уже установлен. Удалить предыдущую версию и продолжить?" /SD IDYES IDYES +2
       Abort
     ExecWait '$0 /S _?=$INSTDIR' $1
   ${EndIf}
 FunctionEnd
 
-Section "BottleForApps" SecMain
+Section "Погребок" SecMain
   SectionIn RO
   SetRegView 64
   SetShellVarContext all
 
   SetOutPath "$INSTDIR"
-  File "${INPUT_DIR}/bottle.exe"
-  File "${INPUT_DIR}/bottled.exe"
-  File "${INPUT_DIR}/bottle-svc.exe"
-  File "${INPUT_DIR}/bottle-gui.exe"
+  File "${INPUT_DIR}/pogrebok.exe"
+  File "${INPUT_DIR}/pogrebok-daemon.exe"
+  File "${INPUT_DIR}/pogrebok-svc.exe"
+  File "${INPUT_DIR}/pogrebok-gui.exe"
   SetOutPath "$INSTDIR\appliance"
-  File "${INPUT_DIR}/appliance/bottleforapps-rootfs.tar.gz"
+  File "${INPUT_DIR}/appliance/pogrebok-rootfs.tar.gz"
 
   ; Ярлык GUI в меню Пуск (рядом с бинарниками — GUI резолвит их от себя).
-  CreateDirectory "$SMPROGRAMS\BottleForApps"
-  CreateShortcut "$SMPROGRAMS\BottleForApps\BottleForApps.lnk" "$INSTDIR\bottle-gui.exe" "" "$INSTDIR\bottle-gui.exe" 0 "" "" "BottleForApps — управление бутылками"
+  CreateDirectory "$SMPROGRAMS\Погребок"
+  CreateShortcut "$SMPROGRAMS\Погребок\Погребок.lnk" "$INSTDIR\pogrebok-gui.exe" "" "$INSTDIR\pogrebok-gui.exe" 0 "" "" "Погребок — управление бутылками"
 
   ; PATH (machine).
   !insertmacro AddToPath
 
   ; Реестр: наш ключ + запись «Установка и удаление программ».
-  WriteRegStr HKLM "Software\BottleForApps" "InstallDir" "$INSTDIR"
-  WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "BottleForApps"
+  WriteRegStr HKLM "Software\Pogrebok" "InstallDir" "$INSTDIR"
+  WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "Погребок"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKLM "${UNINSTALL_KEY}" "Publisher" "BottleForApps"
+  WriteRegStr HKLM "${UNINSTALL_KEY}" "Publisher" "Погребок"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoModify" 1
@@ -168,11 +169,11 @@ Section "BottleForApps" SecMain
 
   ; Служба маршрутов (автозапуск, SYSTEM). Отказ = отказ установки;
   ; поверх ручной установки службы установщик откажет с внятным текстом
-  ; (снимите службу: bottle-svc.exe --uninstall).
-  nsExec::ExecToLog '"$INSTDIR\bottle-svc.exe" --install'
+  ; (снимите службу: pogrebok-svc.exe --uninstall).
+  nsExec::ExecToLog '"$INSTDIR\pogrebok-svc.exe" --install'
   Pop $0
   ${If} $0 != 0
-    MessageBox MB_ICONSTOP "Не удалось установить службу маршрутов (код $0). Если служба уже существует — снимите её: bottle-svc.exe --uninstall, затем повторите установку."
+    MessageBox MB_ICONSTOP "Не удалось установить службу маршрутов (код $0). Если служба уже существует — снимите её: pogrebok-svc.exe --uninstall, затем повторите установку."
     Abort "служба не установлена"
   ${EndIf}
 SectionEnd
@@ -183,23 +184,23 @@ Section "Uninstall"
 
   ; Служба снимается до удаления файлов (зеркало MSI UninstallSvc,
   ; ошибки игнорируем — службы может и не быть).
-  nsExec::ExecToLog '"$INSTDIR\bottle-svc.exe" --uninstall'
+  nsExec::ExecToLog '"$INSTDIR\pogrebok-svc.exe" --uninstall'
   Pop $0
 
-  Delete "$SMPROGRAMS\BottleForApps\BottleForApps.lnk"
-  RMDir "$SMPROGRAMS\BottleForApps"
+  Delete "$SMPROGRAMS\Погребок\Погребок.lnk"
+  RMDir "$SMPROGRAMS\Погребок"
 
   !insertmacro RemoveFromPath
 
-  Delete "$INSTDIR\bottle.exe"
-  Delete "$INSTDIR\bottled.exe"
-  Delete "$INSTDIR\bottle-svc.exe"
-  Delete "$INSTDIR\bottle-gui.exe"
-  Delete "$INSTDIR\appliance\bottleforapps-rootfs.tar.gz"
+  Delete "$INSTDIR\pogrebok.exe"
+  Delete "$INSTDIR\pogrebok-daemon.exe"
+  Delete "$INSTDIR\pogrebok-svc.exe"
+  Delete "$INSTDIR\pogrebok-gui.exe"
+  Delete "$INSTDIR\appliance\pogrebok-rootfs.tar.gz"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR\appliance"
   RMDir "$INSTDIR"
 
   DeleteRegKey HKLM "${UNINSTALL_KEY}"
-  DeleteRegKey HKLM "Software\BottleForApps"
+  DeleteRegKey HKLM "Software\Pogrebok"
 SectionEnd

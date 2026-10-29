@@ -7,10 +7,21 @@
 // Проводится в Tauri-команды в задачах 15–16 (окна бутылок).
 #![allow(dead_code)]
 
-use bottle_core::ipc::{BottleSummary, FullProfile, VpnCredentials};
+use bottle_core::ipc::{FullProfile, VpnCredentials};
 use bottle_core::profile::{BottleKind, BottleProfile, ExposeConfig, VpnConfig};
 
 use super::Vault;
+
+/// Сводка бутылки для списка (id, имя, тип, состояние из демона).
+/// В 0.3 живёт на стороне GUI: wire-протокол демона больше не несёт
+/// List-сводок (Task 19); форма JSON — та же, что была у core-типа.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BottleSummary {
+    pub id: String,
+    pub name: String,
+    pub kind: BottleKind,
+    pub state: Option<String>,
+}
 
 /// Строка списка для сетки главного окна (Task 15): к сводке добавлены
 /// протокол env-бутылки (у WireGuard нет логина/пароля — кнопка гаснет)

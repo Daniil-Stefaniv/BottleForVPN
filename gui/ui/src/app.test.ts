@@ -44,7 +44,7 @@ const STATS: DaemonStatsWire = {
   appliance_version: "0.3.0",
 };
 
-const DAEMON_DOWN = "не удалось подключиться к демону — запущен ли bottled?";
+const DAEMON_DOWN = "не удалось подключиться к демону — запущен ли pogrebok-daemon?";
 
 const HTML = `
 <main id="app">
@@ -404,7 +404,7 @@ describe("главное окно 0.3", () => {
     expect(dialog?.open).toBe(false);
   });
 
-  it("«Запустить демона»: спавн bottled, затем подключение и sync", async () => {
+  it("«Запустить демона»: спавн pogrebok-daemon, затем подключение и sync", async () => {
     const { app, backend } = await boot();
     const api = makeGuiApi({
       daemonConnect: vi

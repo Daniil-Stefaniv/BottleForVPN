@@ -1,6 +1,6 @@
 //! Импорт WSL-апплайенса, провижининг токена, соединение с агентом.
 //!
-//! [`ensure_appliance`] идемпотентен: если дистрибуция `bottleforapps`
+//! [`ensure_appliance`] идемпотентен: если дистрибуция `pogrebok`
 //! уже импортирован, используется локально сохранённый токен (его
 //! отсутствие фатально — восстановить токен нельзя); свежий импорт
 //! генерирует токен, записывает его в VM (`/etc/bottle-agent/token`,
@@ -29,7 +29,7 @@ use tokio_util::codec::{Decoder, Encoder, Framed};
 use crate::error::DaemonError;
 
 /// Стандартное имя WSL-дистрибутива аплаенса (видно в `wsl -l`).
-pub const DISTRIBUTION: &str = "bottleforapps";
+pub const DISTRIBUTION: &str = "pogrebok";
 
 /// Порт control-сервера агента внутри аплаенса (спека §4.3).
 pub const AGENT_PORT: u16 = 7777;
@@ -198,7 +198,7 @@ pub async fn ensure_appliance(
     ensure_appliance_with_port(wsl, data_root, rootfs_tar, connect_timeout, AGENT_PORT).await
 }
 
-/// `bottle upgrade` (спека §11): снос дистрибуции аплаенса и
+/// `pogrebok upgrade` (спека §11): снос дистрибуции аплаенса и
 /// пере-импорт из `rootfs_tar`. Профили и настройки живут в `<data>`
 /// и не трогаются; локальный токен удаляется ДО пере-импорта —
 /// иначе ensure увидит «дистрибуция установлена» без токена и
@@ -285,7 +285,7 @@ async fn unregister_appliance(wsl: &dyn WslRunner) -> Result<(), DaemonError> {
     Err(DaemonError::Appliance(format!(
         "не удалось снять регистрацию дистрибуции {DISTRIBUTION} — \
          выполните `wsl --shutdown`, затем `wsl --unregister {DISTRIBUTION}` \
-         вручную и повторите `bottle upgrade`"
+         вручную и повторите `pogrebok upgrade`"
     )))
 }
 
@@ -359,7 +359,7 @@ async fn provision_token(
         return Err(DaemonError::Appliance(format!(
             "не удалось импортировать дистрибуцию {DISTRIBUTION}: {e}. \
              Если она уже существует (например, после прерванной установки), \
-             выполните `wsl --unregister {DISTRIBUTION}` и повторите, либо `bottle upgrade`"
+             выполните `wsl --unregister {DISTRIBUTION}` и повторите, либо `pogrebok upgrade`"
         )));
     }
     tracing::info!(
@@ -721,7 +721,7 @@ impl Decoder for AgentCodec {
 /// Есть ли дистрибутив аплаенса в выводе `wsl -l -q`.
 ///
 /// Строки чистятся от пробелов, `\r` и BOM (wsl.exe добавляет её к
-/// первому столбцу); сравнение точное, чтобы `my-bottleforapps-2`
+/// первому столбцу); сравнение точное, чтобы `my-pogrebok-2`
 /// не считался установленным аплаенсом.
 fn is_installed(listing: &str) -> bool {
     listing.lines().any(|line| {
@@ -873,10 +873,10 @@ mod tests {
                             return Ok(String::new());
                         }
                     }
-                    // wake: `wsl -d bottleforapps --exec /bin/true`
+                    // wake: `wsl -d pogrebok --exec /bin/true`
                     Some(&"/bin/true") => return Ok(String::new()),
                     // Восстановление токена из VM:
-                    // `wsl -d bottleforapps --exec /bin/cat /etc/bottle-agent/token`
+                    // `wsl -d pogrebok --exec /bin/cat /etc/bottle-agent/token`
                     Some(&"/bin/cat") => {
                         return match self.token.get() {
                             Some(token) => Ok(format!("{token}\n")),
@@ -1151,7 +1151,7 @@ mod tests {
         assert_eq!(wsl.token.get().as_deref(), Some(token.as_str()));
     }
 
-    /// `bottle upgrade` (Review Focus #2): unregister дистрибуции →
+    /// `pogrebok upgrade` (Review Focus #2): unregister дистрибуции →
     /// удаление токена → пере-импорт + handshake; версия нового
     /// аплаенса возвращается; токен регенерирован (не старый).
     #[tokio::test]
@@ -1684,8 +1684,8 @@ mod tests {
 
     #[test]
     fn decode_wsl_output_reads_utf16le_with_bom() {
-        let bytes = utf16le("bottleforapps\r\nUbuntu\r\n", true);
-        assert_eq!(decode_wsl_output(&bytes), "bottleforapps\r\nUbuntu\r\n");
+        let bytes = utf16le("pogrebok\r\nUbuntu\r\n", true);
+        assert_eq!(decode_wsl_output(&bytes), "pogrebok\r\nUbuntu\r\n");
     }
 
     #[test]

@@ -68,7 +68,7 @@ async fn uds_exchange_without_server_is_daemon_unavailable() {
     .await
     .expect_err("демона нет");
     assert!(
-        error.contains("запущен ли bottled"),
+        error.contains("запущен ли pogrebok-daemon"),
         "понятная ошибка: {error}"
     );
 }

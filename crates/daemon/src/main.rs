@@ -1,8 +1,8 @@
-//! `bottled` — демон BottleForApps.
+//! `pogrebok-daemon` — демон Погребка.
 //!
 //! Открывает хранилище профилей в каталоге данных (`--data-dir`, по
 //! умолчанию — локальный каталог данных пользователя) и обслуживает канал
-//! управления CLI (named pipe `\\.\pipe\bottled`): List/Show читают
+//! управления CLI (named pipe `\\.\pipe\pogrebok-daemon`): List/Show читают
 //! хранилище, Start/Stop/Status обслуживает менеджер бутылок
 //! (`--rootfs` — тарболл аплаенса, по умолчанию кладётся установщиком
 //! в `<каталог данных>/appliance/`). Повторный запуск отклоняется
@@ -116,9 +116,9 @@ async fn main() -> ExitCode {
     let args = match parse_cli_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("bottled: {message}");
+            eprintln!("pogrebok-daemon: {message}");
             eprintln!(
-                "использование: bottled --gui-token <64 hex> [--data-dir <PATH>] [--rootfs <PATH>]"
+                "использование: pogrebok-daemon --gui-token <64 hex> [--data-dir <PATH>] [--rootfs <PATH>]"
             );
             return ExitCode::FAILURE;
         }
@@ -127,13 +127,13 @@ async fn main() -> ExitCode {
     // Файловый JSONL-журнал в `<data>/logs` (ротация ежедневно,
     // хранение 30 дней). Инициализация до всего, что логируется;
     // сбой не фатален — демон работает с stdout-логами.
-    if let Err(error) = logging::init_file_logging(&args.data_dir.join("logs"), "bottled") {
-        eprintln!("bottled: файловый журнал недоступен ({error}); пишу только в консоль");
+    if let Err(error) = logging::init_file_logging(&args.data_dir.join("logs"), "pogrebok-daemon") {
+        eprintln!("pogrebok-daemon: файловый журнал недоступен ({error}); пишу только в консоль");
         init_tracing();
     }
 
     if !instance::acquire_single_instance(&args.data_dir) {
-        eprintln!("Демон BottleForApps уже запущен");
+        eprintln!("Демон Погребка уже запущен");
         return ExitCode::FAILURE;
     }
 
@@ -142,11 +142,11 @@ async fn main() -> ExitCode {
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
     let rootfs = resolve_rootfs(args.rootfs, &args.data_dir, exe_dir.as_deref());
     if let Err(error) = serve_daemon(args.data_dir, rootfs, args.gui_token, shutdown_on_ctrl_c()).await {
-        tracing::error!(%error, "bottled завершился с ошибкой");
-        eprintln!("bottled: {error}");
+        tracing::error!(%error, "pogrebok-daemon завершился с ошибкой");
+        eprintln!("pogrebok-daemon: {error}");
         return ExitCode::FAILURE;
     }
-    println!("Демон BottleForApps остановлен");
+    println!("Демон Погребка остановлен");
     ExitCode::SUCCESS
 }
 
@@ -169,7 +169,7 @@ pub async fn serve_daemon(
     // только служебные файлы демона (см. `paths`).
     paths::open_data_dir(&data_dir)?;
     let data_root = data_dir.clone();
-    println!("Демон BottleForApps запущен");
+    println!("Демон Погребка запущен");
     println!("Каталог данных: {}", data_root.display());
     println!("Rootfs аплаенса: {}", rootfs_tar.display());
 
@@ -285,7 +285,7 @@ struct CliArgs {
 }
 
 /// Имя файла rootfs внутри `<data_dir>/appliance/` (кладётся установщиком).
-const ROOTFS_FILE_NAME: &str = "bottleforapps-rootfs.tar.gz";
+const ROOTFS_FILE_NAME: &str = "pogrebok-rootfs.tar.gz";
 
 /// Разбирает аргументы командной строки: `--gui-token <64 hex>` /
 /// `--data-dir <PATH>` / `--rootfs <PATH>` (также формы через `=`).
@@ -350,7 +350,7 @@ where
     })
 }
 
-/// Каталог данных по умолчанию: `<локальный каталог данных>/BottleForApps`.
+/// Каталог данных по умолчанию: `<локальный каталог данных>/Pogrebok`.
 fn default_data_dir() -> Option<PathBuf> {
     bottle_core::ipc::default_data_dir()
 }
@@ -574,6 +574,6 @@ mod tests {
     fn no_data_dir_falls_back_to_default() {
         let parsed = parse_cli_args(args(&["--gui-token", TOKEN]))
             .expect("локальный каталог данных определён в тестовом окружении");
-        assert!(parsed.data_dir.ends_with("BottleForApps"));
+        assert!(parsed.data_dir.ends_with("Pogrebok"));
     }
 }

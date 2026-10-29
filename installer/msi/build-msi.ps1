@@ -1,6 +1,6 @@
-﻿# Сборка MSI BottleForApps (Windows + WiX v4/v5 CLI; CI: windows-раннер).
+# Сборка MSI Pogrebok (Windows + WiX v4/v5 CLI; CI: windows-раннер).
 #
-# Формирует artifacts/BottleForApps-<version>-win-x64.msi + SHA256.
+# Формирует artifacts/Pogrebok-<version>-win-x64.msi + SHA256.
 # Версия — из [workspace.package].version (cargo metadata); требует
 # собранных release-бинарников (cargo build --release -p daemon -p cli
 # -p svc) и rootfs-артефакта appliance-build.
@@ -12,7 +12,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$RootfsPath,
 
-    # GUI (M4): путь к bottle-gui.exe (артефакт джобы gui-build).
+    # GUI (M4): путь к pogrebok-gui.exe (артефакт джобы gui-build).
     [Parameter(Mandatory = $true)]
     [string]$GuiExePath,
 
@@ -25,7 +25,7 @@ if (-not (Test-Path $RootfsPath)) {
     throw "rootfs не найден: $RootfsPath (артефакт appliance-build обязателен)"
 }
 if (-not (Test-Path $GuiExePath)) {
-    throw "bottle-gui.exe не найден: $GuiExePath (артефакт gui-build обязателен)"
+    throw "pogrebok-gui.exe не найден: $GuiExePath (артефакт gui-build обязателен)"
 }
 
 # WiX CLI: PATH → dotnet tool (пин 6.0.*: WiX 7 требует приёма OSMF EULA,
@@ -47,7 +47,7 @@ if (-not $version) {
 }
 Write-Host "Версия: $version"
 
-if (-not (Test-Path "target/release/bottle.exe")) {
+if (-not (Test-Path "target/release/pogrebok.exe")) {
     cargo build --release -p daemon -p cli -p svc
     if ($LASTEXITCODE -ne 0) { throw "cargo build --release не удался" }
 }
@@ -57,7 +57,7 @@ $rootfs = (Resolve-Path $RootfsPath).Path
 $guiExe = (Resolve-Path $GuiExePath).Path
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$msi = "$OutDir/BottleForApps-$version-win-x64.msi"
+$msi = "$OutDir/Pogrebok-$version-win-x64.msi"
 if (Test-Path $msi) { Remove-Item -Force $msi }
 
 # wix build сам валидирует ICE; -arch x64 обязателен для ProgramFiles64Folder.
@@ -68,7 +68,7 @@ wix build `
     -d "RootfsPath=$rootfs" `
     -d "GuiExePath=$guiExe" `
     -o $msi `
-    installer/msi/BottleForApps.wxs
+    installer/msi/Pogrebok.wxs
 if ($LASTEXITCODE -ne 0) { throw "wix build не удался" }
 
 $hash = (Get-FileHash $msi -Algorithm SHA256).Hash

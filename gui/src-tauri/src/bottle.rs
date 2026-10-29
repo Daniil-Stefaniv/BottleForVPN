@@ -10,15 +10,15 @@ use serde::Serialize;
 use tokio::process::Command;
 
 /// Переменная окружения для подмены пути к CLI в dev-режиме и тестах.
-pub const BOTTLE_BIN_ENV: &str = "BOTTLE_GUI_BOTTLE_BIN";
+pub const CLI_BIN_ENV: &str = "POGREBOK_GUI_CLI_BIN";
 
 /// Бюджет на один вызов CLI: `start` в худшем случае занимает до 120 с
 /// (CLI-транспорт сам ждёт столько же) — GUI не отрезает его раньше.
 pub const BOTTLE_TIMEOUT: Duration = Duration::from_secs(130);
 
 /// `CREATE_NO_WINDOW` (Windows): GUI — windows-подсистема без консоли,
-/// поэтому каждый спавн консольного `bottle.exe`/`bottled.exe` иначе
-/// создаёт видимое окно cmd (при периодическом refresh — «моргание»).
+/// поэтому каждый спавн консольного `pogrebok.exe`/`pogrebok-daemon.exe`
+/// иначе создаёт видимое окно cmd (при периодическом refresh — «моргание»).
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -34,7 +34,7 @@ pub struct BottleOutput {
 /// Резолвит исполняемый файл CLI: переменная окружения (dev/тесты) →
 /// `bottle` рядом с GUI (MSI/.app, рулинг D5) → поиск в PATH.
 pub fn resolve_bottle_path() -> PathBuf {
-    if let Ok(path) = std::env::var(BOTTLE_BIN_ENV) {
+    if let Ok(path) = std::env::var(CLI_BIN_ENV) {
         if !path.is_empty() {
             return PathBuf::from(path);
         }
@@ -176,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn run_program_missing_binary_is_error() {
         let result = run_program(
-            "bottle-gui-no-such-binary-xyz",
+            "pogrebok-gui-no-such-binary-xyz",
             vec![],
             std::time::Duration::from_secs(2),
         )
@@ -192,14 +192,14 @@ mod tests {
         // SAFETY: std::env::set_var безопасен в однопоточном тестовом
         // рантайме; переменная снимается до возврата.
         unsafe {
-            std::env::set_var(BOTTLE_BIN_ENV, "/opt/bottle-test");
+            std::env::set_var(CLI_BIN_ENV, "/opt/bottle-test");
         }
         assert_eq!(
             resolve_bottle_path(),
             std::path::PathBuf::from("/opt/bottle-test")
         );
         unsafe {
-            std::env::remove_var(BOTTLE_BIN_ENV);
+            std::env::remove_var(CLI_BIN_ENV);
         }
     }
 }

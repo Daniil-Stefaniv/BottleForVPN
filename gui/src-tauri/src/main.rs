@@ -1,7 +1,7 @@
-//! Точка входа GUI BottleForApps (Tauri 2, M4).
+//! Точка входа GUI Погребка (Tauri 2, M4).
 //!
 //! Rust-сторона минимальна по построению (рулинг D1): команда-посредник
-//! [`run_bottle`] спавнит CLI `bottle --json …`, а [`start_daemon`]/
+//! [`run_bottle`] спавнит CLI `pogrebok --json …`, а [`start_daemon`]/
 //! [`daemon_status`] — единственное место, где GUI запускает не-CLI
 //! (кнопка «Запустить демона»); вся логика и рендер — в TypeScript.
 
@@ -17,13 +17,13 @@ mod tray;
 
 use daemon::DaemonHandle;
 
-/// Команда-посредник для фронтенда: `bottle <args>` → stdout и код.
+/// Команда-посредник для фронтенда: `pogrebok <args>` → stdout и код.
 #[tauri::command]
 async fn run_bottle(args: Vec<String>) -> Result<bottle::BottleOutput, String> {
     bottle::run_bottle(&args).await
 }
 
-/// Запускает демона bottled (кнопка «Запустить демона», рулинг D1).
+/// Запускает демона pogrebok-daemon (кнопка «Запустить демона», рулинг D1).
 #[tauri::command]
 async fn start_daemon(state: tauri::State<'_, DaemonHandle>) -> Result<(), String> {
     state.start().await
@@ -100,7 +100,7 @@ fn gui_log_recent(state: tauri::State<'_, gui_log::GuiLog>) -> Vec<bottle_core::
     state.recent()
 }
 
-/// Папка журналов (gui-*.jsonl и bottled.log) — кнопка «Открыть папку
+/// Папка журналов (gui-*.jsonl и журналы демона) — кнопка «Открыть папку
 /// логов» в подвале консоли (спека §3.4).
 #[tauri::command]
 fn logs_dir() -> Result<String, String> {
@@ -961,7 +961,7 @@ fn main() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("не удалось запустить окно BottleForApps");
+        .expect("не удалось запустить окно Погребка");
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
-﻿# ci-wsl-integration.ps1 — WSL-интеграционный сценарий CI (задача 18, M1).
+# ci-wsl-integration.ps1 — WSL-интеграционный сценарий CI (задача 18, M1).
 #
 # Полный вертикальный срез env-бутылки на windows-раннере:
-#   1) импорт rootfs-апплайенса как дистрибутива `bottleforapps-ci`;
+#   1) импорт rootfs-апплайенса как дистрибутива `pogrebok-ci`;
 #   2) подъём упрощённого WG-стенда (по мотивам теста wg_handshake, T10)
 #      ВНУТРИ той же WSL-VM: namespace `srv` с veth 10.77.253.0/30,
 #      wireguard-сервер 10.99.0.1:51820 (ключи генерируются в VM через
@@ -9,17 +9,17 @@
 #      (UDP 51820 на eth0 DNAT-ится в srv);
 #   3) профиль office-ci (kind=env, wireguard, socks5=0, forwards=[])
 #      во временном DataDir;
-#   4) запуск bottled, `bottle start` → handshake туннеля → `up`;
+#   4) запуск pogrebok-daemon, `pogrebok start` → handshake туннеля → `up`;
 #   5) SOCKS5-negotiate 05 01 00 → 05 00 (как в юнит-тестах T16)
 #      на 127.0.0.1:<порт из status>;
-#   6) `bottle stop` → бутылки в status нет, порт закрыт.
+#   6) `pogrebok stop` → бутылки в status нет, порт закрыт.
 #
 # Допущения стенда (проверяются поведением, CI-джоба continue-on-error):
 #   - все дистрибутивы одной WSL2-VM делят общий network namespace,
-#     поэтому veth/DNAT из `bottleforapps-ci` видны бутылке, поднятой
-#     агентом в дистрибутиве демона `bottleforapps`;
+#     поэтому veth/DNAT из `pogrebok-ci` видны бутылке, поднятой
+#     агентом в дистрибутиве демона `pogrebok`;
 #   - boot.command rootfs стартует bottle-agent при первом обращении
-#     к дистрибутиву: у `bottleforapps-ci` его приходится останавливать
+#     к дистрибутиву: у `pogrebok-ci` его приходится останавливать
 #     (он занял бы 0.0.0.0:7777 в общем namespace до старта агента демона).
 #
 # PowerShell 5.1-совместим. Любой шаг падает с понятным сообщением и
@@ -28,9 +28,9 @@
 param(
     # Тарболл rootfs аплаенса (артефакт джобы appliance-build).
     [Parameter(Mandatory = $true)][string]$Rootfs,
-    # Путь к bottled.exe (cargo build --release -p daemon).
+    # Путь к pogrebok-daemon.exe (cargo build --release -p daemon).
     [Parameter(Mandatory = $true)][string]$Bottled,
-    # Путь к bottle.exe (cargo build --release -p cli).
+    # Путь к pogrebok.exe (cargo build --release -p cli).
     [Parameter(Mandatory = $true)][string]$Bottle,
     # Каталог данных демона (профили, токен, VHD дистрибутивов).
     [Parameter(Mandatory = $true)][string]$DataDir
@@ -42,21 +42,21 @@ $ErrorActionPreference = 'Stop'
 # --- Константы сценария ------------------------------------------------------
 
 # Дистрибутив стенда (импортируется из того же rootfs, что и дистрибутив
-# демона `bottleforapps`; не пересекается с ним по имени).
-$CiDistro = 'bottleforapps-ci'
+# демона `pogrebok`; не пересекается с ним по имени).
+$CiDistro = 'pogrebok-ci'
 # Идентификатор тестовой бутылки (профиль + namespace bottle-office-ci).
 $BottleId = 'office-ci'
 # Внутренние адреса WG-стенда: сервер 10.99.0.1, клиент 10.99.0.2.
 $WgSrvAddr = '10.99.0.1'
 $WgCliAddr = '10.99.0.2'
-# Порт SOCKS5, который bottled пробросит на 127.0.0.1 (из status).
+# Порт SOCKS5, который pogrebok-daemon пробросит на 127.0.0.1 (из status).
 $Socks5Port = 0
 
 # Процесс демона (для teardown).
 $DaemonProcess = $null
 # Логи демона — печатаются в диагностику при провале.
-$DaemonStdout = Join-Path $DataDir 'bottled-stdout.log'
-$DaemonStderr = Join-Path $DataDir 'bottled-stderr.log'
+$DaemonStdout = Join-Path $DataDir 'pogrebok-daemon-stdout.log'
+$DaemonStderr = Join-Path $DataDir 'pogrebok-daemon-stderr.log'
 
 # --- Вспомогательные функции ---------------------------------------------------
 
@@ -108,7 +108,7 @@ function Show-DaemonLog {
 # адреса интерфейсов. Отвечает на главный вопрос сценария — почему
 # «агент аплаенса не ответил за 30 s».
 function Show-ApplianceState {
-    foreach ($distro in @('bottleforapps', $CiDistro)) {
+    foreach ($distro in @('pogrebok', $CiDistro)) {
         Write-Host "----- дистрибутив ${distro}: ps / слушатели / адреса -----"
         $ErrorActionPreference = 'Continue'
         $probe = & wsl.exe -d $distro --exec /bin/sh -c 'ps; echo ---; ss -ltnp; echo ---; ip -o addr' 2>&1
@@ -269,7 +269,7 @@ echo 'BFA-STAND-OK'
 # --- Основной сценарий ---------------------------------------------------------
 
 try {
-    Write-Host "=== WSL-интеграционный сценарий BottleForApps (M1) ==="
+    Write-Host "=== WSL-интеграционный сценарий Погребка (M1) ==="
     Write-Host "Rootfs:   $Rootfs"
     Write-Host "Bottled:  $Bottled"
     Write-Host "Bottle:   $Bottle"
@@ -366,9 +366,9 @@ forwards = []
         -RedirectStandardOutput $DaemonStdout `
         -RedirectStandardError $DaemonStderr `
         -PassThru -WindowStyle Hidden
-    Write-Host "==> bottled запущен (pid $($DaemonProcess.Id)); жду named pipe ~10 с"
+    Write-Host "==> pogrebok-daemon запущен (pid $($DaemonProcess.Id)); жду named pipe ~10 с"
 
-    # Ожидание канала: `bottle list` выходит с кодом 0, когда демон отвечает.
+    # Ожидание канала: `pogrebok list` выходит с кодом 0, когда демон отвечает.
     $daemonReady = $false
     foreach ($attempt in 1..20) {
         $ErrorActionPreference = 'Continue'
@@ -377,12 +377,12 @@ forwards = []
         $ErrorActionPreference = 'Stop'
         if ($code -eq 0) { $daemonReady = $true; break }
         if ($DaemonProcess.HasExited) {
-            throw "bottled завершился при старте (код $($DaemonProcess.ExitCode))"
+            throw "pogrebok-daemon завершился при старте (код $($DaemonProcess.ExitCode))"
         }
         Start-Sleep -Milliseconds 500
     }
     if (-not $daemonReady) {
-        throw "демон не поднял канал \\.\pipe\bottled за 10 с"
+        throw "демон не поднял канал \\.\pipe\pogrebok-daemon за 10 с"
     }
     Write-Host "    демон отвечает; список бутылок:"
     Write-Host ($probe | Out-String)
@@ -390,11 +390,11 @@ forwards = []
     # (5) start: импорт дистрибутива демона, handshake туннеля ≤30 с —
     #     в CLI заложен таймаут ответа 40 с, ждём его целиком.
     Invoke-Tool -FilePath $Bottle -Arguments @('start', $BottleId) `
-        -Description "bottle start $BottleId (туннель + relay)"
+        -Description "pogrebok start $BottleId (туннель + relay)"
 
     # (6) status: состояние up и порт SOCKS5.
     $status = Invoke-Tool -FilePath $Bottle -Arguments @('status') `
-        -Description 'bottle status'
+        -Description 'pogrebok status'
     Write-Host $status
     if ($status -notmatch "$BottleId\s+up") {
         throw "status не показывает «$BottleId  up»:`n$status"
@@ -406,7 +406,7 @@ forwards = []
     $Socks5Port = [int]$portMatch.Groups[1].Value
     Write-Host "    SOCKS5: 127.0.0.1:$Socks5Port"
 
-    # (7) SOCKS5-negotiate через весь путь: 127.0.0.1 (bottled) → VM →
+    # (7) SOCKS5-negotiate через весь путь: 127.0.0.1 (pogrebok-daemon) → VM →
     #     relay внутри namespace бутылки. Несколько попыток — мост
     #     агента поднимается асинхронно.
     $negotiated = $false
@@ -429,10 +429,10 @@ forwards = []
 
     # (8) stop: бутылки в status больше нет, слушатель закрыт.
     Invoke-Tool -FilePath $Bottle -Arguments @('stop', $BottleId) `
-        -Description "bottle stop $BottleId"
+        -Description "pogrebok stop $BottleId"
 
     $statusAfter = Invoke-Tool -FilePath $Bottle -Arguments @('status') `
-        -Description 'bottle status (после stop)'
+        -Description 'pogrebok status (после stop)'
     Write-Host $statusAfter
     if ($statusAfter -match $BottleId) {
         throw "после stop бутылка $BottleId всё ещё в status:`n$statusAfter"
@@ -466,6 +466,6 @@ finally {
     }
     & wsl.exe --unregister $CiDistro 2>&1 | Out-Null
     # Дистрибутив демона импортируется в <DataDir>\appliance-vm — тоже наш.
-    & wsl.exe --unregister 'bottleforapps' 2>&1 | Out-Null
+    & wsl.exe --unregister 'pogrebok' 2>&1 | Out-Null
     $ErrorActionPreference = 'Stop'
 }

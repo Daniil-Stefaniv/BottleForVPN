@@ -1,12 +1,12 @@
-//! Single-instance демона: повторный запуск `bottled` невозможен.
+//! Single-instance демона: повторный запуск `pogrebok-daemon` невозможен.
 
 use std::path::Path;
 
 /// Пытается стать единственным запущенным экземпляром демона.
 ///
-/// Windows — именованный мьютекс `Global\bottled-singleton`: создаётся
+/// Windows — именованный мьютекс `Global\pogrebok-daemon-singleton`: создаётся
 /// и удерживается до конца процесса. Unix (M4: UDS-транспорт) —
-/// эксклюзивный flock на `<data>/bottled.lock`: он закрывает гонку
+/// эксклюзивный flock на `<data>/pogrebok-daemon.lock`: он закрывает гонку
 /// одновременного старта двух демонов до того, как кто-то из них
 /// займёт сокет (живой сокет дополнительно защищает [`crate::uds::serve`]).
 /// `false` означает, что демона уже запустили либо лок не ставится.
@@ -34,7 +34,7 @@ mod single_instance_mutex {
     use windows_sys::Win32::System::Threading::CreateMutexW;
 
     /// Имя мьютекса single-instance (глобальное пространство имён объектов).
-    const MUTEX_NAME: &str = r"Global\bottled-singleton";
+    const MUTEX_NAME: &str = r"Global\pogrebok-daemon-singleton";
 
     /// Создаёт мьютекс и удерживает его дескриптор до конца процесса:
     /// пока демон жив, повторный `acquire` видит `ERROR_ALREADY_EXISTS`.
@@ -67,12 +67,12 @@ mod single_instance_flock {
     use std::sync::OnceLock;
 
     /// Имя lock-файла внутри каталога данных демона.
-    const LOCK_FILE: &str = "bottled.lock";
+    const LOCK_FILE: &str = "pogrebok-daemon.lock";
 
     /// Удерживаемый lock (живёт до конца процесса).
     static HELD: OnceLock<File> = OnceLock::new();
 
-    /// Ставит эксклюзивный неблокирующий flock на `<data>/bottled.lock`.
+    /// Ставит эксклюзивный неблокирующий flock на `<data>/pogrebok-daemon.lock`.
     /// Файл (0600) остаётся на диске после выхода — это нормально:
     /// flock принадлежит открытому дескриптору, не файлу.
     use std::os::fd::AsRawFd;

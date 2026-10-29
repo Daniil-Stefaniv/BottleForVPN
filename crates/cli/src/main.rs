@@ -31,7 +31,7 @@ const TOMBSTONE_MESSAGE: &str = "управление бутылками пер�
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "bottle",
+    name = "pogrebok",
     about = "Погребок — служебные команды демона (управление бутылками — в приложении)",
     version,
     disable_version_flag = true
@@ -131,7 +131,7 @@ enum DaemonCommand {
 /// Подкоманды `bottle routes`.
 #[derive(Debug, Subcommand)]
 enum RoutesCommand {
-    /// Снять сиротские маршруты через службу bottle-svc
+    /// Снять сиротские маршруты через службу pogrebok-svc
     Cleanup,
 }
 
@@ -205,7 +205,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(40);
 /// очередного ожидающего экземпляра канала/сокета и освобождением
 /// предыдущего клиент видит «занят»/«нет файла» — это стык, а не
 /// отсутствие демона; 60 с покрывают его с запасом (включая холодный
-/// старт bottled).
+/// старт pogrebok-daemon).
 #[cfg_attr(not(windows), allow(dead_code))]
 const CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(60);
 
@@ -284,12 +284,12 @@ async fn main() -> ExitCode {
             println!(
                 "{}",
                 render_json(&CliReply::Error {
-                    message: "bottle не поддерживает эту платформу (транспорта демона нет)"
+                    message: "pogrebok не поддерживает эту платформу (транспорта демона нет)"
                         .to_string()
                 })
             );
         } else {
-            eprintln!("bottle не поддерживает эту платформу (транспорта демона нет)");
+            eprintln!("pogrebok не поддерживает эту платформу (транспорта демона нет)");
         }
         ExitCode::FAILURE
     }
@@ -331,12 +331,12 @@ fn format_parse_error(argv: &[&str], error: &clap::Error) -> Option<String> {
     Some(render_json(&CliReply::Error { message: brief }))
 }
 
-/// Строка `--version`: текст (`bottle 0.3.0`) или JSON для `--json`.
+/// Строка `--version`: текст (`pogrebok 0.3.0`) или JSON для `--json`.
 fn version_output(json: bool) -> String {
     if json {
         format!("{{\"version\":\"{}\"}}", env!("CARGO_PKG_VERSION"))
     } else {
-        format!("bottle {}", env!("CARGO_PKG_VERSION"))
+        format!("pogrebok {}", env!("CARGO_PKG_VERSION"))
     }
 }
 
@@ -433,7 +433,7 @@ fn handle_reply(command: &Command, reply: CliReply) -> ExitCode {
     }
 }
 
-/// Транспорт демона: подключение к `\\.\pipe\bottled`, кадры
+/// Транспорт демона: подключение к `\\.\pipe\pogrebok-daemon`, кадры
 /// [`LengthJsonCodec`](bottle_core::frame::LengthJsonCodec), один
 /// запрос — один ответ на соединение.
 #[cfg(windows)]
@@ -458,7 +458,7 @@ mod client {
     #[derive(Debug, thiserror::Error)]
     pub enum ClientError {
         /// Канал не стал доступен за окно повторов: демон не запущен.
-        #[error("Не удалось подключиться к демону — запущен ли bottled?")]
+        #[error("Не удалось подключиться к демону — запущен ли pogrebok-daemon?")]
         DaemonUnavailable,
         /// Демон не прислал ответ за отведённое время.
         #[error("Демон не ответил за {} с", .0.as_secs())]
@@ -712,7 +712,7 @@ mod tests {
         assert_eq!(
             handle_reply(
                 &command,
-                CliReply::Path(r"C:\tmp\bottleforapps-logs-20261004-1200.zip".to_string())
+                CliReply::Path(r"C:\tmp\pogrebok-logs-20261004-1200.zip".to_string())
             ),
             ExitCode::SUCCESS
         );
@@ -843,7 +843,7 @@ mod tests {
     fn version_output_text_and_json_shapes() {
         assert_eq!(
             version_output(false),
-            format!("bottle {}", env!("CARGO_PKG_VERSION"))
+            format!("pogrebok {}", env!("CARGO_PKG_VERSION"))
         );
         let json = version_output(true);
         assert_eq!(
@@ -859,9 +859,9 @@ mod tests {
     fn json_golden_service_replies() {
         assert_eq!(
             render_json(&CliReply::Path(
-                r"C:\tmp\bottleforapps-logs-20261004-1200.zip".to_string()
+                r"C:\tmp\pogrebok-logs-20261004-1200.zip".to_string()
             )),
-            r#"{"Path":"C:\\tmp\\bottleforapps-logs-20261004-1200.zip"}"#
+            r#"{"Path":"C:\\tmp\\pogrebok-logs-20261004-1200.zip"}"#
         );
         assert_eq!(
             render_json(&CliReply::Upgraded {
@@ -876,9 +876,9 @@ mod tests {
         );
         assert_eq!(
             render_json(&CliReply::Error {
-                message: "bottle not found".to_string()
+                message: "демон недоступен".to_string()
             }),
-            r#"{"Error":{"message":"bottle not found"}}"#
+            r#"{"Error":{"message":"демон недоступен"}}"#
         );
     }
 

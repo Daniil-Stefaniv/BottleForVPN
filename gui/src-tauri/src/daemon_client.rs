@@ -2,7 +2,7 @@
 //! и живое event-соединение (Subscribe) с переподключением.
 //!
 //! Транспорт — тот же, что у демона: UDS `<data>/daemon.sock` на
-//! macOS/Unix, named pipe `\\.\pipe\bottled` на Windows; кадры
+//! macOS/Unix, named pipe `\\.\pipe\pogrebok-daemon` на Windows; кадры
 //! `serde_json::Value` через `LengthJsonCodec`. Авторизация — токеном,
 //! который GUI сгенерировал и передал демону аргументом `--gui-token`
 //! при спавне (живёт только в памяти GUI).
@@ -90,7 +90,7 @@ type Emitter = Arc<dyn Fn(&str, Value) + Send + Sync>;
 
 impl DaemonClient {
     /// Клиент штатного эндпоинта демона (`<data>/daemon.sock` /
-    /// `\\.\pipe\bottled`); `None` — каталог данных недоступен.
+    /// `\\.\pipe\pogrebok-daemon`); `None` — каталог данных недоступен.
     pub fn new() -> Option<Self> {
         #[cfg(unix)]
         {

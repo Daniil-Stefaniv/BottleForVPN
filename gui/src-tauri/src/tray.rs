@@ -53,7 +53,7 @@ pub fn create_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 .expect("иконка приложения")
                 .clone(),
         )
-        .tooltip("BottleForApps")
+        .tooltip("Погребок")
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| {

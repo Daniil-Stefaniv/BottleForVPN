@@ -1,7 +1,7 @@
 [package]
-name = "bottle-gui"
-version = "0.2.7"
-description = "BottleForApps — графический интерфейс управления бутылками"
+name = "pogrebok-gui"
+version = "0.3.0"
+description = "Погребок — графический интерфейс управления бутылками"
 edition = "2021"
 rust-version = "1.85"
 
@@ -40,6 +40,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "ti
 [profile.release]
 strip = true
 lto = true
+opt-level = "z"
+panic = "abort"
 
 [dev-dependencies]
 tempfile = "3"

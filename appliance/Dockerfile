@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Апплайенс BottleForApps: Alpine rootfs + bottle-agent + сетевые пакеты.
+# Апплайенс Погребка: Alpine rootfs + bottle-agent + сетевые пакеты.
 # Целевая платформа — x86_64 (WSL2); сборка всегда идёт под linux/amd64.
 
 FROM --platform=linux/amd64 rust:1-alpine AS builder

@@ -25,7 +25,7 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio_util::codec::Decoder;
 
 /// Имя службы — контракт реестра SCM (main.rs).
-const SERVICE_NAME: &str = "BottleForAppsRouteHelper";
+const SERVICE_NAME: &str = "PogrebokRouteHelper";
 
 /// Маршрут фазы «живой сессии» (RFC 5737 TEST-NET-3).
 const SESSION_DEST: &str = "203.0.113.78";
@@ -55,7 +55,7 @@ fn journal_path() -> PathBuf {
     let programdata =
         std::env::var_os("PROGRAMDATA").expect("PROGRAMDATA задан на Windows-раннере");
     std::path::Path::new(&programdata)
-        .join("BottleForApps")
+        .join("Pogrebok")
         .join("routes.jsonl")
 }
 
@@ -229,10 +229,10 @@ struct TestService {
 impl TestService {
     /// Устанавливает службу собственным бинарником (`--install`).
     fn install() -> Self {
-        let output = Command::new(env!("CARGO_BIN_EXE_bottle-svc"))
+        let output = Command::new(env!("CARGO_BIN_EXE_pogrebok-svc"))
             .arg("--install")
             .output()
-            .expect("запуск bottle-svc --install");
+            .expect("запуск pogrebok-svc --install");
         assert!(
             output.status.success(),
             "установка службы не удалась: {}{}",
@@ -250,7 +250,7 @@ impl Drop for TestService {
         }
         let _ = Command::new("sc.exe").args(["stop", SERVICE_NAME]).output();
         wait_service_state_sync("STOPPED", Duration::from_secs(30));
-        let _ = Command::new(env!("CARGO_BIN_EXE_bottle-svc"))
+        let _ = Command::new(env!("CARGO_BIN_EXE_pogrebok-svc"))
             .arg("--uninstall")
             .output();
         del_route_quiet(SESSION_DEST);

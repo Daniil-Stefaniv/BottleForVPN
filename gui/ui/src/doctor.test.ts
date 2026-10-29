@@ -65,17 +65,17 @@ describe("collectLogs", () => {
       calls.push(args);
       return {
         stdout: JSON.stringify({
-          Path: "/tmp/bottleforapps-logs-20261005-1200.zip",
+          Path: "/tmp/pogrebok-logs-20261005-1200.zip",
         }),
         code: 0,
       };
     });
     const path = await collectLogs();
     expect(calls).toEqual([["--json", "logs", "export"]]);
-    expect(path).toBe("/tmp/bottleforapps-logs-20261005-1200.zip");
+    expect(path).toBe("/tmp/pogrebok-logs-20261005-1200.zip");
     const shown = document.querySelector<HTMLElement>("#logs-path");
     expect(shown?.hidden).toBe(false);
-    expect(shown?.textContent).toContain("/tmp/bottleforapps-logs-20261005-1200.zip");
+    expect(shown?.textContent).toContain("/tmp/pogrebok-logs-20261005-1200.zip");
   });
 
   it("ошибка экспорта — путь скрыт, исключение прокинуто для тоста", async () => {
