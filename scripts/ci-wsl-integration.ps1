@@ -1,4 +1,5 @@
-# ci-wsl-integration.ps1 — WSL-интеграционный сценарий CI (задача 18, M1).
+# ci-wsl-integration.ps1 — WSL-интеграционный сценарий CI (задача 18, M1;
+# переписан под 0.3: управление бутылками ушло из CLI в GUI).
 #
 # Полный вертикальный срез env-бутылки на windows-раннере:
 #   1) импорт rootfs-апплайенса как дистрибутива `pogrebok-ci`;
@@ -8,11 +9,14 @@
 #      `wg genkey`/`wg pubkey`), endpoint клиента = IP eth0 VM
 #      (UDP 51820 на eth0 DNAT-ится в srv);
 #   3) профиль office-ci (kind=env, wireguard, socks5=0, forwards=[])
-#      во временном DataDir;
-#   4) запуск pogrebok-daemon, `pogrebok start` → handshake туннеля → `up`;
-#   5) SOCKS5-negotiate 05 01 00 → 05 00 (как в юнит-тестах T16)
-#      на 127.0.0.1:<порт из status>;
-#   6) `pogrebok stop` → бутылки в status нет, порт закрыт.
+#      как JSON FullProfile (спека §5) — данные 0.3 живут не на диске,
+#      а передаются демону через SyncProfiles;
+#   4) запуск pogrebok-daemon с --gui-token, готовность — `scenario ping`;
+#   5) `scenario up` (SyncProfiles + StartBottle по протоколу GUI↔демон)
+#      → handshake туннеля → событие bottle.up с портом SOCKS5;
+#   6) SOCKS5-negotiate 05 01 00 → 05 00 (как в юнит-тестах T16)
+#      на 127.0.0.1:<порт из bottle.up>;
+#   7) `scenario down` (StopBottle) → порт закрыт.
 #
 # Допущения стенда (проверяются поведением, CI-джоба continue-on-error):
 #   - все дистрибутивы одной WSL2-VM делят общий network namespace,
@@ -30,9 +34,10 @@ param(
     [Parameter(Mandatory = $true)][string]$Rootfs,
     # Путь к pogrebok-daemon.exe (cargo build --release -p daemon).
     [Parameter(Mandatory = $true)][string]$Bottled,
-    # Путь к pogrebok.exe (cargo build --release -p cli).
-    [Parameter(Mandatory = $true)][string]$Bottle,
-    # Каталог данных демона (профили, токен, VHD дистрибутивов).
+    # Путь к pogrebok-scenario.exe (cargo build --release -p scenario) —
+    # dev-драйвер протокола GUI↔демон (ping/up/down).
+    [Parameter(Mandatory = $true)][string]$Scenario,
+    # Каталог данных демона (журналы, события, VHD дистрибутивов).
     [Parameter(Mandatory = $true)][string]$DataDir
 )
 
@@ -49,8 +54,12 @@ $BottleId = 'office-ci'
 # Внутренние адреса WG-стенда: сервер 10.99.0.1, клиент 10.99.0.2.
 $WgSrvAddr = '10.99.0.1'
 $WgCliAddr = '10.99.0.2'
-# Порт SOCKS5, который pogrebok-daemon пробросит на 127.0.0.1 (из status).
+# Порт SOCKS5, который pogrebok-daemon пробросит на 127.0.0.1 (из события
+# bottle.up, строка `SOCKS5=127.0.0.1:<port>` в выводе `scenario up`).
 $Socks5Port = 0
+# Токен авторизации протокола GUI↔демон (64 hex; демон 0.3 требует
+# --gui-token, каждое control/event-соединение здоровается им).
+$GuiToken = -join ((1..64) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
 
 # Процесс демона (для teardown).
 $DaemonProcess = $null
@@ -269,24 +278,24 @@ echo 'BFA-STAND-OK'
 # --- Основной сценарий ---------------------------------------------------------
 
 try {
-    Write-Host "=== WSL-интеграционный сценарий Погребка (M1) ==="
+    Write-Host "=== WSL-интеграционный сценарий Погребка (0.3) ==="
     Write-Host "Rootfs:   $Rootfs"
     Write-Host "Bottled:  $Bottled"
-    Write-Host "Bottle:   $Bottle"
+    Write-Host "Scenario: $Scenario"
     Write-Host "DataDir:  $DataDir"
 
     # (0) Preflight: всё, что сценарий запускает, должно существовать.
-    foreach ($path in @($Rootfs, $Bottled, $Bottle)) {
+    foreach ($path in @($Rootfs, $Bottled, $Scenario)) {
         if (-not (Test-Path $path)) {
             throw "не найден обязательный файл: $path"
         }
     }
-    # Идемпотентность: прошлый DataDir может содержать профиль с чужими
-    # ключами стенда — начинаем с чистого каталога.
+    # Идемпотентность: прошлый DataDir может содержать чужие журналы и
+    # VHD дистрибутивов — начинаем с чистого каталога.
     if (Test-Path $DataDir) {
         Remove-Item $DataDir -Recurse -Force
     }
-    New-Item -ItemType Directory -Path (Join-Path $DataDir 'bottles') -Force | Out-Null
+    New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
 
     # wsl.exe пишет UTF-16LE; WSL_UTF8=1 + UTF8-декодирование консоли
     # дают читаемый вывод (тот же приём, что в daemon/src/appliance.rs).
@@ -326,8 +335,11 @@ try {
     }
     Write-Host "    VM IP: $vmIp; endpoint стенда: ${vmIp}:51820"
 
-    # (3) Профиль office-ci + WG-конфиг клиента (ключи стенда).
-    #     Формат — спека §5.1; config — имя файла-копии в хранилище.
+    # (3) Профиль office-ci как JSON FullProfile (спека §5): в 0.3 данные
+    #     бутылок не лежат на диске файлами — их передаёт в демон GUI
+    #     через SyncProfiles; здесь роль GUI играет `scenario up`.
+    #     config — относительное имя файла-копии внутри аплаенса,
+    #     config_text — сам текст WG-конфига (ключи стенда).
     $wgConfig = @"
 [Interface]
 Address = $WgCliAddr/32
@@ -339,74 +351,65 @@ Endpoint = ${vmIp}:51820
 AllowedIPs = $WgSrvAddr/32
 PersistentKeepalive = 5
 "@
-    $profileToml = @"
-id = "$BottleId"
-name = "CI Office"
-kind = "env"
-
-[vpn]
-protocol = "wireguard"
-config = "$BottleId.conf"
-
-[expose]
-socks5 = 0
-forwards = []
-"@
-    $bottlesDir = Join-Path $DataDir 'bottles'
-    # ascii (не utf8): PS 5.1 пишет UTF-8 c BOM, а BOM ломает TOML-разбор
-    # демона; содержимое обоих файлов — чистый ASCII.
-    Set-Content -Path (Join-Path $bottlesDir "$BottleId.conf") -Value $wgConfig -Encoding ascii
-    Set-Content -Path (Join-Path $bottlesDir "$BottleId.toml") -Value $profileToml -Encoding ascii
-    Write-Host "==> Профиль $BottleId записан в $bottlesDir"
+    $fullProfile = [ordered]@{
+        profile = [ordered]@{
+            id     = $BottleId
+            name   = 'CI Office'
+            kind   = 'env'
+            vpn    = [ordered]@{ protocol = 'wireguard'; config = "$BottleId.conf" }
+            expose = [ordered]@{ socks5 = 0; forwards = @(); dns = $null; launch = $null }
+        }
+        config_text = $wgConfig
+        credentials = $null
+    }
+    # ascii (не utf8): PS 5.1 пишет UTF-8 c BOM; содержимое — чистый ASCII.
+    $profileJsonPath = Join-Path $DataDir "$BottleId.profile.json"
+    Set-Content -Path $profileJsonPath `
+        -Value ($fullProfile | ConvertTo-Json -Depth 6 -Compress) -Encoding ascii
+    Write-Host "==> Профиль $BottleId записан в $profileJsonPath"
 
     # (4) Демон: Start-Process (не ждём завершения), вывод — в журналы.
+    #     Демон 0.3 запускается только с --gui-token (его здесь играет
+    #     сценарий: токен случаен на прогон и живёт в памяти скрипта).
     #     Пути quoted: DataDir раннера может содержать пробелы.
     $DaemonProcess = Start-Process -FilePath $Bottled `
-        -ArgumentList @("--data-dir `"$DataDir`"", "--rootfs `"$Rootfs`"") `
+        -ArgumentList @("--gui-token $GuiToken", "--data-dir `"$DataDir`"", "--rootfs `"$Rootfs`"") `
         -RedirectStandardOutput $DaemonStdout `
         -RedirectStandardError $DaemonStderr `
         -PassThru -WindowStyle Hidden
-    Write-Host "==> pogrebok-daemon запущен (pid $($DaemonProcess.Id)); жду named pipe ~10 с"
+    Write-Host "==> pogrebok-daemon запущен (pid $($DaemonProcess.Id)); жду канал до 20 с"
 
-    # Ожидание канала: `pogrebok list` выходит с кодом 0, когда демон отвечает.
-    $daemonReady = $false
-    foreach ($attempt in 1..20) {
-        $ErrorActionPreference = 'Continue'
-        $probe = & $Bottle list 2>&1
-        $code = $LASTEXITCODE
-        $ErrorActionPreference = 'Stop'
-        if ($code -eq 0) { $daemonReady = $true; break }
+    # Ожидание канала: `scenario ping` (Hello + Stats по named pipe)
+    # выходит с кодом 0, когда демон отвечает; свои 20 с ретраев внутри.
+    $ErrorActionPreference = 'Continue'
+    $probe = & $Scenario ping --token $GuiToken --wait 20 2>&1
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($code -ne 0) {
         if ($DaemonProcess.HasExited) {
             throw "pogrebok-daemon завершился при старте (код $($DaemonProcess.ExitCode))"
         }
-        Start-Sleep -Milliseconds 500
+        throw "демон не поднял канал \\.\pipe\pogrebok-daemon за 20 с:`n$($probe | Out-String)"
     }
-    if (-not $daemonReady) {
-        throw "демон не поднял канал \\.\pipe\pogrebok-daemon за 10 с"
-    }
-    Write-Host "    демон отвечает; список бутылок:"
+    Write-Host "    демон отвечает; Stats:"
     Write-Host ($probe | Out-String)
 
-    # (5) start: импорт дистрибутива демона, handshake туннеля ≤30 с —
-    #     в CLI заложен таймаут ответа 40 с, ждём его целиком.
-    Invoke-Tool -FilePath $Bottle -Arguments @('start', $BottleId) `
-        -Description "pogrebok start $BottleId (туннель + relay)"
-
-    # (6) status: состояние up и порт SOCKS5.
-    $status = Invoke-Tool -FilePath $Bottle -Arguments @('status') `
-        -Description 'pogrebok status'
-    Write-Host $status
-    if ($status -notmatch "$BottleId\s+up") {
-        throw "status не показывает «$BottleId  up»:`n$status"
-    }
-    $portMatch = [regex]::Match($status, 'socks5\s+127\.0\.0\.1:(\d+)')
+    # (5) up: SyncProfiles + StartBottle по протоколу GUI↔демон; драйвер
+    #     ждёт событие bottle.up и печатает `SOCKS5=127.0.0.1:<порт>`
+    #     (реальный порт при socks5=0 знает только демон). Таймаут
+    #     подъёма (импорт дистрибутива + handshake) заложен в драйвер.
+    $upOut = Invoke-Tool -FilePath $Scenario `
+        -Arguments @('up', '--token', $GuiToken, '--profile', $profileJsonPath) `
+        -Description "scenario up $BottleId (туннель + relay)"
+    Write-Host $upOut
+    $portMatch = [regex]::Match(($upOut | Out-String), 'SOCKS5=127\.0\.0\.1:(\d+)')
     if (-not $portMatch.Success) {
-        throw "в status нет строки socks5 127.0.0.1:<порт>:`n$status"
+        throw "scenario up не вернул строку SOCKS5=127.0.0.1:<порт>:`n$upOut"
     }
     $Socks5Port = [int]$portMatch.Groups[1].Value
     Write-Host "    SOCKS5: 127.0.0.1:$Socks5Port"
 
-    # (7) SOCKS5-negotiate через весь путь: 127.0.0.1 (pogrebok-daemon) → VM →
+    # (6) SOCKS5-negotiate через весь путь: 127.0.0.1 (pogrebok-daemon) → VM →
     #     relay внутри namespace бутылки. Несколько попыток — мост
     #     агента поднимается асинхронно.
     $negotiated = $false
@@ -427,16 +430,13 @@ forwards = []
     }
     Write-Host "    negotiate 05 00 получен — путь до relay бутылки работает"
 
-    # (8) stop: бутылки в status больше нет, слушатель закрыт.
-    Invoke-Tool -FilePath $Bottle -Arguments @('stop', $BottleId) `
-        -Description "pogrebok stop $BottleId"
+    # (7) stop: StopBottle по протоколу GUI↔демон; ответ Ok демона —
+    #     подтверждение остановки, останется проверить, что слушатель
+    #     на 127.0.0.1 закрыт.
+    Invoke-Tool -FilePath $Scenario `
+        -Arguments @('down', '--token', $GuiToken, '--id', $BottleId) `
+        -Description "scenario down $BottleId"
 
-    $statusAfter = Invoke-Tool -FilePath $Bottle -Arguments @('status') `
-        -Description 'pogrebok status (после stop)'
-    Write-Host $statusAfter
-    if ($statusAfter -match $BottleId) {
-        throw "после stop бутылка $BottleId всё ещё в status:`n$statusAfter"
-    }
     if (Test-TcpStillOpen -Port $Socks5Port) {
         throw "порт 127.0.0.1:$Socks5Port всё ещё слушается после stop"
     }

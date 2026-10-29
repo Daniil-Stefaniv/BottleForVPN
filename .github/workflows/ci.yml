@@ -163,13 +163,10 @@ jobs:
 
 
   # Полный вертикальный срез env-бутылки на Windows: pogrebok-daemon +
-  # pogrebok CLI + импорт аплаенса + WG-туннель (стенд-сервер в той же
-  # WSL-VM) + SOCKS5.
+  # pogrebok-scenario (протокол GUI↔демон) + импорт аплаенса + WG-туннель
+  # (стенд-сервер в той же WSL-VM) + SOCKS5.
   # Спека §15: WSL2 на CI-раннерах ограничен, поэтому до приёмки M2 фейл
   # джобы не роняет пайплайн (фолбэк — agent-integration на Linux-раннере).
-  # ВНИМАНИЕ (0.3): сценарий ci-wsl-integration.ps1 построен на CLI
-  # управления бутылками (create/start/stop), которое в 0.3 уехало в
-  # GUI — джобу предстоит переписать на протокол GUI↔демон (см. README).
   wsl-integration:
     runs-on: windows-latest
     needs: appliance-build
@@ -191,15 +188,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: pogrebok-rootfs
-      - name: Собрать pogrebok-daemon и pogrebok
-        run: cargo build --release -p daemon -p cli
+      - name: Собрать pogrebok-daemon и pogrebok-scenario
+        run: cargo build --release -p daemon -p scenario
       - name: WSL-интеграционный сценарий (env-бутылка + WG-стенд)
         shell: cmd
         run: >
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci-wsl-integration.ps1
           -Rootfs "%GITHUB_WORKSPACE%\pogrebok-rootfs.tar.gz"
           -Bottled "%GITHUB_WORKSPACE%\target\release\pogrebok-daemon.exe"
-          -Bottle "%GITHUB_WORKSPACE%\target\release\pogrebok.exe"
+          -Scenario "%GITHUB_WORKSPACE%\target\release\pogrebok-scenario.exe"
           -DataDir "%RUNNER_TEMP%\bfa-ci-data"
 
   # Релизная сборка (по тегу v*): rootfs из appliance-build, GUI из

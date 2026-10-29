@@ -1,0 +1,21 @@
+[package]
+name = "scenario"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Dev-инструмент CI: не входит в установщики (сборки релиза идут
+# по -p daemon -p cli -p svc), живёт в workspace ради общего bottle-core.
+publish = false
+
+[[bin]]
+name = "pogrebok-scenario"
+path = "src/main.rs"
+
+[dependencies]
+bottle-core = { path = "../core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
