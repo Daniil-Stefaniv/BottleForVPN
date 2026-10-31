@@ -762,17 +762,38 @@ fn open_editor(
         .get_webview_window("main")
         .ok_or_else(|| "главное окно не найдено".to_string())?;
     let parent_for_close = parent.clone();
-    let editor = tauri::WebviewWindowBuilder::new(
+    // Позиционируем редактор по центру главного окна: без явной позиции
+    // ОС может выдать координаты за пределами экрана (воспроизведено на
+    // macOS — окно создавалось с отрицательным x и выглядело «пустым»).
+    // outer_* дают физические пиксели — делим на scale_factor.
+    let position = (|| {
+        let scale = parent.scale_factor().ok()?;
+        let origin = parent.outer_position().ok()?;
+        let size = parent.outer_size().ok()?;
+        let (w, h) = (620.0, 700.0);
+        let x = f64::from(origin.x) / scale + (f64::from(size.width) / scale - w) / 2.0;
+        let y = f64::from(origin.y) / scale + (f64::from(size.height) / scale - h) / 2.0;
+        Some((x, y))
+    })();
+    // Модальность обеспечивается блокировкой родителя (`set_enabled(false)`
+    // ниже) — always_on_top не нужен и вреден: окно редактора висело бы
+    // поверх ВСЕХ приложений, а не только поверх главного.
+    let mut builder = tauri::WebviewWindowBuilder::new(
         &app,
         "editor",
         tauri::WebviewUrl::App("editor.html".into()),
     )
     .title("Погребок — бутылка")
     .inner_size(620.0, 700.0)
-    .min_inner_size(480.0, 560.0)
-    .always_on_top(true)
-    .build()
-    .map_err(|error| format!("не удалось открыть окно редактора: {error}"))?;
+    .min_inner_size(480.0, 560.0);
+    builder = match position {
+        Some((x, y)) => builder.position(x, y),
+        // Геометрию родителя узнать не удалось — центр основного экрана.
+        None => builder.center(),
+    };
+    let editor = builder
+        .build()
+        .map_err(|error| format!("не удалось открыть окно редактора: {error}"))?;
     parent
         .set_enabled(false)
         .map_err(|error| format!("не удалось заблокировать главное окно: {error}"))?;
