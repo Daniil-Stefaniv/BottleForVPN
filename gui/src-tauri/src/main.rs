@@ -743,7 +743,7 @@ async fn delete_bottle(
 /// главное блокируется (`set_enabled`) до закрытия редактора (спека
 /// §3.3, п.8). Уже открыто — фокус на нём.
 #[tauri::command]
-fn open_editor(
+async fn open_editor(
     app: tauri::AppHandle,
     state: tauri::State<'_, EditorState>,
     id: Option<String>,
@@ -979,6 +979,49 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Создание WebviewWindow из синхронной команды блокирует WebView2 на
+    /// Windows и оставляет дочернее окно белым. Эта проверка не даёт
+    /// `open_editor` снова стать синхронной функцией.
+    #[test]
+    fn open_editor_command_is_async() {
+        fn assert_async_command<Fut>(
+            _command: impl Fn(
+                tauri::AppHandle,
+                tauri::State<'static, EditorState>,
+                Option<String>,
+                Option<String>,
+            ) -> Fut,
+        ) where
+            Fut: std::future::Future<Output = Result<(), String>>,
+        {
+        }
+
+        assert_async_command(open_editor);
+    }
+
+    /// Дочернее окно должно входить в capability: без неё Tauri полностью
+    /// запрещает IPC, выбор файла и программное закрытие редактора.
+    #[test]
+    fn editor_window_has_required_capabilities() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/editor.json"))
+                .expect("capability должна быть валидным JSON");
+        let windows = capability["windows"]
+            .as_array()
+            .expect("windows должна быть массивом");
+        let permissions = capability["permissions"]
+            .as_array()
+            .expect("permissions должна быть массивом");
+
+        assert!(windows.iter().any(|label| label == "editor"));
+        assert!(permissions
+            .iter()
+            .any(|permission| permission == "dialog:default"));
+        assert!(permissions
+            .iter()
+            .any(|permission| permission == "core:window:allow-close"));
+    }
 
     /// Без активных бутылок — короткий вопрос (бриф Step 1).
     #[test]
