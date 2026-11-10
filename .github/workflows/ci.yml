@@ -12,6 +12,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Существующий тег релиза для повторной сборки (например, v0.3.2); пусто — только проверки'
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,6 +44,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
       - run: cargo test --workspace
+        timeout-minutes: 20
       # Поведенческий тест маршрутов pogrebok-svc: реальный ActiveStore,
       # add/del точечного маршрута через шлюз по умолчанию (раннер
       # под администратором).
@@ -205,7 +211,15 @@ jobs:
   release-build:
     runs-on: windows-latest
     needs: [appliance-build, gui-build]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # `always()` нужен из-за матрицы GUI: недоступный macOS-раннер не
+    # должен блокировать Windows-релиз, если rootfs и Windows GUI уже
+    # опубликованы как артефакты. Их наличие дополнительно проверяют
+    # download-artifact и шаг валидации ниже.
+    if: >-
+      always() &&
+      needs.appliance-build.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' && startsWith(inputs.release_tag, 'v')))
     # Публикация GitHub Release: GITHUB_TOKEN нужна запись contents
     # (иначе шаг action-gh-release падает 403 Resource not accessible).
     permissions:
@@ -225,7 +239,7 @@ jobs:
       - name: Тег обязан совпадать с версией workspace и GUI
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $tag = "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}".TrimStart('v')
           $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           $version = ($meta.packages | Where-Object { $_.name -eq 'daemon' }).version
           if ($tag -ne $version) {
@@ -266,8 +280,9 @@ jobs:
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           body: |
-            Погребок ${{ github.ref_name }}
+            Погребок ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
             - MSI (полная установка: служба маршрутов, WSL, PATH, GUI с ярлыком в меню Пуск; один UAC)
             - Portable ZIP (без прав администратора; только env-бутылки; pogrebok-gui.exe в комплекте)
@@ -290,7 +305,11 @@ jobs:
   install-smoke:
     runs-on: windows-latest
     needs: release-build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      always() &&
+      needs.release-build.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' && startsWith(inputs.release_tag, 'v')))
     steps:
       - uses: actions/checkout@v4
       - name: Скачать релизные файлы
